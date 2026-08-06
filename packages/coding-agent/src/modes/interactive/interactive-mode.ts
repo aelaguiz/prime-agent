@@ -75,7 +75,7 @@ import {
 	uploadAgentTraceFile,
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
-import { queryAimAccountUsage } from "../../core/aim-usage.js";
+import { queryAimAccountUsage, resolveAimUsageBindings } from "../../core/aim-usage.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import {
 	type AgentCronJob,
@@ -8888,7 +8888,10 @@ export class InteractiveMode {
 			this.agentConnection.getSessionStats(),
 			this.agentConnection.getState(),
 		]);
-		const bindings = state.credentialBindings ?? [];
+		const selectedDescriptor = state.model
+			? this.modelRegistry.authStorage.getExternalDescriptor(state.model.provider)
+			: undefined;
+		const bindings = resolveAimUsageBindings(state.credentialBindings, state.model?.provider, selectedDescriptor);
 		const aimBindings = bindings.filter((binding) => binding.source === "aimgr");
 		const aimExecutable = aimBindings
 			.map((binding) => this.modelRegistry.authStorage.getExternalDescriptor(binding.provider))

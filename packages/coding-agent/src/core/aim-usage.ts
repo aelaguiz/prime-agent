@@ -16,6 +16,23 @@ export interface AimAccountUsage {
 	stale: boolean;
 }
 
+export interface AimUsageBinding {
+	provider: string;
+	source: string;
+	binding: string;
+}
+
+/** Show the selected managed descriptor before the first request pins it to the root. */
+export function resolveAimUsageBindings(
+	pinnedBindings: readonly AimUsageBinding[] | undefined,
+	modelProvider: string | undefined,
+	descriptor: { source: string; binding: string } | undefined,
+): AimUsageBinding[] {
+	if (pinnedBindings?.length) return [...pinnedBindings];
+	if (!modelProvider || !descriptor) return [];
+	return [{ provider: modelProvider, source: descriptor.source, binding: descriptor.binding }];
+}
+
 interface AimStatusAccount {
 	provider?: unknown;
 	label?: unknown;

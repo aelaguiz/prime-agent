@@ -2,7 +2,7 @@ import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseAimAccountUsage, queryAimAccountUsage } from "../src/core/aim-usage.js";
+import { parseAimAccountUsage, queryAimAccountUsage, resolveAimUsageBindings } from "../src/core/aim-usage.js";
 import { BUILTIN_SLASH_COMMANDS, resolveBuiltinSlashCommandName } from "../src/core/slash-commands.js";
 
 const status = {
@@ -27,6 +27,21 @@ describe("AIM /usage support", () => {
 			description: expect.stringContaining("account"),
 		});
 		expect(resolveBuiltinSlashCommandName("usage")).toBe("usage");
+	});
+
+	it("shows the selected AIM account before the first request pins the root", () => {
+		expect(
+			resolveAimUsageBindings(undefined, "openai-codex", {
+				source: "aimgr",
+				binding: "office",
+			}),
+		).toEqual([{ provider: "openai-codex", source: "aimgr", binding: "office" }]);
+		expect(
+			resolveAimUsageBindings([{ provider: "openai-codex", source: "aimgr", binding: "pinned" }], "openai-codex", {
+				source: "aimgr",
+				binding: "new-default",
+			}),
+		).toEqual([{ provider: "openai-codex", source: "aimgr", binding: "pinned" }]);
 	});
 
 	it("keeps only the non-secret account usage fields", () => {
