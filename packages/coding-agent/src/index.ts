@@ -14,6 +14,7 @@ export {
 export {
 	type ApiKeyCredential,
 	type AuthCredential,
+	type AuthSourceToken,
 	type AuthStatus,
 	AuthStorage,
 	type AuthStorageBackend,
@@ -135,6 +136,19 @@ export {
 	wrapRegisteredTool,
 	wrapRegisteredTools,
 } from "./core/extensions/index.js";
+export {
+	type CredentialBinding,
+	EXTERNAL_CREDENTIAL_FRESHNESS_FLOOR_MS,
+	EXTERNAL_CREDENTIAL_PROTOCOL,
+	type ExternalCredentialDescriptor,
+	ExternalCredentialError,
+	type ExternalCredentialErrorCode,
+	type ExternalCredentialFailure,
+	type ExternalCredentialRequest,
+	type ExternalCredentialResponse,
+	type ExternalCredentialSuccess,
+	validateExternalCredentialDescriptor,
+} from "./core/external-credential-client.js";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.js";
 export { convertToLlm } from "./core/messages.js";
@@ -185,6 +199,7 @@ export {
 	type BranchSummaryEntry,
 	buildSessionContext,
 	type CompactionEntry,
+	type CredentialBindingEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,

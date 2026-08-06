@@ -2,6 +2,7 @@ import type { AgentSession, ExtensionBindings } from "../../core/agent-session.j
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type { AgentSessionServices } from "../../core/agent-session-services.js";
 import type { ExtensionCommandContext, ExtensionRunner, ToolDefinition } from "../../core/extensions/index.js";
+import { inspectExternalCredentialSession } from "../../core/external-auth-session.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import type { SessionManager } from "../../core/session-manager.js";
 import type { SettingsManager } from "../../core/settings-manager.js";
@@ -68,6 +69,7 @@ export function createInteractiveModeUiServicesFromServices(options: {
 	sessionManager: SessionManager;
 }): InteractiveModeUiServices {
 	const { services, sessionManager } = options;
+	inspectExternalCredentialSession(services.authStorage, sessionManager);
 
 	return {
 		settingsManager: services.settingsManager,

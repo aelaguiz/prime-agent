@@ -21,6 +21,7 @@ import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
 import { readFirstLineSync, readLinesAsBuffers } from "../utils/file-lines.js";
 import { captureGitContext, type GitContext, gitContextsEqual } from "../utils/git.js";
+import type { CredentialBinding } from "./external-credential-client.js";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -121,6 +122,11 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+}
+
+/** Non-secret external credential identity pinned to this root session tree. */
+export interface CredentialBindingEntry extends SessionEntryBase, CredentialBinding {
+	type: "credential_binding";
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -251,6 +257,7 @@ export type SessionEntry =
 	| ThinkingLevelChangeEntry
 	| ServiceTierChangeEntry
 	| ModelChangeEntry
+	| CredentialBindingEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
@@ -322,6 +329,7 @@ export type ReadonlySessionManager = Pick<
 	| "getEntries"
 	| "getTree"
 	| "getSessionName"
+	| "getCredentialBindings"
 >;
 
 function createSessionId(): string {
@@ -1457,7 +1465,8 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		const shouldPersistWithoutAssistant = entry.type === "session_state" || entry.type === "session_info";
+		const shouldPersistWithoutAssistant =
+			entry.type === "session_state" || entry.type === "session_info" || entry.type === "credential_binding";
 		if (!hasAssistant && !shouldPersistWithoutAssistant) {
 			// Mark as not flushed so when assistant arrives, all entries get written
 			this.flushed = false;
@@ -1537,6 +1546,73 @@ export class SessionManager {
 		};
 		this._appendEntry(entry);
 		return entry.id;
+	}
+
+	/** Append a non-secret external credential binding outside LLM context. */
+	appendCredentialBinding(binding: CredentialBinding): string {
+		const current = this.getCredentialBindings().get(binding.provider);
+		if (current) {
+			if (
+				current.source !== binding.source ||
+				current.binding !== binding.binding ||
+				current.identityFingerprint !== binding.identityFingerprint
+			) {
+				throw new Error(`Credential binding for "${binding.provider}" is already pinned`);
+			}
+			for (let index = this.fileEntries.length - 1; index >= 0; index--) {
+				const entry = this.fileEntries[index];
+				if (entry.type === "credential_binding" && entry.provider === binding.provider) {
+					return entry.id;
+				}
+			}
+			return "";
+		}
+
+		const previousLeafId = this.leafId;
+		const entry: CredentialBindingEntry = {
+			type: "credential_binding",
+			id: generateId(this.byId),
+			parentId: previousLeafId,
+			timestamp: new Date().toISOString(),
+			...binding,
+		};
+		this._appendEntry(entry);
+		// Root metadata must not move the conversation cursor or become a
+		// parent for the next model-context entry.
+		this.leafId = previousLeafId;
+		return entry.id;
+	}
+
+	/** Return the root tree's external credential binding for each provider. */
+	getCredentialBindings(): Map<string, CredentialBinding> {
+		const bindings = new Map<string, CredentialBinding>();
+		for (const entry of this.fileEntries) {
+			if (
+				entry.type === "credential_binding" &&
+				typeof entry.provider === "string" &&
+				typeof entry.source === "string" &&
+				typeof entry.binding === "string" &&
+				typeof entry.identityFingerprint === "string"
+			) {
+				const binding: CredentialBinding = {
+					provider: entry.provider,
+					source: entry.source,
+					binding: entry.binding,
+					identityFingerprint: entry.identityFingerprint,
+				};
+				const current = bindings.get(entry.provider);
+				if (
+					current &&
+					(current.source !== binding.source ||
+						current.binding !== binding.binding ||
+						current.identityFingerprint !== binding.identityFingerprint)
+				) {
+					throw new Error(`Conflicting credential bindings for "${entry.provider}"`);
+				}
+				bindings.set(entry.provider, binding);
+			}
+		}
+		return bindings;
 	}
 
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
@@ -2048,8 +2124,30 @@ export class SessionManager {
 			throw new Error(`Entry ${leafId} not found`);
 		}
 
-		// Filter out LabelEntry from path - we'll recreate them from the resolved map
+		// Credential bindings are root-tree metadata. A fork before the original
+		// entry receives an equivalent non-secret binding on its extracted branch.
 		const pathWithoutLabels = path.filter((e) => e.type !== "label");
+		const inheritedBindings = this.getCredentialBindings();
+		const providersOnPath = new Set(
+			pathWithoutLabels
+				.filter((entry): entry is CredentialBindingEntry => entry.type === "credential_binding")
+				.map((entry) => entry.provider),
+		);
+		const inheritedIds = new Set(pathWithoutLabels.map((entry) => entry.id));
+		let inheritedParentId = pathWithoutLabels[pathWithoutLabels.length - 1]?.id ?? null;
+		for (const binding of inheritedBindings.values()) {
+			if (providersOnPath.has(binding.provider)) continue;
+			const entry: CredentialBindingEntry = {
+				type: "credential_binding",
+				id: generateId(inheritedIds),
+				parentId: inheritedParentId,
+				timestamp: new Date().toISOString(),
+				...binding,
+			};
+			inheritedIds.add(entry.id);
+			pathWithoutLabels.push(entry);
+			inheritedParentId = entry.id;
+		}
 
 		const target = this.persist
 			? createUniqueSessionFileTarget(this.getSessionDir())
@@ -2101,6 +2199,7 @@ export class SessionManager {
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
+			this.leafId = labelEntries[labelEntries.length - 1]?.id ?? leafId;
 
 			// Only write the file now if it contains an assistant message.
 			// Otherwise defer to _persist(), which creates the file on the
@@ -2136,6 +2235,7 @@ export class SessionManager {
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
 		this.sessionId = newSessionId;
 		this._buildIndex();
+		this.leafId = labelEntries[labelEntries.length - 1]?.id ?? leafId;
 		return undefined;
 	}
 

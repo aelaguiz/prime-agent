@@ -255,6 +255,9 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 			return false;
 		}
 
+		if (status.source === "external") {
+			return true;
+		}
 		if (status.source && status.source !== "stored") {
 			return provider.authType === "api_key";
 		}
@@ -329,6 +332,10 @@ export class OAuthSelectorComponent extends Container implements Focusable {
 		const credential = this.authStorage.get(provider.id);
 		if (this.isProviderStale(provider)) {
 			return theme.fg("warning", status.label ?? "expired");
+		}
+		if (status.source === "external") {
+			const source = credential?.type === "external" && credential.source === "aimgr" ? "AIM" : "external";
+			return theme.fg("success", `managed by ${source} · ${status.label ?? "ready"}`);
 		}
 
 		if (status.source && status.source !== "stored") {

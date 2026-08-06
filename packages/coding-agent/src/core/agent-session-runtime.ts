@@ -11,6 +11,11 @@ import { flushAgentTraceUpload } from "./agent-traces.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import {
+	initializeExternalCredentialSession,
+	snapshotExternalCredentialDescriptors,
+	stageExternalCredentialDescriptors,
+} from "./external-auth-session.js";
 import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 import type { CreateAgentSessionResult } from "./sdk.js";
 import { assertSessionCwdExists } from "./session-cwd.js";
@@ -90,6 +95,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private beforeSessionInvalidate?: () => void;
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
+	private externalBindingOwner?: SessionManager;
 	private disposePromise?: Promise<void>;
 
 	constructor(
@@ -340,6 +346,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				rlmDepth: options.rlmDepth,
 			});
 		}
+		const inheritedBindings = options.parentSession.sessionManager.getCredentialBindings();
+		const inheritedDescriptors = snapshotExternalCredentialDescriptors(this.services.authStorage);
 		const runtime = await this.scopedBuild(() =>
 			createAgentSessionRuntime(this.createRuntime, {
 				cwd: sessionManager.getCwd(),
@@ -377,7 +385,16 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 			}),
 		);
 		this.subagentRuntimes.set(options.id, runtime);
+		runtime.externalBindingOwner = this.externalBindingOwner ?? this.session.sessionManager;
 		try {
+			for (const binding of inheritedBindings.values()) {
+				sessionManager.appendCredentialBinding(binding);
+			}
+			stageExternalCredentialDescriptors(runtime.services.authStorage, inheritedDescriptors);
+			initializeExternalCredentialSession(runtime.services.authStorage, sessionManager, (binding) => {
+				runtime.externalBindingOwner?.appendCredentialBinding(binding);
+			});
+			runtime.services.modelRegistry.refresh();
 			await runtime.session.bindExtensions({});
 			if (options.parentSession.getRlmChildRunStatus(options.id) === "cancelled") {
 				throw new Error("RLM subagent startup was cancelled");

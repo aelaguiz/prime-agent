@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fixed Codex HTTP and WebSocket authentication failures retaining numeric 401/403 classification instead of entering transient retry or transport fallback.
+
 ## [0.7.0] - 2026-08-05
 
 ## [0.6.1] - 2026-08-05

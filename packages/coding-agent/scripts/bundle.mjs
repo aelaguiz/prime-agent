@@ -12,19 +12,17 @@
  * imports of pi packages share the bundle's module instances.
  */
 import { chmodSync, readFileSync, rmSync } from "node:fs";
-import { execFileSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
+import { computeSourceBuildId } from "../../../scripts/source-build-id.mjs";
 
 const packageDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const repositoryRoot = dirname(dirname(packageDir));
 const outdir = join(packageDir, "dist", "bundle");
 let buildId;
 try {
-	buildId = execFileSync("git", ["describe", "--tags", "--always", "--dirty"], {
-		cwd: dirname(packageDir),
-		encoding: "utf8",
-	}).trim();
+	buildId = computeSourceBuildId(repositoryRoot);
 } catch {
 	buildId = `release-${JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8")).version}`;
 }

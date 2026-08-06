@@ -3,11 +3,14 @@ import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { AgentSession } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
+import type { SessionTreeFlatNode, SessionTreeNode } from "../../core/session-manager.js";
 import type {
 	AgentConnectionArtifactReference,
 	AgentConnectionArtifactType,
 	AgentConnectionModel,
 	AgentConnectionResourceSnapshot,
+	AgentConnectionSessionTreeFlatNode,
+	AgentConnectionSessionTreeNode,
 	AgentConnectionSlashCommand,
 	AgentConnectionSnapshot,
 	AgentConnectionState,
@@ -42,7 +45,10 @@ export function createAgentConnectionState(
 		sessionId: session.sessionId,
 		sessionName: session.sessionName,
 		sessionDir: sessionManager.getSessionDir(),
-		leafId: sessionManager.getLeafId(),
+		leafId: sanitizeAgentConnectionSessionTreeLeafId(
+			sessionManager.getLeafId(),
+			typeof sessionManager.getFlatTree === "function" ? sessionManager.getFlatTree() : [],
+		),
 		autoCompactionEnabled: session.autoCompactionEnabled,
 		messageCount: session.messages.length,
 		sessionActions: session.getSessionActionSnapshot(),
@@ -54,9 +60,82 @@ export function createAgentConnectionState(
 		})),
 		activeToolNames: session.getActiveToolNames(),
 		contextUsage: session.getContextUsage(),
+		credentialBindings: [...sessionManager.getCredentialBindings().values()]
+			.map(({ provider, source, binding }) => ({ provider, source, binding }))
+			.sort((left, right) => left.provider.localeCompare(right.provider)),
 		// Baseline recap; the daemon overlays the live summary on attach.
 		recap: persistedRecap(sessionManager),
 	};
+}
+
+function publicParentId(parentId: string | null, byId: ReadonlyMap<string, SessionTreeFlatNode>): string | null {
+	const seen = new Set<string>();
+	let current = parentId;
+	while (current !== null) {
+		if (seen.has(current)) return null;
+		seen.add(current);
+		const parent = byId.get(current);
+		if (!parent || parent.entry.type !== "credential_binding") return current;
+		current = parent.entry.parentId;
+	}
+	return null;
+}
+
+/** Canonical worker-metadata sanitizer used by snapshots and old/new daemon paths. */
+export function sanitizeAgentConnectionSessionTreeFlatNodes(
+	nodes: readonly SessionTreeFlatNode[],
+): AgentConnectionSessionTreeFlatNode[] {
+	const byId = new Map(nodes.map((node) => [node.entry.id, node]));
+	return nodes.flatMap((node) => {
+		if (node.entry.type === "credential_binding") return [];
+		return [
+			{
+				...node,
+				entry: { ...node.entry, parentId: publicParentId(node.entry.parentId, byId) },
+			} as AgentConnectionSessionTreeFlatNode,
+		];
+	});
+}
+
+export function sanitizeAgentConnectionSessionTreeLeafId(
+	leafId: string | null,
+	nodes: readonly SessionTreeFlatNode[],
+): string | null {
+	if (leafId === null) return null;
+	const byId = new Map(nodes.map((node) => [node.entry.id, node]));
+	const leaf = byId.get(leafId);
+	return leaf?.entry.type === "credential_binding" ? publicParentId(leaf.entry.parentId, byId) : leafId;
+}
+
+export function buildSanitizedAgentConnectionSessionTree(
+	nodes: readonly SessionTreeFlatNode[],
+): AgentConnectionSessionTreeNode[] {
+	const flatNodes = sanitizeAgentConnectionSessionTreeFlatNodes(nodes);
+	const byId = new Map<string, AgentConnectionSessionTreeNode>();
+	const roots: AgentConnectionSessionTreeNode[] = [];
+	for (const node of flatNodes) byId.set(node.entry.id, { ...node, children: [] });
+	for (const node of flatNodes) {
+		const treeNode = byId.get(node.entry.id)!;
+		const parent = node.entry.parentId === null ? undefined : byId.get(node.entry.parentId);
+		if (parent) parent.children.push(treeNode);
+		else roots.push(treeNode);
+	}
+	return roots;
+}
+
+/** Keep worker-only credential metadata out of the existing daemon/client tree shape. */
+export function createAgentConnectionSessionTree(nodes: SessionTreeNode[]): AgentConnectionSessionTreeNode[] {
+	const flat: SessionTreeFlatNode[] = [];
+	const visit = (node: SessionTreeNode) => {
+		flat.push({
+			entry: node.entry,
+			...(node.label ? { label: node.label } : {}),
+			...(node.labelTimestamp ? { labelTimestamp: node.labelTimestamp } : {}),
+		});
+		for (const child of node.children) visit(child);
+	};
+	for (const node of nodes) visit(node);
+	return buildSanitizedAgentConnectionSessionTree(flat);
 }
 
 export function createAgentConnectionSnapshot(
@@ -71,8 +150,11 @@ export function createAgentConnectionSnapshot(
 		...(session.state?.streamingMessage ? { streamingMessage: session.state.streamingMessage } : {}),
 		sessionContext: session.buildSessionContext(),
 		sessionTree: {
-			tree: sessionManager.getTree(),
-			leafId: sessionManager.getLeafId(),
+			tree: createAgentConnectionSessionTree(sessionManager.getTree()),
+			leafId: sanitizeAgentConnectionSessionTreeLeafId(
+				sessionManager.getLeafId(),
+				typeof sessionManager.getFlatTree === "function" ? sessionManager.getFlatTree() : [],
+			),
 		},
 	};
 }

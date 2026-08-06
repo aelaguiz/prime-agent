@@ -69,6 +69,7 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
+	type DaemonRuntimeIdentity,
 	type DaemonUpdateRestartManifest,
 	failure,
 	isDaemonCommandEnvelope,
@@ -77,7 +78,12 @@ import {
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
-import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
+import {
+	assertExpectedDaemonBuildIdentity,
+	getDaemonRuntimeIdentity,
+	PRIME_AGENT_BUILD_ID_ENV,
+	recomputeSourceBuildId,
+} from "./daemon-runtime-identity.js";
 import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import {
 	classifySessionRosterStatus,
@@ -570,10 +576,29 @@ function mergeSessionLists(active: readonly SessionSummary[], saved: readonly Se
 }
 
 export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions): Promise<never> {
+	assertExpectedDaemonBuildIdentity();
 	const socketPath = options.socketPath ?? defaultDaemonSocketPath();
 	const supervisor = new DaemonSupervisor(socketPath, options);
 	await supervisor.start();
 	return new Promise(() => {});
+}
+
+export class DaemonWorkerRuntimeIdentityError extends Error {
+	constructor(worker: DaemonRuntimeIdentity | undefined, supervisor: DaemonRuntimeIdentity) {
+		super(
+			`Daemon worker runtime build does not match its supervisor (worker=${worker?.buildId ?? "missing"}, supervisor=${supervisor.buildId})`,
+		);
+		this.name = "DaemonWorkerRuntimeIdentityError";
+	}
+}
+
+export function assertDaemonWorkerRuntimeIdentity(
+	worker: DaemonRuntimeIdentity | undefined,
+	supervisor: DaemonRuntimeIdentity = getDaemonRuntimeIdentity(),
+): void {
+	if (!worker || worker.buildId !== supervisor.buildId) {
+		throw new DaemonWorkerRuntimeIdentityError(worker, supervisor);
+	}
 }
 
 export class DaemonSupervisor {
@@ -2111,13 +2136,15 @@ export class DaemonSupervisor {
 		const orphanProcessJournalPath =
 			existing?.descriptor.orphanProcessJournalPath ?? join(this.descriptorDir, `${workerId}.orphans.jsonl`);
 		const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+		const workerEnvironment: NodeJS.ProcessEnv = { ...process.env, ...launchEnv };
+		const recomputedBuildId = recomputeSourceBuildId(workerEnvironment);
+		if (recomputedBuildId) workerEnvironment[PRIME_AGENT_BUILD_ID_ENV] = recomputedBuildId;
 		await this.assertRecoveryAllowed();
 		const child: ChildProcess = spawn(launch.command, launch.args, {
 			cwd: createCommand.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: createCliSubprocessEnv({
-				...process.env,
-				...launchEnv,
+				...workerEnvironment,
 				[DAEMON_WORKER_ROLE_ENV]: "1",
 				[DAEMON_WORKER_TOKEN_ENV]: token,
 				[DAEMON_WORKER_ACTIVE_SESSION_ID_ENV]: rootActiveSessionId,
@@ -2327,7 +2354,8 @@ export class DaemonSupervisor {
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
-				await client.waitForHello(1000);
+				const hello = await client.waitForHello(1000);
+				assertDaemonWorkerRuntimeIdentity(hello.runtime);
 				await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
 					this.supervisorAuthenticationClaim(),
@@ -2342,7 +2370,7 @@ export class DaemonSupervisor {
 			} catch (error) {
 				lastError = error;
 				client.close();
-				if (isSupervisorRecoveryCancelled(error)) {
+				if (isSupervisorRecoveryCancelled(error) || error instanceof DaemonWorkerRuntimeIdentityError) {
 					throw error;
 				}
 				await delay(25);

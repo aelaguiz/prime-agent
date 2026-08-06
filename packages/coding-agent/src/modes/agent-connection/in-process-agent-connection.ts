@@ -23,8 +23,10 @@ import { waitForHeadlessCompletion } from "../headless-completion.js";
 import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
+	createAgentConnectionSessionTree,
 	createAgentConnectionSnapshot,
 	createAgentConnectionState,
+	sanitizeAgentConnectionSessionTreeLeafId,
 } from "./snapshot.js";
 import { createAgentConnectionToolDefinition } from "./tool-definition.js";
 import type {
@@ -163,8 +165,11 @@ export class InProcessAgentConnection implements AgentConnection {
 
 	async getSessionTree(): Promise<{ tree: AgentConnectionSessionTreeNode[]; leafId: string | null }> {
 		return {
-			tree: this.session.sessionManager.getTree(),
-			leafId: this.session.sessionManager.getLeafId(),
+			tree: createAgentConnectionSessionTree(this.session.sessionManager.getTree()),
+			leafId: sanitizeAgentConnectionSessionTreeLeafId(
+				this.session.sessionManager.getLeafId(),
+				this.session.sessionManager.getFlatTree(),
+			),
 		};
 	}
 

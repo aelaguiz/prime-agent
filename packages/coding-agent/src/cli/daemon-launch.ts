@@ -66,7 +66,7 @@ type DaemonVersionProbe =
 	| { status: "current"; hello: DaemonHello }
 	| { status: "stale"; hello?: DaemonHello };
 
-/** Connect to a running daemon and check whether it matches this client's protocol and app version. */
+/** Connect to a running daemon and check whether its wire contract and runtime build match this client. */
 export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
 	let client: DaemonClient | undefined;
 	for (const timeoutMs of [250, 2000]) {
@@ -84,15 +84,17 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 	}
 	try {
 		const hello = await client.waitForHello(2000);
+		const clientRuntime = getDaemonRuntimeIdentity();
 		const current =
 			hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
 			hello.schemaId === DAEMON_SCHEMA_ID &&
-			hello.appVersion === VERSION;
+			hello.appVersion === VERSION &&
+			hello.runtime?.buildId === clientRuntime.buildId;
 		if (!current) {
 			logDaemonLaunch(
 				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
 					`/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"} vs client ` +
-					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${getDaemonRuntimeIdentity().buildId}`,
+					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${clientRuntime.buildId}`,
 			);
 		}
 		if (current) {

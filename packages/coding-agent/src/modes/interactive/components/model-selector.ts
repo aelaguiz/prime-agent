@@ -369,11 +369,15 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const isSelected = i === this.selectedIndex;
 			const isCurrent = modelsAreEqual(this.currentModel, item.model);
 			const isConfigured = this.isProviderConfigured(item);
-			const meta = isConfigured
-				? isCurrent
-					? theme.fg("success", "current")
-					: undefined
-				: theme.fg("warning", isCurrent ? "current · sign in" : "sign in");
+			const authStatus = this.modelRegistry.getProviderAuthStatus(item.provider);
+			const managed = authStatus.source === "external";
+			const meta = managed
+				? theme.fg("success", `${isCurrent ? "current · " : ""}managed by AIM · ${authStatus.label ?? "ready"}`)
+				: isConfigured
+					? isCurrent
+						? theme.fg("success", "current")
+						: undefined
+					: theme.fg("warning", isCurrent ? "current · sign in" : "sign in");
 
 			this.listContainer.addChild(
 				new MenuRow({

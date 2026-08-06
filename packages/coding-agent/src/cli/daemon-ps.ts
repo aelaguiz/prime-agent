@@ -426,7 +426,7 @@ export type ReapAction =
 /**
  * Decide what to do with each discovered daemon (pure, no side effects). Reap
  * targets only clearly-safe daemons: orphaned socket files (including a stale
- * default daemon.sock with no live process), and reachable idle daemons on
+ * default build-scoped socket with no live process), and reachable idle daemons on
  * non-default sockets. A reachable default daemon, and any reachable daemon with
  * live sessions, are never touched.
  *
@@ -448,7 +448,7 @@ export function planReap(daemons: readonly DaemonInfo[], force: boolean): ReapAc
 
 	return daemons.map((daemon): ReapAction => {
 		// An orphan socket file has no owning process, so removing it is safe even
-		// on the default path (a stale daemon.sock left by a crash). Decide this
+		// on the default path (a stale scoped socket left by a crash). Decide this
 		// before the default guard so a dead default socket still gets cleaned up.
 		if (daemon.status === "orphan-file") {
 			return { kind: "remove-file", daemon };

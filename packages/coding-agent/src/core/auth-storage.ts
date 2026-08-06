@@ -20,6 +20,21 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import {
+	type CredentialBinding,
+	EXTERNAL_CREDENTIAL_PROTOCOL,
+	ExternalCredentialClient,
+	type ExternalCredentialDescriptor,
+	ExternalCredentialError,
+	type ResolvedExternalAccess,
+	validateExternalCredentialDescriptor,
+} from "./external-credential-client.js";
+export const AUTH_STORAGE_GET_EXTERNAL_DESCRIPTOR_SNAPSHOT = Symbol("auth-storage.get-external-descriptor-snapshot");
+export const AUTH_STORAGE_SET_EXTERNAL_DESCRIPTOR_SNAPSHOT = Symbol("auth-storage.set-external-descriptor-snapshot");
+export const AUTH_STORAGE_RESET_EXTERNAL_RUNTIME = Symbol("auth-storage.reset-external-runtime");
+export const AUTH_STORAGE_START_EXTERNAL_SESSION = Symbol("auth-storage.start-external-session");
+export const AUTH_STORAGE_SET_EXTERNAL_INSPECTION_BINDINGS = Symbol("auth-storage.set-external-inspection-bindings");
+
+import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,
 	loadPrimeCliConfig,
@@ -49,14 +64,40 @@ export type OAuthCredential = {
 	type: "oauth";
 } & OAuthCredentials;
 
-export type AuthCredential = ApiKeyCredential | OAuthCredential;
+export type AuthCredential = ApiKeyCredential | OAuthCredential | ExternalCredentialDescriptor;
 
 export type AuthStorageData = Record<string, AuthCredential>;
+
+function deepCloneAndFreeze<T>(value: T): T {
+	if (Array.isArray(value)) {
+		return Object.freeze(value.map((item) => deepCloneAndFreeze(item))) as T;
+	}
+	if (value && typeof value === "object") {
+		return Object.freeze(
+			Object.fromEntries(
+				Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, deepCloneAndFreeze(item)]),
+			),
+		) as T;
+	}
+	return value;
+}
+
+function cloneCredential(credential: AuthCredential): AuthCredential {
+	if (credential.type === "external") return validateExternalCredentialDescriptor(credential);
+	return deepCloneAndFreeze(credential);
+}
+
+function cloneStorageData(data: AuthStorageData): AuthStorageData {
+	return Object.freeze(
+		Object.fromEntries(Object.entries(data).map(([provider, credential]) => [provider, cloneCredential(credential)])),
+	) as AuthStorageData;
+}
 
 export type AuthStatus = {
 	configured: boolean;
 	source?:
 		| "stored"
+		| "external"
 		| "runtime"
 		| "environment"
 		| "prime_cli"
@@ -79,6 +120,7 @@ type LockResult<T> = {
 
 type ActiveAuthStatusSource = Exclude<NonNullable<AuthStatus["source"]>, "stale">;
 
+/** Ephemeral non-bearer fingerprints; safe for stale-source routing, never persistence or logs. */
 export type AuthSourceToken = {
 	provider: string;
 	source: ActiveAuthStatusSource;
@@ -95,10 +137,24 @@ type AuthSourceCandidate = {
 	resolveValueFingerprint?: () => string | undefined;
 };
 
-type AuthApiKeyResult = {
+export type AuthApiKeyResult = {
 	apiKey?: string;
 	sourceToken?: AuthSourceToken;
 };
+
+export class ManagedAuthConflictError extends Error {
+	constructor(
+		readonly provider: string,
+		readonly binding: string,
+	) {
+		super(
+			`Authentication for "${provider}" is managed by AIM for this session (${binding}). ` +
+				`Change AIM defaults for new sessions with "aim prime use", or return to native authentication with ` +
+				`"aim prime uninstall --provider ${provider}".`,
+		);
+		this.name = "ManagedAuthConflictError";
+	}
+}
 
 export interface AuthStorageBackend {
 	withLock<T>(fn: (current: string | undefined) => LockResult<T>): T;
@@ -251,6 +307,13 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private externalClient = new ExternalCredentialClient();
+	private externalBindings = new Map<string, CredentialBinding>();
+	private lastExternalSourceTokens = new Map<string, AuthSourceToken>();
+	private externalSessionGeneration = 0;
+	private externalResolutionEnabled = false;
+	private onExternalBindingResolved?: (binding: CredentialBinding) => void;
+	private pendingExternalDescriptorSnapshot?: Map<string, ExternalCredentialDescriptor>;
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -279,6 +342,7 @@ export class AuthStorage {
 	 * Used for CLI --api-key flag.
 	 */
 	setRuntimeApiKey(provider: string, apiKey: string): void {
+		this.assertProviderMutable(provider);
 		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.set(provider, apiKey);
 	}
@@ -287,6 +351,7 @@ export class AuthStorage {
 	 * Remove a runtime API key override.
 	 */
 	removeRuntimeApiKey(provider: string): void {
+		this.assertProviderMutable(provider);
 		this.clearStaleAuthSource(provider, "runtime");
 		this.runtimeOverrides.delete(provider);
 	}
@@ -347,6 +412,9 @@ export class AuthStorage {
 	}
 
 	private getStoredCredentialValueMaterial(providerId: string, credential: AuthCredential): string | undefined {
+		if (credential.type === "external") {
+			return undefined;
+		}
 		if (credential.type === "api_key") {
 			if (credential.key.startsWith("!")) {
 				const resolvedKey = resolveConfigValueUncached(credential.key);
@@ -357,6 +425,22 @@ export class AuthStorage {
 		const provider = getOAuthProvider(providerId);
 		const apiKey = provider?.getApiKey(credential) ?? credential.access;
 		return `oauth:${apiKey}\0${credential.refresh}\0${credential.expires}`;
+	}
+
+	private getExternalAuthCandidate(provider: string): AuthSourceCandidate | undefined {
+		const credential = this.data[provider];
+		if (credential?.type !== "external") {
+			return undefined;
+		}
+		const binding = this.externalBindings.get(provider);
+		const sourceToken = this.lastExternalSourceTokens.get(provider);
+		return {
+			source: "external",
+			configured: true,
+			label: binding?.binding ?? credential.binding,
+			identityFingerprint: binding?.identityFingerprint ?? credential.expectedIdentityFingerprint,
+			...(sourceToken ? { valueFingerprint: sourceToken.valueFingerprint } : {}),
+		};
 	}
 
 	private getRuntimeAuthCandidate(provider: string): AuthSourceCandidate | undefined {
@@ -396,7 +480,7 @@ export class AuthStorage {
 		options?: { resolveCommandValue?: boolean; resolvedCommandValue?: string },
 	): AuthSourceCandidate | undefined {
 		const credential = this.data[provider];
-		if (!credential) {
+		if (!credential || credential.type === "external") {
 			return undefined;
 		}
 		const isCommandApiKey = credential.type === "api_key" && credential.key.startsWith("!");
@@ -481,6 +565,10 @@ export class AuthStorage {
 	}
 
 	private getAuthSourceCandidates(provider: string, options?: { includeFallback?: boolean }): AuthSourceCandidate[] {
+		const externalCandidate = this.getExternalAuthCandidate(provider);
+		if (externalCandidate) {
+			return [externalCandidate];
+		}
 		const fallbackCandidate =
 			options?.includeFallback === false ? undefined : this.getFallbackAuthCandidate(provider);
 		const candidates =
@@ -587,6 +675,9 @@ export class AuthStorage {
 		if (token.provider.length === 0) {
 			return false;
 		}
+		if (token.source === "external") {
+			this.externalClient.invalidate({ ...token, source: "external" });
+		}
 		const stale = this.staleAuthSources.get(token.provider) ?? [];
 		if (
 			!stale.some(
@@ -619,11 +710,68 @@ export class AuthStorage {
 		if (!content) {
 			return {};
 		}
-		return JSON.parse(content) as AuthStorageData;
+		const parsed = JSON.parse(content) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw new Error("Invalid auth storage data");
+		}
+		const normalized: AuthStorageData = {};
+		for (const [provider, credential] of Object.entries(parsed as Record<string, unknown>)) {
+			if (typeof credential !== "object" || credential === null || !("type" in credential)) {
+				throw new Error(`Invalid credential for "${provider}"`);
+			}
+			try {
+				normalized[provider] = cloneCredential(credential as AuthCredential);
+			} catch {
+				throw new Error(`Invalid external credential descriptor for "${provider}"`);
+			}
+		}
+		return normalized;
+	}
+
+	/** Copy the loaded root's descriptor mechanics into a newly-created descendant. */
+	[AUTH_STORAGE_GET_EXTERNAL_DESCRIPTOR_SNAPSHOT](): Map<string, ExternalCredentialDescriptor> {
+		const snapshot = new Map<string, ExternalCredentialDescriptor>();
+		for (const [provider, credential] of Object.entries(this.data)) {
+			if (credential.type === "external") snapshot.set(provider, validateExternalCredentialDescriptor(credential));
+		}
+		return snapshot;
+	}
+
+	/** Queue a worker-local descriptor snapshot for the next root initialization. */
+	[AUTH_STORAGE_SET_EXTERNAL_DESCRIPTOR_SNAPSHOT](snapshot: ReadonlyMap<string, ExternalCredentialDescriptor>): void {
+		this.pendingExternalDescriptorSnapshot = new Map(
+			[...snapshot].map(([provider, descriptor]) => [provider, validateExternalCredentialDescriptor(descriptor)]),
+		);
+	}
+
+	private applyPendingExternalDescriptorSnapshot(nextData: AuthStorageData): AuthStorageData {
+		const snapshot = this.pendingExternalDescriptorSnapshot;
+		if (!snapshot) return nextData;
+		this.pendingExternalDescriptorSnapshot = undefined;
+		for (const [provider, credential] of Object.entries(nextData)) {
+			if (credential.type === "external") delete nextData[provider];
+		}
+		for (const [provider, descriptor] of snapshot) {
+			nextData[provider] = validateExternalCredentialDescriptor(descriptor);
+		}
+		return nextData;
+	}
+
+	private preserveExternalSessionSnapshot(nextData: AuthStorageData): AuthStorageData {
+		if (!this.externalResolutionEnabled) return nextData;
+		for (const provider of new Set([...Object.keys(this.data), ...Object.keys(nextData)])) {
+			const previous = this.data[provider];
+			const next = nextData[provider];
+			if (previous?.type !== "external" && next?.type !== "external") continue;
+			if (previous) nextData[provider] = previous;
+			else delete nextData[provider];
+		}
+		return nextData;
 	}
 
 	/**
-	 * Reload credentials from storage.
+	 * Reload credentials from storage. Once a worker owns a root session, external
+	 * additions, removals, and descriptor changes are deferred to the next root.
 	 */
 	reload(): void {
 		let content: string | undefined;
@@ -632,11 +780,79 @@ export class AuthStorage {
 				content = current;
 				return { result: undefined };
 			});
-			this.data = this.parseStorageData(content);
+			this.data = this.preserveExternalSessionSnapshot(
+				this.applyPendingExternalDescriptorSnapshot(this.parseStorageData(content)),
+			);
 			this.loadError = null;
 		} catch (error) {
 			this.loadError = error as Error;
 			this.recordError(error);
+		}
+	}
+
+	/** End the current root-session scope before loading defaults for a new root. */
+	[AUTH_STORAGE_RESET_EXTERNAL_RUNTIME](): void {
+		this.externalSessionGeneration += 1;
+		this.externalClient.clear();
+		this.externalBindings.clear();
+		this.lastExternalSourceTokens.clear();
+		this.onExternalBindingResolved = undefined;
+		this.externalResolutionEnabled = false;
+	}
+
+	/** Activate one worker-owned root-session scope and pin all installed descriptors. */
+	[AUTH_STORAGE_START_EXTERNAL_SESSION](
+		bindings: Iterable<CredentialBinding> = [],
+		onBindingResolved?: (binding: CredentialBinding) => void,
+	): void {
+		this.externalSessionGeneration += 1;
+		this.externalClient.clear();
+		this.externalBindings.clear();
+		this.lastExternalSourceTokens.clear();
+		this.onExternalBindingResolved = onBindingResolved;
+		this.externalResolutionEnabled = true;
+		for (const binding of bindings) {
+			this.externalBindings.set(binding.provider, { ...binding });
+		}
+		for (const [provider, credential] of Object.entries(this.data)) {
+			if (credential.type !== "external") continue;
+			const current = this.externalBindings.get(provider);
+			if (
+				current &&
+				(current.source !== credential.source || credential.protocol !== EXTERNAL_CREDENTIAL_PROTOCOL)
+			) {
+				throw new ExternalCredentialError("identity_conflict");
+			}
+		}
+	}
+
+	/** Seed client/UI status from persisted metadata without enabling helper execution. */
+	[AUTH_STORAGE_SET_EXTERNAL_INSPECTION_BINDINGS](bindings: Iterable<CredentialBinding>): void {
+		this.externalBindings.clear();
+		for (const binding of bindings) {
+			this.externalBindings.set(binding.provider, { ...binding });
+		}
+	}
+
+	isExternalAuthManaged(provider: string): boolean {
+		return this.data[provider]?.type === "external";
+	}
+
+	private getManagedBinding(provider: string, descriptor: ExternalCredentialDescriptor): string {
+		return this.externalBindings.get(provider)?.binding ?? descriptor.binding;
+	}
+
+	getManagedAuthMessage(provider: string): string | undefined {
+		const credential = this.data[provider];
+		return credential?.type === "external"
+			? new ManagedAuthConflictError(provider, this.getManagedBinding(provider, credential)).message
+			: undefined;
+	}
+
+	private assertProviderMutable(provider: string): void {
+		const credential = this.data[provider];
+		if (credential?.type === "external") {
+			throw new ManagedAuthConflictError(provider, this.getManagedBinding(provider, credential));
 		}
 	}
 
@@ -648,6 +864,10 @@ export class AuthStorage {
 		try {
 			this.storage.withLock((current) => {
 				const currentData = this.parseStorageData(current);
+				const currentCredential = currentData[provider];
+				if (currentCredential?.type === "external") {
+					throw new ManagedAuthConflictError(provider, this.getManagedBinding(provider, currentCredential));
+				}
 				const merged: AuthStorageData = { ...currentData };
 				if (credential) {
 					merged[provider] = credential;
@@ -657,6 +877,7 @@ export class AuthStorage {
 				return { result: undefined, next: JSON.stringify(merged, null, 2) };
 			});
 		} catch (error) {
+			if (error instanceof ManagedAuthConflictError) throw error;
 			this.recordError(error);
 		}
 	}
@@ -665,25 +886,37 @@ export class AuthStorage {
 	 * Get credential for a provider.
 	 */
 	get(provider: string): AuthCredential | undefined {
-		return this.data[provider] ?? undefined;
+		const credential = this.data[provider];
+		return credential ? cloneCredential(credential) : undefined;
+	}
+
+	/** Inspect a non-secret external descriptor without enabling helper execution. */
+	getExternalDescriptor(provider: string): ExternalCredentialDescriptor | undefined {
+		const credential = this.data[provider];
+		return credential?.type === "external"
+			? (cloneCredential(credential) as ExternalCredentialDescriptor)
+			: undefined;
 	}
 
 	/**
 	 * Set credential for a provider.
 	 */
 	set(provider: string, credential: AuthCredential): void {
+		this.assertProviderMutable(provider);
+		const storedCredential = cloneCredential(credential);
+		this.persistProviderChange(provider, storedCredential);
 		this.clearStaleAuthSource(provider, "stored");
-		this.data[provider] = credential;
-		this.persistProviderChange(provider, credential);
+		this.data[provider] = storedCredential;
 	}
 
 	/**
 	 * Remove credential for a provider.
 	 */
 	remove(provider: string): void {
+		this.assertProviderMutable(provider);
+		this.persistProviderChange(provider, undefined);
 		this.clearStaleAuthSource(provider, "stored");
 		delete this.data[provider];
-		this.persistProviderChange(provider, undefined);
 	}
 
 	/**
@@ -719,7 +952,7 @@ export class AuthStorage {
 	 * Get all credentials (for passing to getOAuthApiKey).
 	 */
 	getAll(): AuthStorageData {
-		return { ...this.data };
+		return cloneStorageData(this.data);
 	}
 
 	drainErrors(): Error[] {
@@ -732,6 +965,7 @@ export class AuthStorage {
 	 * Login to an OAuth provider.
 	 */
 	async login(providerId: OAuthProviderId, callbacks: OAuthLoginCallbacks): Promise<void> {
+		this.assertProviderMutable(providerId);
 		const provider = getOAuthProvider(providerId);
 		if (!provider) {
 			throw new Error(`Unknown OAuth provider: ${providerId}`);
@@ -745,6 +979,7 @@ export class AuthStorage {
 	 * Logout from a provider.
 	 */
 	logout(provider: string): void {
+		this.assertProviderMutable(provider);
 		if (provider === PRIME_INFERENCE_PROVIDER_ID && this.isPrimeCliConfigEnabled()) {
 			try {
 				clearPrimeCliCredentials(this.getEnabledPrimeCliConfigPath());
@@ -765,51 +1000,100 @@ export class AuthStorage {
 		providerId: OAuthProviderId,
 	): Promise<{ apiKey: string; newCredentials: OAuthCredentials } | null> {
 		const provider = getOAuthProvider(providerId);
-		if (!provider) {
-			return null;
-		}
+		if (!provider) return null;
 
-		const result = await this.storage.withLockAsync(async (current) => {
-			const currentData = this.parseStorageData(current);
-			this.data = currentData;
+		return this.storage.withLockAsync(async (current) => {
+			const diskData = this.parseStorageData(current);
+			const diskCredential = diskData[providerId];
+			if (diskCredential?.type === "external") {
+				throw new ManagedAuthConflictError(providerId, this.getManagedBinding(providerId, diskCredential));
+			}
+			this.data = this.preserveExternalSessionSnapshot({ ...diskData });
 			this.loadError = null;
 
-			const cred = currentData[providerId];
-			if (cred?.type !== "oauth") {
-				return { result: null };
-			}
-
-			if (Date.now() < cred.expires) {
-				return { result: { apiKey: provider.getApiKey(cred), newCredentials: cred } };
+			if (diskCredential?.type !== "oauth") return { result: null };
+			if (Date.now() < diskCredential.expires) {
+				return {
+					result: { apiKey: provider.getApiKey(diskCredential), newCredentials: diskCredential },
+				};
 			}
 
 			const oauthCreds: Record<string, OAuthCredentials> = {};
-			for (const [key, value] of Object.entries(currentData)) {
-				if (value.type === "oauth") {
-					oauthCreds[key] = value;
-				}
+			for (const [key, value] of Object.entries(diskData)) {
+				if (value.type === "oauth") oauthCreds[key] = value;
 			}
-
 			const refreshed = await getOAuthApiKey(providerId, oauthCreds);
-			if (!refreshed) {
-				return { result: null };
-			}
+			if (!refreshed) return { result: null };
 
 			const merged: AuthStorageData = {
-				...currentData,
-				[providerId]: { type: "oauth", ...refreshed.newCredentials },
+				...diskData,
+				[providerId]: cloneCredential({ type: "oauth", ...refreshed.newCredentials }),
 			};
-			this.data = merged;
+			this.data = this.preserveExternalSessionSnapshot({ ...merged });
 			this.loadError = null;
 			return { result: refreshed, next: JSON.stringify(merged, null, 2) };
 		});
+	}
 
-		return result;
+	private async resolveExternalAccess(
+		providerId: string,
+		descriptor: ExternalCredentialDescriptor,
+	): Promise<ResolvedExternalAccess> {
+		if (!this.externalResolutionEnabled) {
+			throw new ExternalCredentialError("helper_unavailable");
+		}
+		const sessionBinding = this.externalBindings.get(providerId);
+		if (
+			sessionBinding &&
+			(sessionBinding.source !== descriptor.source || descriptor.protocol !== EXTERNAL_CREDENTIAL_PROTOCOL)
+		) {
+			throw new ExternalCredentialError("identity_conflict");
+		}
+
+		const generation = this.externalSessionGeneration;
+		const preservedBinding = sessionBinding?.binding !== descriptor.binding ? sessionBinding : undefined;
+		const binding = preservedBinding?.binding ?? descriptor.binding;
+		const expectedIdentityFingerprint =
+			preservedBinding?.identityFingerprint ?? descriptor.expectedIdentityFingerprint;
+		const resolved = await this.externalClient.resolve(descriptor, providerId, binding, expectedIdentityFingerprint);
+		const sourceToken: AuthSourceToken = {
+			provider: providerId,
+			source: "external",
+			identityFingerprint: resolved.identityFingerprint,
+			valueFingerprint: resolved.valueFingerprint,
+		};
+		if (generation === this.externalSessionGeneration) {
+			this.lastExternalSourceTokens.set(providerId, sourceToken);
+		}
+
+		if (!sessionBinding && generation === this.externalSessionGeneration) {
+			const persistedBinding: CredentialBinding = {
+				provider: providerId,
+				source: descriptor.source,
+				binding: resolved.binding,
+				identityFingerprint: resolved.identityFingerprint,
+			};
+			this.externalBindings.set(providerId, persistedBinding);
+			this.onExternalBindingResolved?.({ ...persistedBinding });
+		} else if (sessionBinding && !preservedBinding && generation === this.externalSessionGeneration) {
+			// A same-label descriptor identity update is authoritative for this root.
+			// Do not append conflicting historical metadata; future resumes reapply
+			// the installed descriptor authority for the same label.
+			this.externalBindings.set(providerId, {
+				provider: providerId,
+				source: descriptor.source,
+				binding: resolved.binding,
+				identityFingerprint: resolved.identityFingerprint,
+			});
+		}
+
+		return resolved;
 	}
 
 	/**
 	 * Get API key for a provider.
-	 * Priority:
+	 * External auth is exclusive. Otherwise the existing Prime CLI, team,
+	 * stored, environment, and fallback precedence is unchanged.
 	 * 1. Runtime override (CLI --api-key)
 	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
 	 * 3. Other providers: auth.json, environment variable
@@ -819,6 +1103,34 @@ export class AuthStorage {
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		const credential = this.data[providerId];
+		if (credential?.type === "external") {
+			if (!this.externalResolutionEnabled) {
+				return {};
+			}
+			const resolved = await this.resolveExternalAccess(providerId, credential);
+			const sourceToken: AuthSourceToken = {
+				provider: providerId,
+				source: "external",
+				identityFingerprint: resolved.identityFingerprint,
+				valueFingerprint: resolved.valueFingerprint,
+			};
+			if (
+				this.staleAuthSources
+					.get(providerId)
+					?.some(
+						(token) =>
+							token.source === "external" &&
+							token.identityFingerprint === sourceToken.identityFingerprint &&
+							token.valueFingerprint === sourceToken.valueFingerprint,
+					) === true
+			) {
+				this.externalClient.invalidate({ ...sourceToken, source: "external" });
+				throw new ExternalCredentialError("reauth_required");
+			}
+			return { apiKey: resolved.accessToken, sourceToken };
+		}
+
 		// Runtime override takes highest priority
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);
@@ -905,6 +1217,7 @@ export class AuthStorage {
 						}
 					} catch (error) {
 						this.recordError(error);
+						if (error instanceof ManagedAuthConflictError) throw error;
 						// Refresh failed - re-read file to check if another instance succeeded
 						this.reload();
 						const updatedCred = this.data[providerId];
@@ -961,6 +1274,41 @@ export class AuthStorage {
 		return {};
 	}
 
+	/** Invalidate and reacquire one exact external value; version-only changes are terminal. */
+	async retryExternalApiKey(sourceToken: AuthSourceToken): Promise<AuthApiKeyResult | undefined> {
+		if (sourceToken.source !== "external") return undefined;
+		const credential = this.data[sourceToken.provider];
+		if (credential?.type !== "external" || !this.externalResolutionEnabled) return undefined;
+		const sessionBinding = this.externalBindings.get(sourceToken.provider);
+		if (
+			sessionBinding &&
+			(sessionBinding.source !== credential.source || credential.protocol !== EXTERNAL_CREDENTIAL_PROTOCOL)
+		) {
+			throw new ExternalCredentialError("identity_conflict");
+		}
+		const generation = this.externalSessionGeneration;
+		const preservedBinding = sessionBinding?.binding !== credential.binding ? sessionBinding : undefined;
+		const resolved = await this.externalClient.resolveAfterRejection(
+			credential,
+			{ ...sourceToken, source: "external" },
+			preservedBinding?.binding ?? credential.binding,
+			preservedBinding?.identityFingerprint ?? credential.expectedIdentityFingerprint,
+		);
+		if (generation !== this.externalSessionGeneration) {
+			throw new ExternalCredentialError("coordination_unavailable");
+		}
+		if (!resolved || resolved.valueFingerprint === sourceToken.valueFingerprint) return undefined;
+		return {
+			apiKey: resolved.accessToken,
+			sourceToken: {
+				provider: sourceToken.provider,
+				source: "external",
+				identityFingerprint: resolved.identityFingerprint,
+				valueFingerprint: resolved.valueFingerprint,
+			},
+		};
+	}
+
 	async getApiKey(providerId: string, options?: { includeFallback?: boolean }): Promise<string | undefined> {
 		const result = await this.getApiKeyWithSourceToken(providerId, options);
 		return result.apiKey;
@@ -974,6 +1322,7 @@ export class AuthStorage {
 	}
 
 	setPrimeInferenceTeamSelection(team: PrimeTeam | null): void {
+		this.assertProviderMutable(PRIME_INFERENCE_PROVIDER_ID);
 		if (this.isPrimeCliConfigEnabled()) {
 			try {
 				savePrimeCliTeamSelection(team, this.getEnabledPrimeCliConfigPath());
@@ -995,6 +1344,7 @@ export class AuthStorage {
 	}
 
 	setPrimeInferenceApiKey(apiKey: string): void {
+		this.assertProviderMutable(PRIME_INFERENCE_PROVIDER_ID);
 		if (this.isPrimeCliConfigEnabled()) {
 			try {
 				const configPath = this.getEnabledPrimeCliConfigPath();

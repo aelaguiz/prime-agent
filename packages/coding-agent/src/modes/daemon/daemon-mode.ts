@@ -122,6 +122,8 @@ import {
 	createAgentConnectionCommands,
 	createAgentConnectionResourceSnapshot,
 	createAgentConnectionState,
+	sanitizeAgentConnectionSessionTreeFlatNodes,
+	sanitizeAgentConnectionSessionTreeLeafId,
 } from "../agent-connection/snapshot.js";
 import { createAgentConnectionToolDefinition } from "../agent-connection/tool-definition.js";
 import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
@@ -168,7 +170,11 @@ import {
 	success,
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
-import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
+import {
+	getDaemonRuntimeIdentity,
+	PRIME_AGENT_BUILD_ID_ENV,
+	PRIME_AGENT_EXPECTED_BUILD_ID_ENV,
+} from "./daemon-runtime-identity.js";
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
@@ -815,6 +821,10 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
+			// The candidate must attest its own current bundle/source identity.
+			// Never let an inherited source BUILD_ID make new code impersonate this worker's build.
+			delete environment[PRIME_AGENT_BUILD_ID_ENV];
+			environment[PRIME_AGENT_EXPECTED_BUILD_ID_ENV] = getDaemonRuntimeIdentity().buildId;
 			const child = spawn(launch.command, launch.args, {
 				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
 				detached: true,
@@ -4468,9 +4478,11 @@ export class AgentDaemon {
 
 			case "get_session_tree": {
 				const state = this.getSessionState(command.activeSessionId);
+				const sessionManager = state.runtime.session.sessionManager;
+				const flatNodes = sessionManager.getFlatTree();
 				return success(command.id, "get_session_tree", {
-					flatNodes: state.runtime.session.sessionManager.getFlatTree(),
-					leafId: state.runtime.session.sessionManager.getLeafId(),
+					flatNodes: sanitizeAgentConnectionSessionTreeFlatNodes(flatNodes),
+					leafId: sanitizeAgentConnectionSessionTreeLeafId(sessionManager.getLeafId(), flatNodes),
 				});
 			}
 

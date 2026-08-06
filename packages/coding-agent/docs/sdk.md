@@ -407,9 +407,10 @@ If no model is provided:
 
 > See [examples/sdk/02-custom-model.ts](../examples/sdk/02-custom-model.ts)
 
-### API Keys and OAuth
+### API Keys, OAuth, and AIM-Managed Credentials
 
-API key resolution priority (handled by AuthStorage):
+When a provider has an AIM-managed `type: "external"` descriptor in `auth.json`, that descriptor is exclusive and fails closed. Runtime overrides, native stored credentials, environment variables, and fallback keys cannot replace it. For providers without an external descriptor, native resolution priority is:
+
 1. Runtime overrides (via `setRuntimeApiKey`, not persisted)
 2. Stored credentials in `auth.json` (API keys or OAuth tokens)
 3. Environment variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.)
@@ -445,7 +446,13 @@ const { session } = await createAgentSession({
 const simpleRegistry = ModelRegistry.inMemory(authStorage);
 ```
 
-> See [examples/sdk/09-api-keys-and-oauth.ts](../examples/sdk/09-api-keys-and-oauth.ts)
+`createAgentSession()` activates external resolution only for its worker-owned session runtime. Use one `AuthStorage`/`ModelRegistry` pair per root runtime; `createAgentSession()` rejects mismatched pairs and managed storage cannot be shared across roots. Inspection-only SDK code can read `authStorage.getAuthStatus(provider)` and the defensive copy from `authStorage.getExternalDescriptor(provider)` without executing the helper. Do not execute a descriptor yourself, inject a returned access token with `setRuntimeApiKey`, or copy helper output into another process; doing so bypasses identity binding, memory-only caching, bounded helper execution, and the one-shot structured auth-retry policy.
+
+The public descriptor/protocol surface is exported as `ExternalCredentialDescriptor`, `ExternalCredentialRequest`, `ExternalCredentialSuccess`, `ExternalCredentialFailure`, `ExternalCredentialResponse`, `ExternalCredentialError`, and `EXTERNAL_CREDENTIAL_PROTOCOL`. Descriptors are non-secret installation records normally owned by AIM. Access fingerprints and helper-private credential versions are intentionally internal and are not part of the SDK event or session contract.
+
+A root's first successful managed resolution appends a non-context `credential_binding` session entry. Continuing or forking that session restores the exact identity binding, and RLM descendants inherit it. SDK clients receive the existing `auth_stale` event if a structured pre-stream 401/403 remains terminal; the event shape is unchanged and no credential version is added.
+
+> See [providers.md](providers.md#aim-managed-credentials) for the descriptor, helper, lifecycle, and threat-model contract, and [examples/sdk/09-api-keys-and-oauth.ts](../examples/sdk/09-api-keys-and-oauth.ts) for native auth examples.
 
 ### System Prompt
 

@@ -8843,7 +8843,10 @@ export class InteractiveMode {
 	}
 
 	private async handleSessionCommand(): Promise<void> {
-		const stats = await this.agentConnection.getSessionStats();
+		const [stats, state] = await Promise.all([
+			this.agentConnection.getSessionStats(),
+			this.agentConnection.getState(),
+		]);
 		const sessionName = this.getCurrentSessionName();
 
 		let info = `${theme.bold("Session Info")}\n\n`;
@@ -8852,6 +8855,14 @@ export class InteractiveMode {
 		}
 		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
 		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
+		if (state.credentialBindings?.length) {
+			info += `${theme.bold("Managed accounts")}\n`;
+			for (const binding of state.credentialBindings) {
+				const source = binding.source === "aimgr" ? "AIM" : binding.source;
+				info += `${theme.fg("dim", `${binding.provider}:`)} ${source} · ${binding.binding}\n`;
+			}
+			info += "\n";
+		}
 		info += `${theme.bold("Messages")}\n`;
 		info += `${theme.fg("dim", "User:")} ${stats.userMessages}\n`;
 		info += `${theme.fg("dim", "Assistant:")} ${stats.assistantMessages}\n`;

@@ -316,6 +316,13 @@ export interface AgentConnectionModelCycleResult {
 	isScoped: boolean;
 }
 
+/** Non-secret managed credential identity pinned to the active root session tree. */
+export interface AgentConnectionCredentialBinding {
+	provider: string;
+	source: string;
+	binding: string;
+}
+
 export interface AgentConnectionState {
 	activeSessionId?: string;
 	cwd: string;
@@ -343,6 +350,8 @@ export interface AgentConnectionState {
 	scopedModels: AgentConnectionScopedModel[];
 	activeToolNames: string[];
 	contextUsage: SessionStats["contextUsage"];
+	/** Secret-free account labels for managed providers in this root tree. */
+	credentialBindings?: AgentConnectionCredentialBinding[];
 	/** One-line recap of the agent's recent work, shown above the prompt. */
 	recap?: string;
 }

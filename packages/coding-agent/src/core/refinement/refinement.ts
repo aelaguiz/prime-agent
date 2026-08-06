@@ -870,6 +870,7 @@ export async function planRefinement(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	complete: typeof completeSimple = completeSimple,
 ): Promise<RefinementPlan> {
 	const id = `refine_${new Date()
 		.toISOString()
@@ -910,7 +911,7 @@ export async function planRefinement(
 	// Keep the refinement request non-reasoning regardless of the interactive session
 	// thinking level so the model uses its output budget for the JSON object.
 	void thinkingLevel;
-	const response = await completeSimple(
+	const response = await complete(
 		model,
 		{
 			systemPrompt: REFINEMENT_SYSTEM_PROMPT,
@@ -956,6 +957,7 @@ export async function reviewAutoRefine(
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
+	complete: typeof completeSimple = completeSimple,
 ): Promise<AutoRefineReview> {
 	const conversationText = serializeConversation(convertToLlm(messages)).slice(-40_000);
 	const userPrompt = [
@@ -976,7 +978,7 @@ ${conversationText}
 	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
 	// reasoning-capable models use final text budget for the JSON object.
 	void thinkingLevel;
-	const response = await completeSimple(
+	const response = await complete(
 		model,
 		{
 			systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,

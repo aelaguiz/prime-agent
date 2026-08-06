@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
+import { completeSimpleWithExternalAuthRetry } from "../../core/external-auth-retry.js";
 import type { ModelRegistry } from "../../core/model-registry.js";
 import type { AgentStatus, AgentTaskState } from "../../core/session-manager.js";
 import type { ActiveSessionState } from "./active-session-state.js";
@@ -157,12 +157,8 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 	if (!model) {
 		return undefined;
 	}
-	const auth = await registry.getApiKeyAndHeaders(model);
-	if (!auth.ok || !auth.apiKey) {
-		return undefined;
-	}
 	try {
-		const response = await completeSimple(
+		const response = await completeSimpleWithExternalAuthRetry(
 			model,
 			{
 				systemPrompt: AGENT_STATUS_SYSTEM_PROMPT,
@@ -174,7 +170,8 @@ export async function generateAgentStatus(params: GenerateAgentStatusParams): Pr
 					},
 				],
 			},
-			{ maxTokens: SUMMARY_MAX_TOKENS, apiKey: auth.apiKey, headers: auth.headers, signal },
+			{ maxTokens: SUMMARY_MAX_TOKENS, signal },
+			registry,
 		);
 		if (response.stopReason === "error") {
 			return undefined;

@@ -43,6 +43,23 @@ import {
 	resolveHeadersOrThrow,
 } from "./resolve-config-value.js";
 
+const EXTERNAL_AUTH_HEADER_NAMES = new Set(["authorization", "x-api-key"]);
+
+function assertNoExternalAuthHeaderOverrides(
+	provider: string,
+	sources: Array<Record<string, string> | undefined>,
+): void {
+	for (const headers of sources) {
+		for (const name of Object.keys(headers ?? {})) {
+			if (EXTERNAL_AUTH_HEADER_NAMES.has(name.toLowerCase())) {
+				throw new Error(
+					`Authentication header "${name}" cannot override AIM-managed credentials for "${provider}"`,
+				);
+			}
+		}
+	}
+}
+
 // Schema for OpenRouter routing preferences
 const PercentileCutoffsSchema = Type.Object({
 	p50: Type.Optional(Type.Number()),
@@ -268,6 +285,8 @@ export type ResolvedRequestAuth =
 			ok: true;
 			apiKey?: string;
 			headers?: Record<string, string>;
+			/** Non-bearer source/value fingerprints used only for exact stale-source handling. */
+			sourceToken?: AuthSourceToken;
 	  }
 	| {
 			ok: false;
@@ -1075,7 +1094,9 @@ export class ModelRegistry {
 		provider: string,
 		options?: { resolvedApiKey?: string },
 	): ProviderRequestAuthSource | undefined {
-		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
+		const providerApiKey = this.authStorage.isExternalAuthManaged(provider)
+			? undefined
+			: this.providerRequestConfigs.get(provider)?.apiKey;
 		if (!providerApiKey) {
 			return undefined;
 		}
@@ -1211,7 +1232,9 @@ export class ModelRegistry {
 			return authStorageToken;
 		}
 
-		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
+		const providerApiKey = this.authStorage.isExternalAuthManaged(provider)
+			? undefined
+			: this.providerRequestConfigs.get(provider)?.apiKey;
 		if (!providerApiKey) {
 			return undefined;
 		}
@@ -1302,7 +1325,11 @@ export class ModelRegistry {
 			});
 			let apiKey = authStorageAuth.apiKey;
 			let authSourceToken = authStorageAuth.sourceToken;
-			if (apiKey === undefined && providerConfig?.apiKey) {
+			if (
+				apiKey === undefined &&
+				!this.authStorage.isExternalAuthManaged(model.provider) &&
+				providerConfig?.apiKey
+			) {
 				const resolvedApiKey = resolveConfigValueOrThrow(
 					providerConfig.apiKey,
 					`API key for provider "${model.provider}"`,
@@ -1325,6 +1352,14 @@ export class ModelRegistry {
 				this.modelRequestHeaders.get(this.getModelRequestKey(model.provider, model.id)),
 				`model "${model.provider}/${model.id}"`,
 			);
+			if (this.authStorage.isExternalAuthManaged(model.provider)) {
+				assertNoExternalAuthHeaderOverrides(model.provider, [
+					model.headers,
+					authStorageHeaders,
+					providerHeaders,
+					modelHeaders,
+				]);
+			}
 
 			let headers =
 				model.headers || authStorageHeaders || providerHeaders || modelHeaders
@@ -1342,7 +1377,28 @@ export class ModelRegistry {
 				ok: true,
 				apiKey,
 				headers: headers && Object.keys(headers).length > 0 ? headers : undefined,
+				...(authSourceToken?.source === "external" ? { sourceToken: authSourceToken } : {}),
 			};
+		} catch (error) {
+			return {
+				ok: false,
+				error: error instanceof Error ? error.message : String(error),
+			};
+		}
+	}
+
+	/** Reacquire one exact external source after a structured provider 401/403. */
+	async retryExternalAuth(model: Model<Api>, sourceToken: AuthSourceToken): Promise<ResolvedRequestAuth> {
+		try {
+			const changed = await this.authStorage.retryExternalApiKey(sourceToken);
+			if (!changed?.apiKey || !changed.sourceToken) {
+				return { ok: false, error: "External credential did not change after authentication rejection." };
+			}
+			const refreshed = await this.getApiKeyAndHeaders(model);
+			if (refreshed.ok) {
+				this.setLastProviderAuthSourceToken(model.provider, refreshed.sourceToken);
+			}
+			return refreshed;
 		} catch (error) {
 			return {
 				ok: false,
@@ -1403,7 +1459,9 @@ export class ModelRegistry {
 			return authStorageAuth.apiKey;
 		}
 
-		const providerApiKey = this.providerRequestConfigs.get(provider)?.apiKey;
+		const providerApiKey = this.authStorage.isExternalAuthManaged(provider)
+			? undefined
+			: this.providerRequestConfigs.get(provider)?.apiKey;
 		if (!providerApiKey) {
 			this.setLastProviderAuthSourceToken(provider, undefined);
 			return undefined;

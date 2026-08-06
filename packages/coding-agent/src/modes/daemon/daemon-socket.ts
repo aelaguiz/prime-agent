@@ -1,8 +1,11 @@
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
+import type { DaemonRuntimeIdentity } from "./daemon-protocol.js";
+import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
 
 const DAEMON_SOCKET_MODE = 0o600;
 const DAEMON_SOCKET_DIR_MODE = 0o700;
@@ -33,11 +36,28 @@ export interface DaemonSocketIdentity {
 	ino: number;
 }
 
-export function defaultDaemonSocketPath(): string {
-	if (process.platform === "win32") {
-		return "\\\\.\\pipe\\prime-agent-daemon";
+export function daemonSocketRuntimeScope(identity: DaemonRuntimeIdentity = getDaemonRuntimeIdentity()): string {
+	// The daemon handshake defines runtime compatibility by build ID. Paths are
+	// diagnostic only: the same installed build can be invoked through a symlink,
+	// wrapper, or alternate Node executable and must still converge.
+	return createHash("sha256").update(identity.buildId).digest("hex").slice(0, 16);
+}
+
+/**
+ * The implicit daemon owner is build-scoped. Compatible same-build clients
+ * converge, while different source/install builds coexist instead of negotiating
+ * lifecycle on one global socket. Explicit --daemon-socket callers bypass this
+ * derivation and retain exact-path semantics.
+ */
+export function defaultDaemonSocketPath(
+	identity: DaemonRuntimeIdentity = getDaemonRuntimeIdentity(),
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const scope = daemonSocketRuntimeScope(identity);
+	if (platform === "win32") {
+		return `\\\\.\\pipe\\prime-agent-daemon-${scope}`;
 	}
-	return join(defaultDaemonSocketDir(), "daemon.sock");
+	return join(defaultDaemonSocketDir(), `daemon-${scope}.sock`);
 }
 
 export async function acquireDaemonSocketPathLease(socketPath: string): Promise<DaemonSocketPathLease | undefined> {
@@ -213,7 +233,11 @@ function assertSocketLease(socketPath: string, lease: DaemonSocketPathLease): vo
 
 export function defaultDaemonSocketDir(): string {
 	const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-	return join(tmpdir(), `prime-agent-${suffix}`);
+	const name = `prime-agent-${suffix}`;
+	const candidate = join(tmpdir(), name);
+	// Keep enough room for the longer per-worker socket name under the
+	// conservative 104-byte sockaddr_un limit used by macOS.
+	return Buffer.byteLength(candidate) <= 64 ? candidate : join("/tmp", name);
 }
 
 function ensureDefaultDaemonSocketDir(socketPath: string): void {

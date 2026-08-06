@@ -43,6 +43,7 @@ import {
 	listDaemonSavedSessions,
 	renameDaemonSavedSession,
 } from "../daemon/saved-session-catalog.js";
+import { sanitizeAgentConnectionSessionTreeFlatNodes, sanitizeAgentConnectionSessionTreeLeafId } from "./snapshot.js";
 import type {
 	AgentConnection,
 	AgentConnectionBeforeSessionInvalidateListener,
@@ -176,8 +177,9 @@ export interface DaemonAgentConnectionOptions {
  * daemon command details stay inside this adapter.
  */
 export function buildSessionTreeFromFlatNodes(
-	flatNodes: readonly AgentConnectionSessionTreeFlatNode[],
+	rawFlatNodes: readonly AgentConnectionSessionTreeFlatNode[],
 ): AgentConnectionSessionTreeNode[] {
+	const flatNodes = sanitizeAgentConnectionSessionTreeFlatNodes(rawFlatNodes);
 	const byId = new Map<string, AgentConnectionSessionTreeNode>();
 	const roots: AgentConnectionSessionTreeNode[] = [];
 	for (const flatNode of flatNodes) {
@@ -508,7 +510,10 @@ export class DaemonAgentConnection implements AgentConnection {
 			type: "get_session_tree",
 			activeSessionId: this.activeSessionId,
 		});
-		return { tree: buildSessionTreeFromFlatNodes(data.flatNodes), leafId: data.leafId };
+		return {
+			tree: buildSessionTreeFromFlatNodes(data.flatNodes),
+			leafId: sanitizeAgentConnectionSessionTreeLeafId(data.leafId, data.flatNodes),
+		};
 	}
 
 	async listSavedSessions(

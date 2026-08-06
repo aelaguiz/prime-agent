@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple, supportsFastMode } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Message, type Model, supportsFastMode } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
@@ -9,6 +9,8 @@ import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
+import { streamWithExternalAuthRetry } from "./external-auth-retry.js";
+import { initializeExternalCredentialSession } from "./external-auth-session.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
 import { ModelRegistry } from "./model-registry.js";
@@ -160,11 +162,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Use provided or create AuthStorage and ModelRegistry
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
-	const authStorage = options.authStorage ?? AuthStorage.create(authPath);
+	const authStorage = options.authStorage ?? options.modelRegistry?.authStorage ?? AuthStorage.create(authPath);
 	const modelRegistry = options.modelRegistry ?? ModelRegistry.create(authStorage, modelsPath);
+	if (modelRegistry.authStorage !== authStorage) {
+		throw new Error(
+			"createAgentSession requires modelRegistry and authStorage to share the same AuthStorage instance",
+		);
+	}
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	initializeExternalCredentialSession(authStorage, sessionManager);
 
 	// Ensure MCP providers are registered and built-in MCP skills are gated by
 	// auth even on the bare SDK path (not just the CLI's createAgentSessionServices).
@@ -309,14 +317,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				throw new Error(auth.error);
 			}
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			return streamSimple(model, context, {
-				...options,
-				apiKey: auth.apiKey,
-				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
-			});
+			return streamWithExternalAuthRetry(
+				model,
+				context,
+				{
+					...options,
+					timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
+					maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+					maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				},
+				modelRegistry,
+				auth,
+			);
 		},
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;

@@ -207,6 +207,41 @@ describe("ProviderAuthFlows", () => {
 		await expect(logoutResult).resolves.toBeNull();
 	});
 
+	it("shows AIM guidance instead of starting managed login or logout", async () => {
+		writeFileSync(
+			authJsonPath,
+			JSON.stringify({
+				anthropic: {
+					type: "external",
+					source: "aimgr",
+					protocol: "aimgr-credential-v1",
+					executable: join(tempDir, "fake-aim"),
+					args: ["credential-helper"],
+					binding: "fable",
+					expectedIdentityFingerprint: "identity-fable",
+				},
+			}),
+		);
+		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
+		const { host, statusMessages, errorMessages, overlays } = createHost(authStorage);
+		const flows = new ProviderAuthFlows(host);
+
+		await expect(flows.loginProvider({ id: "anthropic", name: "Anthropic", authType: "oauth" })).resolves.toEqual({
+			status: "failed",
+		});
+		expect(overlays).toEqual([]);
+		expect(errorMessages).toEqual([]);
+		expect(statusMessages.at(-1)).toContain("aim prime use");
+		expect(statusMessages.at(-1)).toContain("aim prime uninstall --provider anthropic");
+
+		const logoutResult = flows.runLogout();
+		expect(overlays).toHaveLength(1);
+		overlays[0]?.handleInput?.("\r");
+		await expect(logoutResult).resolves.toBeNull();
+		expect(statusMessages.at(-1)).toContain("managed by AIM");
+		expect(authStorage.get("anthropic")?.type).toBe("external");
+	});
+
 	it("opens login on the requested MCP Connections category", async () => {
 		const authStorage = AuthStorage.create(authJsonPath, { usePrimeCliConfig: false });
 		const { host, overlays } = createHost(authStorage);

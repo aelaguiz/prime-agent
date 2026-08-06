@@ -3,9 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PRIME_AGENT_LAUNCHER_PATH="$SCRIPT_DIR/prime-agent.sh"
-if BUILD_ID="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty 2>/dev/null)"; then
-  export PRIME_AGENT_BUILD_ID="$BUILD_ID"
+# A plain `git describe --dirty` is identical across all edits in a dirty source
+# checkout, so an old daemon can otherwise accept a newer source client and spawn
+# stale workers. Fingerprint tracked and untracked source truth for daemon fencing.
+if ! BUILD_ID="$(node "$SCRIPT_DIR/scripts/source-build-id.mjs" "$SCRIPT_DIR")"; then
+  echo "Failed to compute the Prime Agent source build identity." >&2
+  exit 1
 fi
+export PRIME_AGENT_BUILD_ID="$BUILD_ID"
 
 # Check for --no-env / --dist flags
 NO_ENV=false

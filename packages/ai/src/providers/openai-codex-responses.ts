@@ -40,6 +40,7 @@ import {
 } from "../utils/diagnostics.js";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { headersToRecord } from "../utils/headers.js";
+import { formatStreamFailureMessage, recordStreamFailure } from "../utils/stream-failure.js";
 import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 
@@ -100,6 +101,7 @@ interface RequestBody {
 // ============================================================================
 
 function isRetryableError(status: number, errorText: string): boolean {
+	if (status === 401 || status === 403) return false;
 	if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
 		return true;
 	}
@@ -265,12 +267,16 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					const providerError = new Error(info.friendlyMessage || info.message) as Error & { status: number };
+					providerError.status = response.status;
+					throw providerError;
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
 							throw new Error("Request was aborted");
 						}
+						const status = (error as Error & { status?: unknown }).status;
+						if (status === 401 || status === 403) throw error;
 					}
 					lastError = error instanceof Error ? error : new Error(String(error));
 					// Network errors are retryable
@@ -306,7 +312,8 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
+			output.errorMessage = formatStreamFailureMessage(error);
+			recordStreamFailure(model, output, error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -486,7 +493,11 @@ class CodexProtocolError extends Error {
 }
 
 function isCodexNonTransportError(error: unknown): boolean {
-	return error instanceof CodexApiError || error instanceof CodexProtocolError;
+	const status =
+		error && typeof error === "object" && typeof (error as { status?: unknown }).status === "number"
+			? (error as { status: number }).status
+			: undefined;
+	return status === 401 || status === 403 || error instanceof CodexApiError || error instanceof CodexProtocolError;
 }
 
 async function* mapCodexEvents(events: AsyncIterable<Record<string, unknown>>): AsyncGenerator<ResponseStreamEvent> {
@@ -915,25 +926,45 @@ async function acquireWebSocket(
 	};
 }
 
+function webSocketHttpStatus(event: unknown): number | undefined {
+	if (!event || typeof event !== "object") return undefined;
+	for (const candidate of [
+		(event as { status?: unknown }).status,
+		(event as { statusCode?: unknown }).statusCode,
+		(event as { response?: { status?: unknown } }).response?.status,
+		(event as { error?: { status?: unknown; statusCode?: unknown } }).error?.status,
+		(event as { error?: { status?: unknown; statusCode?: unknown } }).error?.statusCode,
+	]) {
+		if (typeof candidate === "number") return candidate;
+	}
+	return undefined;
+}
+
+function withWebSocketHttpStatus(error: Error, event: unknown): Error {
+	const status = webSocketHttpStatus(event);
+	if (status !== undefined) (error as Error & { status: number }).status = status;
+	return error;
+}
+
 function extractWebSocketError(event: unknown): Error {
 	if (event && typeof event === "object") {
 		const message = "message" in event ? (event as { message?: unknown }).message : undefined;
 		if (typeof message === "string" && message.length > 0) {
-			return new Error(message);
+			return withWebSocketHttpStatus(new Error(message), event);
 		}
 
 		const nestedError = "error" in event ? (event as { error?: unknown }).error : undefined;
 		if (nestedError instanceof Error && nestedError.message.length > 0) {
-			return nestedError;
+			return withWebSocketHttpStatus(nestedError, event);
 		}
 		if (nestedError && typeof nestedError === "object" && "message" in nestedError) {
 			const nestedMessage = (nestedError as { message?: unknown }).message;
 			if (typeof nestedMessage === "string" && nestedMessage.length > 0) {
-				return new Error(nestedMessage);
+				return withWebSocketHttpStatus(new Error(nestedMessage), event);
 			}
 		}
 	}
-	return new Error("WebSocket error");
+	return withWebSocketHttpStatus(new Error("WebSocket error"), event);
 }
 
 function extractWebSocketCloseError(event: unknown): Error {
@@ -946,13 +977,16 @@ function extractWebSocketCloseError(event: unknown): Error {
 		if (!reasonText && code === WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE) {
 			reasonText = " message too big";
 		}
-		return new WebSocketCloseError(`WebSocket closed${codeText}${reasonText}`.trim(), {
-			code: typeof code === "number" ? code : undefined,
-			reason: typeof reason === "string" && reason.length > 0 ? reason : undefined,
-			wasClean: typeof wasClean === "boolean" ? wasClean : undefined,
-		});
+		return withWebSocketHttpStatus(
+			new WebSocketCloseError(`WebSocket closed${codeText}${reasonText}`.trim(), {
+				code: typeof code === "number" ? code : undefined,
+				reason: typeof reason === "string" && reason.length > 0 ? reason : undefined,
+				wasClean: typeof wasClean === "boolean" ? wasClean : undefined,
+			}),
+			event,
+		);
 	}
-	return new Error("WebSocket closed");
+	return withWebSocketHttpStatus(new Error("WebSocket closed"), event);
 }
 
 async function decodeWebSocketData(data: unknown): Promise<string | null> {

@@ -13,8 +13,11 @@ import {
 } from "../src/cli/daemon-launch.js";
 import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import { getDaemonRuntimeIdentity } from "../src/modes/daemon/daemon-runtime-identity.js";
+import { defaultDaemonSocketPath } from "../src/modes/daemon/daemon-socket.js";
 
 interface FakeDaemonOptions {
+	socketPath?: string;
 	/** Sessions returned for a `list` command. */
 	sessions?: Array<Record<string, unknown>>;
 	busyClientOwnedSessionCount?: number;
@@ -25,6 +28,7 @@ interface FakeDaemonOptions {
 	protocolVersion?: number;
 	appVersion?: string;
 	schemaId?: string;
+	buildId?: string;
 	serverCapabilities?: string[];
 	onCommand?: (command: { type: string }) => void;
 }
@@ -39,16 +43,19 @@ function send(socket: Socket, message: unknown): void {
 }
 
 async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDaemon> {
-	const dir = mkdtempSync(join(tmpdir(), "pa-launch-"));
-	const socketPath = join(dir, "d.sock");
+	const ownsDir = options.socketPath === undefined;
+	const dir = ownsDir ? mkdtempSync(join(tmpdir(), "pa-launch-")) : dirname(options.socketPath!);
+	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+	const socketPath = options.socketPath ?? join(dir, "d.sock");
 	const server: Server = createServer((socket) => {
 		socket.on("error", () => undefined);
 		send(socket, {
 			type: "daemon_hello",
 			socketPath,
 			protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
-			appVersion: options.appVersion,
+			appVersion: options.appVersion ?? VERSION,
 			schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
+			runtime: { ...getDaemonRuntimeIdentity(), buildId: options.buildId ?? getDaemonRuntimeIdentity().buildId },
 			clientId: "fake-client",
 			serverCapabilities: options.serverCapabilities ?? [],
 		});
@@ -102,7 +109,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 		close: () =>
 			new Promise<void>((resolve) => {
 				server.close(() => resolve());
-				rmSync(dir, { recursive: true, force: true });
+				if (ownsDir) rmSync(dir, { recursive: true, force: true });
 			}),
 	};
 }
@@ -228,6 +235,36 @@ describe("ensureInteractiveDaemonRunning", () => {
 		await Promise.all(cleanups.splice(0).map((fn) => fn()));
 	});
 
+	it("leaves a busy H1 service untouched when normal H2 startup selects its scoped socket", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-build-scope-"));
+		const current = getDaemonRuntimeIdentity();
+		const h1 = { ...current, buildId: "busy-H1" };
+		const h2 = { ...current, buildId: "new-H2" };
+		const h1Socket = join(dir, defaultDaemonSocketPath(h1, "linux").split("/").at(-1)!);
+		const h2Socket = join(dir, defaultDaemonSocketPath(h2, "linux").split("/").at(-1)!);
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			socketPath: h1Socket,
+			buildId: h1.buildId,
+			sessions: [{ id: "active-H1", activeSessionId: "active-H1", isStreaming: true }],
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(async () => {
+			await daemon.close();
+			rmSync(dir, { recursive: true, force: true });
+		});
+
+		expect(h2Socket).not.toBe(h1Socket);
+		expect(await probeDaemonVersion(h2Socket)).toEqual({ status: "absent" });
+		expect(commands).toEqual([]);
+		expect(await probeRunningDaemonSessions(h1Socket)).toMatchObject({
+			reachable: true,
+			activeSessions: [expect.objectContaining({ activeSessionId: "active-H1" })],
+		});
+		expect(commands).toEqual(["list"]);
+		expect(commands).not.toContain("shutdown");
+	});
+
 	it("rejects a busy pre-session-action daemon before attach", async () => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
@@ -257,6 +294,23 @@ describe("ensureInteractiveDaemonRunning", () => {
 		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("stale");
 		expect(commands).toContain("list");
 		expect(commands).not.toContain("shutdown");
+	});
+
+	it("rejects a daemon from a different source build even when its wire and app versions match", async () => {
+		const daemon = await startFakeDaemon({ buildId: "stale-dirty-source-build" });
+		cleanups.push(daemon.close);
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = dirname(daemon.socketPath);
+
+		try {
+			await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({
+				status: "stale",
+				hello: { runtime: { buildId: "stale-dirty-source-build" } },
+			});
+		} finally {
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+		}
 	});
 
 	it("does not treat a live daemon as absent when cold startup delays the first connection", async () => {
@@ -356,6 +410,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 				appVersion: VERSION,
 				schemaId: DAEMON_SCHEMA_ID,
+				runtime: getDaemonRuntimeIdentity(),
 				clientId: "fake-client",
 				serverCapabilities: [],
 			});

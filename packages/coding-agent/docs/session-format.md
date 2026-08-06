@@ -214,6 +214,16 @@ Emitted when the user switches models mid-session.
 {"type":"model_change","id":"d4e5f6g7","parentId":"c3d4e5f6","timestamp":"2024-12-03T14:05:00.000Z","provider":"openai","modelId":"gpt-4o"}
 ```
 
+### CredentialBindingEntry
+
+Pins a root session tree to the exact external credential identity selected on its first successful managed credential resolution. This daemon bookkeeping entry does **not** participate in model context and is omitted from daemon/client session-tree snapshots.
+
+```json
+{"type":"credential_binding","id":"e4f5g6h7","parentId":"d4e5f6g7","timestamp":"2024-12-03T14:05:01.000Z","provider":"openai-codex","source":"aimgr","binding":"pro3","identityFingerprint":"<opaque-profile-identity>"}
+```
+
+Only the stable binding tuple is persisted. Access material, access-value fingerprints, expiry, and helper-private `credentialVersion` values are never stored. Resume and fork restore the binding; RLM descendants inherit it from their root tree. Branching before this bookkeeping entry does not remove the root-level binding.
+
 ### ThinkingLevelChangeEntry
 
 Emitted when the user changes the thinking/reasoning level.
@@ -421,6 +431,7 @@ Key methods for working with sessions programmatically.
 - `appendThinkingLevelChange(level)` - Record thinking change
 - `appendServiceTierChange(tier)` - Record provider service-tier change
 - `appendModelChange(provider, modelId)` - Record model change
+- `appendCredentialBinding(binding)` - Pin a non-context external credential identity for the root tree
 - `appendCompaction(summary, firstKeptEntryId, tokensBefore, details?, fromHook?, customInstructions?)` - Add compaction
 - `appendCustomEntry(customType, data?)` - Extension state (not in context)
 - `appendChildUsageAttribution(targetId, childUsage, aggregateUsage)` - Persist RLM child usage folded into a parent assistant message
@@ -448,6 +459,7 @@ Key methods for working with sessions programmatically.
 - `getEntries()` - All entries (excluding header)
 - `getHeader()` - Session header metadata
 - `getSessionName()` - Get display name from latest session_info entry
+- `getCredentialBindings()` - Get root-level external credential bindings, independent of the current branch
 - `getCwd()` - Working directory
 - `getSessionDir()` - Session storage directory
 - `getSessionId()` - Session UUID

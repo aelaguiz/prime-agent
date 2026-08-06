@@ -79,6 +79,40 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		return { runtimeHost, faux };
 	}
 
+	it("inherits the root credential binding map into RLM subagents", async () => {
+		const { runtimeHost, faux } = await createRuntimeHost(() => undefined);
+		runtimeHost.session.sessionManager.appendCredentialBinding({
+			provider: "openai-codex",
+			source: "aimgr",
+			binding: "pro3",
+			identityFingerprint: "identity-pro3",
+		});
+		const child = await runtimeHost.createRlmSubagentRuntime({
+			parentSession: runtimeHost.session,
+			id: "child-auth-binding",
+			prompt: "test binding inheritance",
+			sessionName: "binding-child",
+			sessionDir: join(runtimeHost.services.agentDir, "sessions", "sub-binding"),
+			model: faux.getModel(),
+			thinkingLevel: "off",
+			serviceTier: "default",
+			scopedModels: [],
+			activeToolNames: [],
+			customTools: [],
+			includeGoals: false,
+			includeCompactSkill: false,
+			rlmDepth: 1,
+			rlmMaxDepth: 2,
+			rlmParentNodeId: "parent-node",
+		});
+		expect(child.session.sessionManager.getCredentialBindings().get("openai-codex")).toEqual({
+			provider: "openai-codex",
+			source: "aimgr",
+			binding: "pro3",
+			identityFingerprint: "identity-pro3",
+		});
+	});
+
 	it("runs beforeSessionInvalidate after session_shutdown and before rebindSession", async () => {
 		const phases: string[] = [];
 		const { runtimeHost } = await createRuntimeHost((pi) => {

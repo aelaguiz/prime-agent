@@ -152,6 +152,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
+import { completeSimpleWithExternalAuthRetry } from "./external-auth-retry.js";
 import {
 	createGoalContextMessage,
 	emptyGoalState,
@@ -188,7 +189,7 @@ import {
 	IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
 	isSessionSlashCommandMessage,
 } from "./messages.js";
-import type { ModelRegistry } from "./model-registry.js";
+import type { ModelRegistry, ResolvedRequestAuth } from "./model-registry.js";
 import { throwIfPromptAdmissionCancelled } from "./prompt-admission.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import {
@@ -1387,10 +1388,9 @@ export class AgentSession {
 		this._subagentRuntimeHost = host;
 	}
 
-	private async _getRequiredRequestAuth(model: Model<any>): Promise<{
-		apiKey: string;
-		headers?: Record<string, string>;
-	}> {
+	private async _getRequiredRequestAuth(
+		model: Model<any>,
+	): Promise<Extract<ResolvedRequestAuth, { ok: true }> & { apiKey: string }> {
 		const result = await this._modelRegistry.getApiKeyAndHeaders(model);
 		if (!result.ok) {
 			if (result.error.startsWith("No API key found")) {
@@ -1399,7 +1399,7 @@ export class AgentSession {
 			throw new Error(result.error);
 		}
 		if (result.apiKey) {
-			return { apiKey: result.apiKey, headers: result.headers };
+			return { ...result, apiKey: result.apiKey };
 		}
 
 		const isOAuth = this._modelRegistry.isUsingOAuth(model);
@@ -3380,6 +3380,9 @@ export class AgentSession {
 		}
 
 		const lastAssistant = this._findLastAssistantInMessages(event.messages);
+		if (lastAssistant && this._isExternalAuthRetryTerminal(lastAssistant)) {
+			return;
+		}
 		const concreteAuthFailure = lastAssistant ? this._isConcreteProviderAuthFailure(lastAssistant) : false;
 		if (!lastAssistant || (!this._isRetryableError(lastAssistant) && !concreteAuthFailure)) {
 			return;
@@ -3413,10 +3416,13 @@ export class AgentSession {
 		if (!message || message.stopReason !== "error" || !message.errorMessage) {
 			return;
 		}
-		if (!isLikelyAuthenticationError(message.errorMessage)) {
+		if (!isLikelyAuthenticationError(message.errorMessage) && !this._isExternalAuthRetryTerminal(message)) {
 			return;
 		}
-		message.errorMessage = addLoginGuidanceToAuthError(message.errorMessage);
+		const managedMessage = this._modelRegistry.authStorage.getManagedAuthMessage(message.provider);
+		message.errorMessage = managedMessage
+			? `${message.errorMessage}\n\n${managedMessage}`
+			: addLoginGuidanceToAuthError(message.errorMessage);
 	}
 
 	private async _processAgentEvent(event: AgentEvent): Promise<void> {
@@ -3557,6 +3563,12 @@ export class AgentSession {
 			if (!msg) {
 				this._resolveRetry();
 				return;
+			}
+
+			if (this._isExternalAuthRetryTerminal(msg) && this._isConcreteProviderAuthFailure(msg)) {
+				const token = this._captureRetryAuthFailureSource(msg);
+				this._markProviderAuthStale(msg, token ? [token] : undefined);
+				this._retryAuthFailureSources = [];
 			}
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
@@ -7003,11 +7015,13 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			const requestAuth = await this._getRequiredRequestAuth(this.model);
+			const { apiKey, headers } = requestAuth;
 			const result = await this._performCompaction({
 				model: this.model,
 				apiKey,
 				headers,
+				requestAuth,
 				customInstructions,
 				signal: this._compactionAbortController.signal,
 			});
@@ -7071,10 +7085,11 @@ export class AgentSession {
 		model: Model<any>;
 		apiKey: string;
 		headers?: Record<string, string>;
+		requestAuth: Extract<ResolvedRequestAuth, { ok: true }>;
 		customInstructions?: string;
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
-		const { model, apiKey, headers, customInstructions, signal } = options;
+		const { model, apiKey, headers, requestAuth, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
@@ -7111,7 +7126,23 @@ export class AgentSession {
 
 		const { summary, firstKeptEntryId, tokensBefore, details } =
 			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+			(await compact(
+				preparation,
+				model,
+				apiKey,
+				headers,
+				customInstructions,
+				signal,
+				this.thinkingLevel,
+				(requestModel, context, requestOptions) =>
+					completeSimpleWithExternalAuthRetry(
+						requestModel,
+						context,
+						requestOptions,
+						this._modelRegistry,
+						requestAuth,
+					),
+			));
 
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
@@ -7530,7 +7561,8 @@ export class AgentSession {
 		if (!model) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const requestAuth = await this._getRequiredRequestAuth(model);
+		const { apiKey, headers } = requestAuth;
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
@@ -7541,6 +7573,14 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			(requestModel, requestContext, requestOptions) =>
+				completeSimpleWithExternalAuthRetry(
+					requestModel,
+					requestContext,
+					requestOptions,
+					this._modelRegistry,
+					requestAuth,
+				),
 		);
 	}
 
@@ -7711,7 +7751,8 @@ export class AgentSession {
 		}
 
 		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		const requestAuth = await this._getRequiredRequestAuth(model);
+		const { apiKey, headers } = requestAuth;
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -7752,6 +7793,14 @@ export class AgentSession {
 			headers,
 			signal,
 			this.thinkingLevel,
+			(requestModel, requestContext, requestOptions) =>
+				completeSimpleWithExternalAuthRetry(
+					requestModel,
+					requestContext,
+					requestOptions,
+					this._modelRegistry,
+					requestAuth,
+				),
 		);
 		if (this._disposed || signal.aborted) {
 			throw new Error("Refinement cancelled because the session was disposed.");
@@ -8116,6 +8165,7 @@ export class AgentSession {
 				model: this.model,
 				apiKey: authResult.apiKey,
 				headers: authResult.headers,
+				requestAuth: authResult,
 				customInstructions,
 				signal: this._autoCompactionAbortController.signal,
 			});
@@ -9992,13 +10042,23 @@ export class AgentSession {
 		return typeof kind === "string" ? kind : undefined;
 	}
 
+	private _isExternalAuthRetryTerminal(message: AssistantMessage): boolean {
+		const diagnostic = message.diagnostics?.find((item) => item.type === "external_auth_retry");
+		if (!diagnostic) return false;
+		if (diagnostic.details?.outcome === "unchanged_or_failed") return true;
+		return this._getProviderStreamFailureKind(message) === "auth";
+	}
+
 	private _isStructuredPermanentProviderFailure(message: AssistantMessage): boolean {
 		const kind = this._getProviderStreamFailureKind(message);
 		return kind === "auth" || kind === "invalid_request" || kind === "refusal";
 	}
 
 	private _isStructuredPermanentProviderRetryExhausted(message: AssistantMessage): boolean {
-		return this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message);
+		return (
+			this._isExternalAuthRetryTerminal(message) ||
+			(this._retryAttempt > 0 && this._isStructuredPermanentProviderFailure(message))
+		);
 	}
 
 	private _getProviderStreamFailureAuthStatus(message: AssistantMessage): number | undefined {
@@ -10757,7 +10817,8 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				const requestAuth = await this._getRequiredRequestAuth(model);
+				const { apiKey, headers } = requestAuth;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
@@ -10767,6 +10828,14 @@ export class AgentSession {
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
+					complete: (requestModel, requestContext, requestOptions) =>
+						completeSimpleWithExternalAuthRetry(
+							requestModel,
+							requestContext,
+							requestOptions,
+							this._modelRegistry,
+							requestAuth,
+						),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

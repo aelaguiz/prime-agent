@@ -22,6 +22,8 @@ flowchart TD
 
 The supervisor owns public sockets, client attachments, routing, global agent-message delivery, worker health, command journals, and coordinated updates. It does not execute providers, tools, compaction, bash, kernels, schedules, or transcript scans.
 
+The implicit public socket is scoped by a short hash of the complete runtime build ID. Clients from the same build converge on one supervisor even when invoked through different executable or launcher paths. Different installed builds and different dirty-source contents use separate sockets, worker descriptor directories, catalogs, and workers; normal startup never replaces or prompts to stop a busy supervisor from another build. An explicit `--daemon-socket` remains an exact operator-selected ownership boundary. `prime-agent ps` discovers all scoped supervisors and marks only the caller build's implicit socket as the default.
+
 The catalog subprocess owns saved-session scans and inactive-session file operations. A catalog failure can fail a catalog request without interrupting active workers.
 
 Each worker owns one root `AgentSessionRuntime`, its root `AgentSession`, scheduler, kernels, and every RLM descendant below that root. New, switch, fork, and import operations replace the root runtime inside the worker while preserving the public active-session ID.
@@ -36,7 +38,7 @@ Normal interactive sessions use resident workers:
 - Workers monitor the public supervisor socket. If it disappears, one worker acquires an atomic launch lease and starts a replacement supervisor.
 - A replacement supervisor adopts live workers and their active-session IDs.
 - A worker crash affects one root tree. Recovery retries after 250 ms, 1 second, and 5 seconds; three failures mark that root failed.
-- `prime-agent shutdown` stops the supervisor and all workers; `--force` also terminates unresponsive worker process groups and tracked children.
+- `prime-agent shutdown` stops the selected supervisor and its workers (the caller build's scoped supervisor by default); `--force` also terminates its unresponsive worker process groups and tracked children.
 
 There is no fixed session, worker, client, or workload cap in this layer.
 
@@ -101,6 +103,14 @@ Every sequenced event belongs to a worker generation. Clients retain the last `{
 A generation change invalidates comparison with the old sequence. Missing replay is not fatal: the attach snapshot is the durable recovery baseline. `DaemonAgentConnection` applies the snapshot, ignores duplicate or retired-generation events, and reports a resynchronized session to the UI.
 
 Large snapshots are encoded in the worker and streamed as opaque chunks through a bounded supervisor cache. The supervisor never constructs a history-sized object.
+
+## External Credential Boundary
+
+AIM-managed credential helpers execute only inside the active worker that owns a root session tree. The supervisor, catalog subprocess, and attached clients may inspect the non-secret managed status and root binding but never invoke the helper or receive its access material. Worker-owned access values, access fingerprints, expiry, and helper-private credential versions remain in memory and are not added to either public protocol v4 or the private worker frame.
+
+The stable `credential_binding` JSONL entry is daemon bookkeeping, not conversation context. Existing agent-connection session-tree serialization filters it, so snapshots retain their current wire shape. A terminal managed-auth failure reuses the existing `auth_stale` event and source-token fields; there is no daemon protocol, schema, or event-version change for external credentials.
+
+The supervisor-worker token and owner-only files protect process coordination, not against another malicious process running as the same OS user.
 
 ## Private Worker Transport
 

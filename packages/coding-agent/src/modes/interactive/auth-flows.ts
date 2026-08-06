@@ -181,6 +181,11 @@ export class ProviderAuthFlows {
 	}
 
 	loginProvider(providerOption: AuthSelectorProvider): Promise<AuthenticationResult> {
+		const managedMessage = this.host.modelRegistry.authStorage.getManagedAuthMessage(providerOption.id);
+		if (managedMessage) {
+			this.host.showStatus(managedMessage);
+			return Promise.resolve({ status: "failed" });
+		}
 		const kind = providerOption.category === "service" ? "service" : "provider";
 		if (providerOption.authType === "oauth") {
 			return this.showLoginDialog(providerOption.id, providerOption.name, kind);
@@ -218,6 +223,12 @@ export class ProviderAuthFlows {
 				async (providerOption: AuthSelectorProvider) => {
 					close();
 
+					const managedMessage = this.host.modelRegistry.authStorage.getManagedAuthMessage(providerOption.id);
+					if (managedMessage) {
+						this.host.showStatus(managedMessage);
+						resolve(null);
+						return;
+					}
 					try {
 						this.host.modelRegistry.authStorage.logout(providerOption.id);
 						this.host.modelRegistry.refresh();
@@ -300,7 +311,12 @@ export class ProviderAuthFlows {
 			options.push({
 				id: providerId,
 				name,
-				authType: credential.type,
+				authType:
+					credential.type === "external"
+						? oauthProvidersById.has(providerId)
+							? "oauth"
+							: "api_key"
+						: credential.type,
 				category: isSerper || isMcp ? "service" : "provider",
 			});
 		}

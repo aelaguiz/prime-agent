@@ -756,6 +756,77 @@ describe("openai-codex streaming", () => {
 		const streamResult = streamOpenAICodexResponses(model, context, { apiKey: token });
 		await streamResult.result();
 	});
+	it.each([
+		{ eventType: "error", status: 401 },
+		{ eventType: "close", status: 401 },
+		{ eventType: "close", status: 403 },
+	])(
+		"preserves websocket $eventType auth status $status without falling back to SSE",
+		async ({ eventType, status }) => {
+			const token = mockToken();
+			global.fetch = vi.fn(async () => new Response("unexpected fetch", { status: 500 })) as typeof fetch;
+
+			class AuthFailureWebSocket {
+				private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+				constructor() {
+					queueMicrotask(() =>
+						this.dispatch(eventType, {
+							message: "rate limit wording",
+							statusCode: status,
+							code: 1006,
+							wasClean: false,
+						}),
+					);
+				}
+
+				addEventListener(type: string, listener: (event: unknown) => void): void {
+					const listeners = this.listeners.get(type) ?? new Set();
+					listeners.add(listener);
+					this.listeners.set(type, listeners);
+				}
+
+				removeEventListener(type: string, listener: (event: unknown) => void): void {
+					this.listeners.get(type)?.delete(listener);
+				}
+
+				send(): void {}
+				close(): void {}
+
+				private dispatch(type: string, event: unknown): void {
+					for (const listener of this.listeners.get(type) ?? []) listener(event);
+				}
+			}
+			globalThis.WebSocket = AuthFailureWebSocket as unknown as typeof WebSocket;
+			const model: Model<"openai-codex-responses"> = {
+				id: "gpt-5.4",
+				name: "GPT-5.4",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 400000,
+				maxTokens: 128000,
+			};
+			const context: Context = { messages: [{ role: "user", content: "hello", timestamp: 1 }] };
+
+			const result = await streamSimpleOpenAICodexResponses(model, context, {
+				apiKey: token,
+				transport: "auto",
+			}).result();
+			expect(global.fetch).not.toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.diagnostics).toContainEqual(
+				expect.objectContaining({
+					type: "provider_stream_failure",
+					details: expect.objectContaining({ kind: "auth", status }),
+				}),
+			);
+		},
+	);
+
 	it("forwards auto transport from streamSimple options and uses cached websocket context", async () => {
 		const token = mockToken();
 		const sentBodies: unknown[] = [];

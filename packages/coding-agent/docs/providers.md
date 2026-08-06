@@ -5,6 +5,7 @@ Prime Agent supports subscription-based providers via OAuth and API key provider
 ## Table of Contents
 
 - [Subscriptions](#subscriptions)
+- [AIM-Managed Credentials](#aim-managed-credentials)
 - [API Keys](#api-keys)
 - [Auth File](#auth-file)
 - [Cloud Providers](#cloud-providers)
@@ -34,6 +35,45 @@ Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party h
 
 - Press Enter for github.com, or enter your GitHub Enterprise Server domain
 - If you get "model not supported", enable it in VS Code: Copilot Chat → model selector → select model → "Enable"
+
+## AIM-Managed Credentials
+
+AIM can install a non-secret external credential descriptor for a supported provider. Prime Agent then treats AIM as that provider's exclusive credential authority: `/login`, `/logout`, `--api-key`, runtime overrides, stored native credentials, environment variables, and custom-provider fallback keys cannot shadow or replace it.
+
+Manage the selection with AIM, not in Prime Agent:
+
+```bash
+aim prime use --codex <profile>       # manage openai-codex
+aim prime use --claude <profile>      # manage anthropic
+aim prime status                      # inspect managed selections
+aim prime uninstall --provider <id>   # return a provider to native auth
+```
+
+Prime Agent's `/login`, `/logout`, and model selector show the same guidance when a provider is managed. A failed managed helper is reported as an external credential error; Prime Agent does not silently fall back to native auth.
+
+AIM writes descriptors to `~/.prime/agent/auth.json`. The descriptor contains no access token:
+
+```json
+{
+  "openai-codex": {
+    "type": "external",
+    "source": "aimgr",
+    "protocol": "aimgr-credential-v1",
+    "executable": "/absolute/path/to/trusted/aim",
+    "args": ["credential-helper"],
+    "binding": "pro3",
+    "expectedIdentityFingerprint": "<opaque-profile-identity>"
+  }
+}
+```
+
+Prime Agent executes the descriptor directly, without a shell, only inside the active worker for a root session. The helper receives one JSON line on stdin and must return one JSON line on stdout using `aimgr-credential-v1`. Prime Agent applies bounded input/output, timeout, exit, and freshness checks; keeps access material only in worker memory; and never writes returned values, access fingerprints, or private credential versions into `auth.json`, session JSONL, diagnostics, or daemon/client snapshots.
+
+The first successful provider resolution pins `(provider, source, binding, identityFingerprint)` into the root's session file. Resume and fork preserve that identity binding; RLM descendants inherit it. Repointing the global AIM selection does not move a running or resumed tree to another identity. A new root session reads the current descriptor. If a bound identity is unavailable or mismatched, that tree fails closed until the binding is restored or a new root is started.
+
+On a structured 401/403 received before any assistant output, Prime Agent may invalidate its in-memory entry and reacquire once. It retries the request only if the helper returns a different access-value fingerprint; private `credentialVersion` changes alone never authorize a retry. Mid-stream failures and all other errors use normal provider behavior.
+
+This boundary is designed to keep account material out of Prime Agent persistence and daemon transport. It is not a same-UID sandbox: a malicious process running as the same OS user can still inspect or interfere with user-owned processes and files.
 
 ## API Keys
 
@@ -239,9 +279,9 @@ Or set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file.
 
 ## Resolution Order
 
-When resolving credentials for a provider:
+When an `auth.json` entry is `type: "external"`, it is exclusive for that provider and fails closed; no native source may override or replace it. Otherwise, native credentials resolve in this order:
 
-1. CLI `--api-key` flag
+1. CLI/runtime API-key override
 2. `auth.json` entry (API key or OAuth token)
 3. Environment variable
 4. Custom provider keys from `models.json`

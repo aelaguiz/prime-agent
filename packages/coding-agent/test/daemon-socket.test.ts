@@ -7,30 +7,44 @@ import lockfile from "proper-lockfile";
 import { describe, expect, it } from "vitest";
 import {
 	cleanupDaemonSocketPath,
+	defaultDaemonSocketDir,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
 	prepareDaemonSocketPath,
 } from "../src/modes/daemon/daemon-socket.js";
 
 describe("defaultDaemonSocketPath", () => {
-	it("uses a fixed Windows named pipe path", () => {
-		if (process.platform !== "win32") {
-			return;
-		}
+	const h1 = {
+		buildId: "build-H1",
+		executablePath: "/opt/node/bin/node",
+		entrypointPath: "/opt/prime/bundle/cli.js",
+	};
 
-		expect(defaultDaemonSocketPath()).toBe("\\\\.\\pipe\\prime-agent-daemon");
+	it("uses an exact build-scoped Windows named pipe", () => {
+		const socketPath = defaultDaemonSocketPath(h1, "win32");
+		expect(socketPath).toMatch(/^\\\\\.\\pipe\\prime-agent-daemon-[0-9a-f]{16}$/);
+		expect(socketPath.startsWith("\\\\.\\pipe\\prime-agent-daemon-")).toBe(true);
 	});
 
-	it("uses a per-user Unix socket directory", () => {
-		if (process.platform === "win32") {
-			return;
-		}
+	it("converges same-build launch paths and isolates different builds", () => {
+		const same = { ...h1 };
+		const h2 = { ...h1, buildId: "build-H2" };
+		const otherLaunchPath = {
+			...h1,
+			executablePath: "/other/node",
+			entrypointPath: "/other/prime/cli.js",
+			launcherPath: "/other/prime-agent",
+		};
+		expect(defaultDaemonSocketPath(same, "linux")).toBe(defaultDaemonSocketPath(h1, "linux"));
+		expect(defaultDaemonSocketPath(otherLaunchPath, "linux")).toBe(defaultDaemonSocketPath(h1, "linux"));
+		expect(defaultDaemonSocketPath(h2, "linux")).not.toBe(defaultDaemonSocketPath(h1, "linux"));
+	});
 
-		const suffix = typeof process.getuid === "function" ? String(process.getuid()) : "user";
-		const socketPath = defaultDaemonSocketPath();
-
-		expect(dirname(socketPath)).toBe(join(tmpdir(), `prime-agent-${suffix}`));
-		expect(basename(socketPath)).toBe("daemon.sock");
+	it("uses a short per-user Unix socket directory and filename", () => {
+		const socketPath = defaultDaemonSocketPath(h1, "darwin");
+		expect(dirname(socketPath)).toBe(defaultDaemonSocketDir());
+		expect(basename(socketPath)).toMatch(/^daemon-[0-9a-f]{16}\.sock$/);
+		expect(Buffer.byteLength(socketPath)).toBeLessThan(104);
 	});
 
 	it("checks a live daemon before acquiring the socket path lock", async () => {

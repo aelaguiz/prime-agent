@@ -77,6 +77,18 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.js";
+export {
+	type CredentialBinding,
+	EXTERNAL_CREDENTIAL_FRESHNESS_FLOOR_MS,
+	EXTERNAL_CREDENTIAL_PROTOCOL,
+	type ExternalCredentialDescriptor,
+	ExternalCredentialError,
+	type ExternalCredentialErrorCode,
+	type ExternalCredentialFailure,
+	type ExternalCredentialRequest,
+	type ExternalCredentialResponse,
+	type ExternalCredentialSuccess,
+} from "./external-credential-client.js";
 export type { RefinementResult } from "./refinement/index.js";
 export type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
 export { SessionImportFileNotFoundError } from "./session-import-errors.js";

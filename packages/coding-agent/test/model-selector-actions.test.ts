@@ -70,6 +70,30 @@ describe("ModelSelectorComponent", () => {
 		expect(selectedModel).toBe("faux-1");
 	});
 
+	it("shows the AIM binding label for managed models", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", name: "One", reasoning: true }],
+		});
+		harnesses.push(harness);
+		vi.spyOn(harness.session.modelRegistry, "getProviderAuthStatus").mockReturnValue({
+			configured: true,
+			source: "external",
+			label: "pro3",
+		});
+
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			harness.getModel("faux-1"),
+			harness.session.modelRegistry,
+			[],
+			() => {},
+			() => {},
+		);
+		await waitForAsyncRender();
+
+		expect(stripAnsi(selector.render(120).join("\n"))).toContain("current · managed by AIM · pro3");
+	});
+
 	it("renders injected daemon models without refreshing the local registry", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", name: "Local One", reasoning: true }],

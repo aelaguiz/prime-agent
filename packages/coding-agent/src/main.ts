@@ -781,7 +781,14 @@ async function prepareRuntimeServices(options: {
 				message: "--api-key requires a model to be specified via --model, --provider/--model, or --models",
 			});
 		} else {
-			authStorage.setRuntimeApiKey(effectiveSessionModel.provider, config.apiKey);
+			try {
+				authStorage.setRuntimeApiKey(effectiveSessionModel.provider, config.apiKey);
+			} catch (error) {
+				diagnostics.push({
+					type: "error",
+					message: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
 	}
 

@@ -39,6 +39,8 @@ describe("classifyStreamFailure", () => {
 		[undefined, 529, "overloaded"],
 		["rate_limit_error", undefined, "rate_limit"],
 		[undefined, 429, "rate_limit"],
+		["overloaded_error", 401, "auth"],
+		["rate_limit_error", 403, "auth"],
 		["refusal", undefined, "refusal"],
 		["sensitive", undefined, "safety"],
 		["SAFETY", undefined, "safety"],
