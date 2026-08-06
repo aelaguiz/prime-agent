@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parseAimAccountUsage, queryAimAccountUsage } from "../src/core/aim-usage.js";
-import { BUILTIN_SLASH_COMMANDS } from "../src/core/slash-commands.js";
+import { BUILTIN_SLASH_COMMANDS, resolveBuiltinSlashCommandName } from "../src/core/slash-commands.js";
 
 const status = {
 	accounts: [
@@ -26,6 +26,7 @@ describe("AIM /usage support", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "usage")).toMatchObject({
 			description: expect.stringContaining("account"),
 		});
+		expect(resolveBuiltinSlashCommandName("usage")).toBe("usage");
 	});
 
 	it("keeps only the non-secret account usage fields", () => {
