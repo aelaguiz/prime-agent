@@ -75,6 +75,7 @@ import {
 	uploadAgentTraceFile,
 	uploadAllAgentTraces,
 } from "../../core/agent-traces.js";
+import { queryAimAccountUsage } from "../../core/aim-usage.js";
 import { isNoModelsAvailableMessage } from "../../core/auth-guidance.js";
 import {
 	type AgentCronJob,
@@ -4659,6 +4660,12 @@ export class InteractiveMode {
 					this.editor.setText("");
 					return;
 				}
+				if (commandName === "usage" && !commandArgs) {
+					this.echoLocalCommand(text);
+					await this.handleUsageCommand();
+					this.editor.setText("");
+					return;
+				}
 				if (commandName === "system-prompt" && !commandArgs) {
 					this.echoLocalCommand(text);
 					await this.handleSystemPromptCommand();
@@ -8873,6 +8880,88 @@ export class InteractiveMode {
 
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new Text(info, 1, 0));
+		this.ui.requestRender();
+	}
+
+	private async handleUsageCommand(): Promise<void> {
+		const [stats, state] = await Promise.all([
+			this.agentConnection.getSessionStats(),
+			this.agentConnection.getState(),
+		]);
+		const bindings = state.credentialBindings ?? [];
+		const aimBindings = bindings.filter((binding) => binding.source === "aimgr");
+		const aimExecutable = aimBindings
+			.map((binding) => this.modelRegistry.authStorage.getExternalDescriptor(binding.provider))
+			.find((descriptor) => descriptor?.source === "aimgr")?.executable;
+		let accountUsage: Awaited<ReturnType<typeof queryAimAccountUsage>> = [];
+		let usageUnavailable = false;
+		if (aimBindings.length > 0) {
+			if (aimExecutable) {
+				try {
+					accountUsage = await queryAimAccountUsage(aimExecutable);
+				} catch {
+					usageUnavailable = true;
+				}
+			} else {
+				usageUnavailable = true;
+			}
+		}
+
+		const formatReset = (resetAt: number | undefined): string => {
+			if (!resetAt) return "";
+			const remainingMs = resetAt - Date.now();
+			if (remainingMs <= 0) return " · resets now";
+			const minutes = Math.ceil(remainingMs / 60_000);
+			if (minutes < 60) return ` · resets in ${minutes}m`;
+			const hours = Math.ceil(remainingMs / 3_600_000);
+			if (hours < 48) return ` · resets in ${hours}h`;
+			return ` · resets in ${Math.ceil(hours / 24)}d`;
+		};
+
+		let info = `${theme.bold("Usage")}\n\n`;
+		if (state.model) {
+			info += `${theme.fg("dim", "Model:")} ${state.model.provider}/${state.model.id}\n`;
+		}
+		if (bindings.length === 0) {
+			info += `${theme.fg("dim", "Account:")} Native or unmanaged\n`;
+		} else {
+			for (const binding of bindings) {
+				const source = binding.source === "aimgr" ? "AIM" : binding.source;
+				info += `${theme.fg("dim", `${binding.provider}:`)} ${source} · ${binding.binding}\n`;
+				const usage = accountUsage.find(
+					(account) => account.provider === binding.provider && account.label === binding.binding,
+				);
+				if (usage?.plan) info += `  ${theme.fg("dim", "Plan:")} ${usage.plan}\n`;
+				if (usage?.ok && usage.windows.length > 0) {
+					for (const window of usage.windows) {
+						const limit = usage.limitReached ? " · limit reached" : "";
+						const stale = usage.stale ? " · stale" : "";
+						info += `  ${theme.fg("dim", `${window.label}:`)} ${Math.round(window.usedPercent)}% used${formatReset(window.resetAt)}${limit}${stale}\n`;
+					}
+				} else if (binding.source === "aimgr") {
+					const unavailable =
+						usageUnavailable || usage ? "Provider usage unavailable" : "Account not found in AIM";
+					info += `  ${theme.fg("dim", unavailable)}\n`;
+				}
+			}
+		}
+
+		info += `\n${theme.bold("Session")}\n`;
+		info += `${theme.fg("dim", "Tokens:")} ${formatTokenCount(stats.tokens.total)} total`;
+		info += ` · ${formatTokenCount(stats.tokens.input)} in · ${formatTokenCount(stats.tokens.output)} out`;
+		if (stats.tokens.cacheRead > 0) info += ` · ${formatTokenCount(stats.tokens.cacheRead)} cache read`;
+		info += "\n";
+		const cost = stats.cost < 0.01 ? stats.cost.toFixed(4) : stats.cost.toFixed(2);
+		info += `${theme.fg("dim", "Cost:")} $${cost}\n`;
+		const contextUsage = this.getConnectionContextUsage() ?? stats.contextUsage;
+		if (contextUsage?.tokens !== null && contextUsage?.tokens !== undefined) {
+			info += `${theme.fg("dim", "Context:")} ${formatTokenCount(contextUsage.tokens)} / ${formatTokenCount(contextUsage.contextWindow)}`;
+			if (contextUsage.percent !== null) info += ` (${Math.round(contextUsage.percent)}%)`;
+			info += "\n";
+		}
+
+		this.chatContainer.addChild(new Spacer(1));
+		this.chatContainer.addChild(new Text(info.trimEnd(), 1, 0));
 		this.ui.requestRender();
 	}
 
