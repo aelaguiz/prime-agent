@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added `/login` support for xAI SuperGrok / X Premium subscriptions, with live-session model rebinding onto the Responses rail and Grok 4.6 available after subscription login.
 - Added AIM-managed Codex and Anthropic credentials with exclusive fail-closed auth, session-tree identity pinning, memory-only caching, and one safe pre-stream reacquisition retry.
 - Fixed source clients attaching to stale daemons from a different dirty working-tree revision.
 - Scoped implicit daemon ownership by runtime build so different installed or dirty-source builds run side by side without stopping or prompting about each other's active sessions.

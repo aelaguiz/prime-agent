@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added xAI SuperGrok / X Premium device-code OAuth and remapped stored subscription models onto the Responses API, including Grok 4.6.
 - Fixed Codex HTTP and WebSocket authentication failures retaining numeric 401/403 classification instead of entering transient retry or transport fallback.
 
 ## [0.7.0] - 2026-08-05

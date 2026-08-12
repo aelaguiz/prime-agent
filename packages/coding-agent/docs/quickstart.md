@@ -48,7 +48,7 @@ Start Prime Agent and run:
 /login
 ```
 
-Then select a provider. Built-in subscription logins include Claude Pro/Max, ChatGPT Plus/Pro (Codex), and GitHub Copilot.
+Then select a provider. Built-in subscription logins include Claude Pro/Max, ChatGPT Plus/Pro (Codex), GitHub Copilot, and xAI (SuperGrok / X Premium).
 
 ### Option 2: API Key
 
