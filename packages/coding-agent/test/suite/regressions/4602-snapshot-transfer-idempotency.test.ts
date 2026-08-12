@@ -171,7 +171,7 @@ function snapshotFrames(messages: AgentMessage[]) {
 }
 
 describe("ENG-4602 snapshot transfer containment", () => {
-	it("observes the deferred attach snapshot promise", async () => {
+	it("assigns each attach transfer a unique snapshot ID and observes its deferred promise", async () => {
 		const daemon = new AgentDaemon("/tmp/eng-4602-worker.sock", {
 			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -197,7 +197,7 @@ describe("ENG-4602 snapshot transfer containment", () => {
 		} as DaemonSocketClient;
 		const streamError = new Error("encoder failed after begin");
 		const log = vi.fn();
-		const streamWorkerSnapshot = vi.fn(async () => {
+		const streamWorkerSnapshot = vi.fn(async (_client: DaemonSocketClient, _result: DaemonAttachResult) => {
 			throw streamError;
 		});
 		const internals = daemon as unknown as {
@@ -221,12 +221,23 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			});
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			await new Promise<void>((resolve) => setImmediate(resolve));
+			await internals.handleCommand(client, {
+				type: "attach",
+				activeSessionId,
+				capabilities: ["attach_snapshot", "event_sequence", "slim_attach", "chunked_snapshot"],
+			});
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await new Promise<void>((resolve) => setImmediate(resolve));
 		} finally {
 			process.off("unhandledRejection", unhandled);
 			socket.destroy();
 		}
 
-		expect(streamWorkerSnapshot).toHaveBeenCalledOnce();
+		expect(streamWorkerSnapshot).toHaveBeenCalledTimes(2);
+		expect(streamWorkerSnapshot.mock.calls[0]?.[1].snapshotStream?.id).not.toBe(
+			streamWorkerSnapshot.mock.calls[1]?.[1].snapshotStream?.id,
+		);
+		expect(log).toHaveBeenCalledTimes(2);
 		expect(log).toHaveBeenCalledWith(`could not stream attach snapshot: ${String(streamError)}`);
 		expect(unhandled).not.toHaveBeenCalled();
 	});

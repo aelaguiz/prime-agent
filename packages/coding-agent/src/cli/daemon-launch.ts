@@ -24,7 +24,7 @@ import {
 	DAEMON_WORKER_TOKEN_ENV,
 } from "../modes/daemon/daemon-worker-protocol.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
-import { createCliSubprocessEnv, formatCurrentCliCommand } from "./subprocess-launch.js";
+import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
 const DAEMON_STARTUP_LOG_TAIL_BYTES = 4 * 1024;
@@ -66,8 +66,11 @@ type DaemonVersionProbe =
 	| { status: "current"; hello: DaemonHello }
 	| { status: "stale"; hello?: DaemonHello };
 
-/** Connect to a running daemon and check whether it matches this client's protocol and app version. */
+/** Connect to a running daemon and check whether its wire contract and runtime build match this client. */
 export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
+	// Local identity errors must fail before a resident daemon is classified or
+	// replaced. The catch below is only for remote connection/hello failures.
+	const clientRuntime = getDaemonRuntimeIdentity();
 	let client: DaemonClient | undefined;
 	for (const timeoutMs of [250, 2000]) {
 		const candidate = new DaemonClient(socketPath);
@@ -87,12 +90,13 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 		const current =
 			hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
 			hello.schemaId === DAEMON_SCHEMA_ID &&
-			hello.appVersion === VERSION;
+			hello.appVersion === VERSION &&
+			hello.runtime?.buildId === clientRuntime.buildId;
 		if (!current) {
 			logDaemonLaunch(
 				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
 					`/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"} vs client ` +
-					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${getDaemonRuntimeIdentity().buildId}`,
+					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${clientRuntime.buildId}`,
 			);
 		}
 		if (current) {
@@ -161,8 +165,9 @@ export class StaleDaemonError extends Error {
 		super(
 			`An incompatible Prime Agent daemon is running.\n\n${daemonIdentity}\n` +
 				`Client: v${VERSION}, protocol ${DAEMON_PROTOCOL_VERSION}, schema ${DAEMON_SCHEMA_ID}, build ${client.buildId}, ` +
-				`executable ${client.launcherPath ?? client.entrypointPath ?? client.executablePath}\n\nRun:\n` +
-				`${formatCurrentCliCommand(["shutdown", "--force"])}\n\nThen retry the original command.`,
+				`executable ${client.launcherPath ?? client.entrypointPath ?? client.executablePath}\n\n` +
+				"Prime Agent left the existing daemon running to protect active work. Continue with the build that started it, " +
+				"or retry after its sessions are idle.",
 		);
 		this.name = "StaleDaemonError";
 	}
@@ -347,11 +352,6 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		if (!stopped) throw new StaleDaemonError(socketPath, probe.hello);
 	}
 
-	const entrypoint = process.argv[1];
-	if (!entrypoint) {
-		throw new Error("Cannot determine current CLI entrypoint for daemon launch");
-	}
-
 	// Strip inherited daemon worker/supervisor role env vars so the spawned
 	// daemon supervisor does not inherit worker-mode behavior. Without this,
 	// a CLI running inside a daemon worker (e.g. a test spawned by the Prime
@@ -368,19 +368,16 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
 
 	const logOffset = currentDaemonLogSize(socketPath);
-	const child = spawn(
-		process.execPath,
-		[...process.execArgv, entrypoint, "--mode", "daemon", "--daemon-socket", socketPath],
-		{
-			cwd: spawnCwd ?? process.cwd(),
-			detached: true,
-			env,
-			// A pipe would tie the daemon's stderr to this short-lived CLI
-			// (EPIPE once it exits); crash details come from the daemon log,
-			// which the supervisor writes to before rethrowing startup errors.
-			stdio: "ignore",
-		},
-	);
+	const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+	const child = spawn(launch.command, launch.args, {
+		cwd: spawnCwd ?? process.cwd(),
+		detached: true,
+		env,
+		// A pipe would tie the daemon's stderr to this short-lived CLI
+		// (EPIPE once it exits); crash details come from the daemon log,
+		// which the supervisor writes to before rethrowing startup errors.
+		stdio: "ignore",
+	});
 	let childFailure:
 		| { type: "error"; error: Error }
 		| { type: "exit"; code: number | null; signal: NodeJS.Signals | null }

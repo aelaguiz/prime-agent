@@ -7,8 +7,10 @@ import { createHash } from "node:crypto";
 import {
 	type AnthropicMessagesCompat,
 	type Api,
+	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
+	completeSimple,
 	getModels,
 	getProviders,
 	type KnownProvider,
@@ -28,6 +30,7 @@ import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir, VERSION } from "../config.js";
+import { formatAuthenticationFailedMessage, formatNoApiKeyFoundMessage } from "./auth-guidance.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
 import {
@@ -277,6 +280,19 @@ export type ResolvedRequestAuth =
 export interface ModelCatalogSnapshot {
 	models: Model<Api>[];
 	configuredProviders: string[];
+}
+
+type CredentialAwareSimpleStreamOptions = SimpleStreamOptions & {
+	transportAuthIdentity?: string;
+};
+
+/** The root-owned request constructor used by non-interactive provider call sites. */
+export interface ProviderRequestCompletion {
+	completeSimpleWithRequestAdmission<TApi extends Api>(
+		model: Model<TApi>,
+		context: Context,
+		options?: SimpleStreamOptions,
+	): Promise<AssistantMessage>;
 }
 
 /** Result of loading custom models from models.json */
@@ -1349,6 +1365,40 @@ export class ModelRegistry {
 				error: error instanceof Error ? error.message : String(error),
 			};
 		}
+	}
+
+	/**
+	 * Resolve auth and synchronously construct one simple provider request only
+	 * after the root/provider credential generation has been admitted.
+	 */
+	async completeSimpleWithRequestAdmission<TApi extends Api>(
+		model: Model<TApi>,
+		context: Context,
+		options?: SimpleStreamOptions,
+	): Promise<AssistantMessage> {
+		return this.authStorage.withProviderRequestAdmission(
+			model.provider,
+			() => this.getApiKeyAndHeaders(model),
+			(auth, admission) => {
+				if (!auth.ok) {
+					throw new Error(auth.error);
+				}
+				if (!auth.apiKey) {
+					throw new Error(
+						this.isUsingOAuth(model)
+							? formatAuthenticationFailedMessage(model.provider)
+							: formatNoApiKeyFoundMessage(model.provider),
+					);
+				}
+				const requestOptions: CredentialAwareSimpleStreamOptions = {
+					...options,
+					apiKey: auth.apiKey,
+					headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
+					...(admission ? { transportAuthIdentity: admission.transportAuthIdentity } : {}),
+				};
+				return completeSimple(model, context, requestOptions);
+			},
+		);
 	}
 
 	/**

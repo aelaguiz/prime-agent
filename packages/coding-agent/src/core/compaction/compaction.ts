@@ -7,13 +7,13 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "../messages.js";
+import type { ProviderRequestCompletion } from "../model-registry.js";
 import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
 import {
 	computeFileLists,
@@ -557,8 +557,7 @@ export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
-	apiKey: string,
-	headers?: Record<string, string>,
+	requestCompletion: ProviderRequestCompletion,
 	signal?: AbortSignal,
 	customInstructions?: string,
 	previousSummary?: string,
@@ -590,10 +589,10 @@ export async function generateSummary(
 
 	const completionOptions =
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers };
+			? { maxTokens, signal, reasoning: thinkingLevel }
+			: { maxTokens, signal };
 
-	const response = await completeSimple(
+	const response = await requestCompletion.completeSimpleWithRequestAdmission(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
@@ -745,8 +744,7 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
 export async function compact(
 	preparation: CompactionPreparation,
 	model: Model<any>,
-	apiKey: string,
-	headers?: Record<string, string>,
+	requestCompletion: ProviderRequestCompletion,
 	customInstructions?: string,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
@@ -773,8 +771,7 @@ export async function compact(
 						messagesToSummarize,
 						model,
 						settings.reserveTokens,
-						apiKey,
-						headers,
+						requestCompletion,
 						signal,
 						customInstructions,
 						previousSummary,
@@ -785,8 +782,7 @@ export async function compact(
 				turnPrefixMessages,
 				model,
 				settings.reserveTokens,
-				apiKey,
-				headers,
+				requestCompletion,
 				signal,
 				thinkingLevel,
 			),
@@ -799,8 +795,7 @@ export async function compact(
 			messagesToSummarize,
 			model,
 			settings.reserveTokens,
-			apiKey,
-			headers,
+			requestCompletion,
 			signal,
 			customInstructions,
 			previousSummary,
@@ -831,8 +826,7 @@ async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
 	reserveTokens: number,
-	apiKey: string,
-	headers?: Record<string, string>,
+	requestCompletion: ProviderRequestCompletion,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<string> {
@@ -848,12 +842,12 @@ async function generateTurnPrefixSummary(
 		},
 	];
 
-	const response = await completeSimple(
+	const response = await requestCompletion.completeSimpleWithRequestAdmission(
 		model,
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		model.reasoning && thinkingLevel && thinkingLevel !== "off"
-			? { maxTokens, signal, apiKey, headers, reasoning: thinkingLevel }
-			: { maxTokens, signal, apiKey, headers },
+			? { maxTokens, signal, reasoning: thinkingLevel }
+			: { maxTokens, signal },
 	);
 
 	if (response.stopReason === "error") {

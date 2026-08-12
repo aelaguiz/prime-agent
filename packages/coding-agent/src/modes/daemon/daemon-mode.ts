@@ -291,6 +291,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"heartbeat_set",
 	"heartbeat_update",
 	"set_model",
+	"handoff_aim_credential",
 	"cycle_model",
 	"set_scoped_models",
 	"set_thinking_level",
@@ -2163,6 +2164,18 @@ export class AgentDaemon {
 		return state;
 	}
 
+	private getLiveSessionTree(root: ActiveSessionState): ActiveSessionState[] {
+		const tree: ActiveSessionState[] = [];
+		const pending = [root];
+		while (pending.length > 0) {
+			const state = pending.shift();
+			if (!state || this.sessions.get(state.activeSessionId) !== state) continue;
+			tree.push(state);
+			pending.push(...getChildActiveSessionStates(this.sessions, state));
+		}
+		return tree;
+	}
+
 	private async getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState> {
 		let lookupError: unknown;
 		try {
@@ -2316,6 +2329,7 @@ export class AgentDaemon {
 				cwd: sessionManager.getCwd(),
 				agentDir: parentState.runtime.services.agentDir,
 				sessionManager,
+				authStorage: parentState.runtime.services.authStorage,
 				sessionStartEvent: { type: "session_start", reason: "startup" },
 				sessionConfig: parentState.runtime.runtimeConfig,
 				sessionOptions: {
@@ -2713,6 +2727,7 @@ export class AgentDaemon {
 					cwd: sessionManager.getCwd(),
 					agentDir: parentState.runtime.services.agentDir,
 					sessionManager,
+					authStorage: parentState.runtime.services.authStorage,
 					sessionStartEvent: { type: "session_start", reason: "startup" },
 					sessionConfig: parentState.runtime.runtimeConfig,
 					sessionLease,
@@ -3594,7 +3609,7 @@ export class AgentDaemon {
 					});
 				}
 				if (streamsSnapshot) {
-					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}-${randomUUID()}`;
 					let transcript: SnapshotTranscriptChunkSource;
 					try {
 						transcript = createSnapshotTranscriptChunks({
@@ -4275,6 +4290,17 @@ export class AgentDaemon {
 					waitForExtensions: !(session.isStreaming || session.isCompacting),
 				});
 				return success(command.id, "set_model", model);
+			}
+
+			case "handoff_aim_credential": {
+				const state = this.getBoundSessionState(command.activeSessionId);
+				if (state.runtime.metadata.kind !== "top-level") {
+					throw new Error("AIM credential handoff requires a top-level session");
+				}
+				await state.runtime.handoffAimCredential(command, () =>
+					this.getLiveSessionTree(state).map((candidate) => candidate.runtime),
+				);
+				return success(command.id, "handoff_aim_credential", { ok: true });
 			}
 
 			case "cycle_model": {
@@ -6187,7 +6213,7 @@ export class AgentDaemon {
 		state: ActiveSessionState,
 		message: Extract<DaemonOutbound, { type: "session_replaced" }>,
 	): void {
-		const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+		const snapshotId = `${state.activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}-${randomUUID()}`;
 		// Mark before the registry read so later events queue behind this snapshot.
 		const snapshotSignal = markClientSnapshotStreaming(client, state.activeSessionId);
 		void this.prepareReplacementSnapshot(client, state, message, snapshotId, snapshotSignal).catch((error) => {
@@ -6385,7 +6411,7 @@ export class AgentDaemon {
 							),
 						});
 					}
-					const snapshotId = `${activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}`;
+					const snapshotId = `${activeSessionId}-${state.eventGeneration}-${state.lastEventSequence}-${randomUUID()}`;
 					const snapshotSignal = markClientSnapshotStreaming(client, activeSessionId);
 					let transcript: SnapshotTranscriptChunkSource;
 					try {

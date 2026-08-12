@@ -7023,11 +7023,9 @@ export class AgentSession {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { apiKey, headers } = await this._getRequiredRequestAuth(this.model);
+			await this._getRequiredRequestAuth(this.model);
 			const result = await this._performCompaction({
 				model: this.model,
-				apiKey,
-				headers,
 				customInstructions,
 				signal: this._compactionAbortController.signal,
 			});
@@ -7089,12 +7087,10 @@ export class AgentSession {
 	 */
 	private async _performCompaction(options: {
 		model: Model<any>;
-		apiKey: string;
-		headers?: Record<string, string>;
 		customInstructions?: string;
 		signal: AbortSignal;
 	}): Promise<CompactionResult> {
-		const { model, apiKey, headers, customInstructions, signal } = options;
+		const { model, customInstructions, signal } = options;
 		const pathEntries = this.sessionManager.getBranch();
 		const settings = this.settingsManager.getCompactionSettings();
 
@@ -7131,7 +7127,7 @@ export class AgentSession {
 
 		const { summary, firstKeptEntryId, tokensBefore, details } =
 			extensionCompaction ??
-			(await compact(preparation, model, apiKey, headers, customInstructions, signal, this.thinkingLevel));
+			(await compact(preparation, model, this._modelRegistry, customInstructions, signal, this.thinkingLevel));
 
 		if (signal.aborted) {
 			throw new Error("Compaction cancelled");
@@ -7550,15 +7546,14 @@ export class AgentSession {
 		if (!model) {
 			return { shouldRefine: false, rationale: "No model selected." };
 		}
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		await this._getRequiredRequestAuth(model);
 		return reviewAutoRefine(
 			this.agent.state.messages,
 			this._loadMergedHarnessState(),
 			this._loadRefinementHistory(),
 			model,
-			apiKey,
+			this._modelRegistry,
 			context,
-			headers,
 			signal,
 			this.thinkingLevel,
 		);
@@ -7731,7 +7726,7 @@ export class AgentSession {
 		}
 
 		const model = this.model;
-		const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+		await this._getRequiredRequestAuth(model);
 		const globalHarnessStateDir = getGlobalHarnessStateDir();
 		const localHarnessStateDir = this._localHarnessStateDir();
 		const requestedScope = options.global ? "global" : "local";
@@ -7767,9 +7762,8 @@ export class AgentSession {
 			planningState,
 			history,
 			model,
-			apiKey,
+			this._modelRegistry,
 			options,
-			headers,
 			signal,
 			this.thinkingLevel,
 		);
@@ -8134,8 +8128,6 @@ export class AgentSession {
 
 			const result = await this._performCompaction({
 				model: this.model,
-				apiKey: authResult.apiKey,
-				headers: authResult.headers,
 				customInstructions,
 				signal: this._autoCompactionAbortController.signal,
 			});
@@ -9983,6 +9975,16 @@ export class AgentSession {
 			return false;
 		}
 
+		if (
+			message.diagnostics?.some(
+				(diagnostic) =>
+					diagnostic.type === "aim_credential_failover" ||
+					diagnostic.type === "aim_credential_failover_unavailable",
+			)
+		) {
+			return false;
+		}
+
 		if (this._isStructuredPermanentProviderRetryExhausted(message)) {
 			return false;
 		}
@@ -10777,12 +10779,11 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const model = this.model!;
-				const { apiKey, headers } = await this._getRequiredRequestAuth(model);
+				await this._getRequiredRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
 					model,
-					apiKey,
-					headers,
+					requestCompletion: this._modelRegistry,
 					signal: this._branchSummaryAbortController.signal,
 					customInstructions,
 					replaceInstructions,

@@ -69,6 +69,7 @@ import {
 	type DaemonCommand,
 	type DaemonOutbound,
 	type DaemonResponse,
+	type DaemonRuntimeIdentity,
 	type DaemonUpdateRestartManifest,
 	failure,
 	isDaemonCommandEnvelope,
@@ -155,6 +156,7 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"promote_owned_session",
 	"kill",
 	"rename",
+	"handoff_aim_credential",
 	"prompt",
 	"cancel_prompt_admission",
 	"prompt_and_wait",
@@ -574,6 +576,26 @@ export async function runDaemonSupervisorMode(options: DaemonSupervisorOptions):
 	const supervisor = new DaemonSupervisor(socketPath, options);
 	await supervisor.start();
 	return new Promise(() => {});
+}
+
+export class DaemonWorkerRuntimeIdentityError extends Error {
+	constructor(worker: DaemonRuntimeIdentity | undefined, supervisor: DaemonRuntimeIdentity) {
+		super(
+			`Daemon worker runtime build does not match its supervisor (worker=${worker?.buildId ?? "missing"}, supervisor=${supervisor.buildId})`,
+		);
+		this.name = "DaemonWorkerRuntimeIdentityError";
+	}
+}
+
+export function assertDaemonWorkerRuntimeIdentity(
+	worker: DaemonRuntimeIdentity | undefined,
+	supervisor: DaemonRuntimeIdentity = getDaemonRuntimeIdentity(),
+): void {
+	// Protocol negotiation determines compatibility. Build IDs remain diagnostic;
+	// requiring byte-identical bundles would strand live workers during a rolling restart.
+	if (!worker) {
+		throw new DaemonWorkerRuntimeIdentityError(worker, supervisor);
+	}
 }
 
 export class DaemonSupervisor {
@@ -2333,7 +2355,8 @@ export class DaemonSupervisor {
 			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 			try {
 				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
-				await client.waitForHello(1000);
+				const hello = await client.waitForHello(1000);
+				assertDaemonWorkerRuntimeIdentity(hello.runtime);
 				await client.authenticateWorker(
 					worker.descriptor.authenticationToken,
 					this.supervisorAuthenticationClaim(),
@@ -2348,7 +2371,7 @@ export class DaemonSupervisor {
 			} catch (error) {
 				lastError = error;
 				client.close();
-				if (isSupervisorRecoveryCancelled(error)) {
+				if (isSupervisorRecoveryCancelled(error) || error instanceof DaemonWorkerRuntimeIdentityError) {
 					throw error;
 				}
 				await delay(25);
@@ -2412,6 +2435,13 @@ export class DaemonSupervisor {
 			this.broadcastHeartbeatsChanged();
 		} catch (error) {
 			if (isSupervisorRecoveryCancelled(error)) {
+				return;
+			}
+			if (error instanceof DaemonWorkerRuntimeIdentityError) {
+				worker.descriptor.lifecycle = "failed";
+				worker.descriptor.lastError = error.message;
+				this.persistWorker(worker);
+				this.log(`Refused to adopt incompatible worker ${worker.descriptor.workerId}: ${error.message}`);
 				return;
 			}
 			this.log(`Could not adopt worker ${worker.descriptor.workerId}: ${String(error)}`);
@@ -2756,7 +2786,7 @@ export class DaemonSupervisor {
 							this.broadcastHeartbeatsChanged();
 							return;
 						} catch (error) {
-							if (isSupervisorRecoveryCancelled(error)) {
+							if (isSupervisorRecoveryCancelled(error) || error instanceof DaemonWorkerRuntimeIdentityError) {
 								throw error;
 							}
 							await this.assertRecoveryAllowed();
@@ -2785,6 +2815,13 @@ export class DaemonSupervisor {
 					return;
 				} catch (error) {
 					if (isSupervisorRecoveryCancelled(error) || this.isWorkerRecoveryCancelled(worker)) {
+						return;
+					}
+					if (error instanceof DaemonWorkerRuntimeIdentityError) {
+						worker.descriptor.lifecycle = "failed";
+						worker.descriptor.lastError = error.message;
+						this.persistWorker(worker);
+						this.log(`Refused to recover incompatible worker ${worker.descriptor.workerId}: ${error.message}`);
 						return;
 					}
 					try {

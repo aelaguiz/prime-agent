@@ -117,6 +117,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 		takesArgument: true,
 	},
 	{ name: "session", description: "Show session info" },
+	{ name: "usage", description: "Show account, provider, token, cost, and context usage" },
 	{ name: "system-prompt", description: "Show the exact system prompt sent to the model" },
 	{ name: "logs", description: "Show where daemon and client logs are saved" },
 	{
@@ -198,7 +199,6 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: ReadonlyArray<BuiltinSlashCommand> = [
 
 const BUILTIN_SLASH_COMMAND_ALIASES: ReadonlyArray<BuiltinSlashCommandAlias> = [
 	{ name: "clear", aliasFor: "new" },
-	{ name: "usage", aliasFor: "context" },
 	{ name: "thinking", aliasFor: "effort" },
 	{ name: "rename", aliasFor: "name" },
 	{ name: "side", aliasFor: "btw" },

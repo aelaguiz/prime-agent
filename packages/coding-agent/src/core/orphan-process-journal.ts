@@ -17,6 +17,11 @@ export interface ActiveOrphanProcess {
 	processStartId: string;
 }
 
+export interface ActiveOrphanProcessCandidate {
+	pid: number;
+	processStartId?: string;
+}
+
 export function recordOrphanProcessState(pid: number, active: boolean): void {
 	const path = process.env[ORPHAN_PROCESS_JOURNAL_ENV];
 	if (!path || !Number.isInteger(pid) || pid <= 0) {
@@ -44,7 +49,7 @@ export function recordOrphanProcessState(pid: number, active: boolean): void {
 	}
 }
 
-export function readActiveOrphanProcesses(path: string, ownerPid: number): ActiveOrphanProcess[] {
+function readLatestOrphanProcessRecords(path: string, failOnInvalidRecord: boolean): OrphanProcessRecord[] {
 	let contents: string;
 	try {
 		contents = readFileSync(path, "utf8");
@@ -54,7 +59,7 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 		}
 		throw error;
 	}
-	const latest = new Map<number, OrphanProcessRecord>();
+	const latest = new Map<string, OrphanProcessRecord>();
 	for (const line of contents.split("\n")) {
 		if (!line) {
 			continue;
@@ -65,22 +70,43 @@ export function readActiveOrphanProcesses(path: string, ownerPid: number): Activ
 				record.version === 1 &&
 				Number.isInteger(record.pid) &&
 				(record.pid ?? 0) > 0 &&
-				record.ownerPid === ownerPid &&
+				Number.isInteger(record.ownerPid) &&
+				(record.ownerPid ?? 0) > 0 &&
+				(record.processStartId === undefined || typeof record.processStartId === "string") &&
 				typeof record.active === "boolean" &&
 				typeof record.recordedAt === "string"
 			) {
-				latest.set(record.pid!, record as OrphanProcessRecord);
+				latest.set(`${record.ownerPid}:${record.pid}`, record as OrphanProcessRecord);
+			} else if (failOnInvalidRecord) {
+				throw new Error("invalid orphan process record");
 			}
-		} catch {
-			// A crash can truncate only the final append.
+		} catch (error) {
+			if (failOnInvalidRecord) {
+				throw new Error(`Invalid orphan process journal ${path}`, { cause: error });
+			}
+			// A crash can truncate only the final append; ordinary process reaping stays best-effort.
 		}
 	}
-	return [...latest.values()]
+	return [...latest.values()];
+}
+
+export function readActiveOrphanProcesses(path: string, ownerPid: number): ActiveOrphanProcess[] {
+	return readLatestOrphanProcessRecords(path, false)
 		.filter(
 			(record): record is OrphanProcessRecord & { processStartId: string } =>
-				record.active && typeof record.processStartId === "string",
+				record.ownerPid === ownerPid && record.active && typeof record.processStartId === "string",
 		)
 		.map((record) => ({ pid: record.pid, processStartId: record.processStartId }));
+}
+
+/** Strict cleanup view: every active identity across worker generations, including unverifiable ones. */
+export function readActiveOrphanProcessCandidates(path: string): ActiveOrphanProcessCandidate[] {
+	return readLatestOrphanProcessRecords(path, true)
+		.filter((record) => record.active)
+		.map((record) => ({
+			pid: record.pid,
+			...(record.processStartId ? { processStartId: record.processStartId } : {}),
+		}));
 }
 
 export function isOrphanProcessIdentityCurrent(orphan: ActiveOrphanProcess): boolean {

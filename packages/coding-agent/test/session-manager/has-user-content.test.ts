@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { AIM_CREDENTIAL_BINDING_CUSTOM_TYPE } from "../../src/core/aim-external-auth.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import { userMsg } from "../utilities.js";
 
@@ -22,6 +23,26 @@ describe("SessionManager.hasUserContent", () => {
 			session.appendThinkingLevelChange("off");
 			session.appendServiceTierChange("default");
 			expect(session.hasUserContent()).toBe(false);
+		});
+	});
+
+	it("ignores only the exact AIM credential binding custom entry", () => {
+		withSession((session) => {
+			session.appendModelChange("anthropic", "claude-opus-4-8");
+			session.appendThinkingLevelChange("off");
+			session.appendCustomEntryWithRollback(AIM_CREDENTIAL_BINDING_CUSTOM_TYPE, {
+				provider: "anthropic",
+				source: "aimgr",
+				binding: "session-bound",
+				identityFingerprint: "identity-session",
+			});
+
+			expect(session.hasUserContent()).toBe(false);
+
+			session.appendCustomEntryWithRollback("aimgr_credential_binding_v1_custom", {
+				kind: "arbitrary-user-content",
+			});
+			expect(session.hasUserContent()).toBe(true);
 		});
 	});
 

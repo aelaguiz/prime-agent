@@ -1,5 +1,7 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AutocompleteProvider,
@@ -199,6 +201,128 @@ describe("InteractiveMode.showStatus", () => {
 		// adds spacer + text
 		expect(fakeThis.chatContainer.children).toHaveLength(5);
 		expect(renderLastLine(fakeThis.chatContainer)).toContain("STATUS_TWO");
+	});
+
+	test("shows the recovered Codex binding without exposing credential material", () => {
+		const showStatus = vi.fn();
+		const fakeThis = { showStatus } as unknown as InteractiveMode;
+		(InteractiveMode as any).prototype.showAimCredentialRecovery.call(fakeThis, {
+			role: "assistant",
+			diagnostics: [
+				{
+					type: "aim_credential_failover",
+					timestamp: Date.now(),
+					details: { fromBinding: "pro7", toBinding: "pro11" },
+				},
+			],
+		});
+
+		expect(showStatus).toHaveBeenCalledWith(
+			"Codex account pro7 exhausted; resumed on pro11. Session and work are preserved.",
+		);
+	});
+});
+
+describe("InteractiveMode /usage account scope", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	function createUsageHarness(
+		state: AgentConnectionState,
+		getAimExecutable = vi.fn((_provider?: string) => undefined as string | undefined),
+	) {
+		const chatContainer = new Container();
+		return {
+			chatContainer,
+			getAimExecutable,
+			harness: {
+				agentConnection: {
+					getSessionStats: vi.fn(async () => ({
+						tokens: { total: 0, input: 0, output: 0, cacheRead: 0 },
+						cost: 0,
+						contextUsage: undefined,
+					})),
+					getState: vi.fn(async () => state),
+				},
+				modelRegistry: { authStorage: { getAimExecutable } },
+				chatContainer,
+				ui: { requestRender: vi.fn() },
+				showStatus: vi.fn(),
+				getConnectionContextUsage: vi.fn(() => undefined),
+			},
+		};
+	}
+
+	test.each([
+		[undefined, "Current session binding unavailable"],
+		[[], "Native or unmanaged"],
+	] as const)("does not replace session binding state with the AIM pool", async (credentialBindings, expected) => {
+		const state = createConnectionState(
+			credentialBindings === undefined ? {} : { credentialBindings: [...credentialBindings] },
+		);
+		const { harness, chatContainer } = createUsageHarness(state);
+		await (InteractiveMode as any).prototype.handleUsageCommand.call(harness);
+		const output = normalizeRenderedOutput(chatContainer);
+		expect(output).toContain(expected);
+		expect(output).not.toContain("AIM credential pool");
+	});
+
+	test("renders only the exact session binding when AIM status is unavailable", async () => {
+		const { harness, chatContainer } = createUsageHarness(
+			createConnectionState({
+				credentialBindings: [{ provider: "anthropic", source: "aimgr", binding: "office" }],
+			}),
+		);
+		await (InteractiveMode as any).prototype.handleUsageCommand.call(harness);
+		const output = normalizeRenderedOutput(chatContainer);
+		expect(output).toContain("Claude: AIM · office");
+		expect(output).toContain("Provider usage unavailable");
+		expect(output).not.toContain("AIM credential pool");
+	});
+
+	test("uses the unique installed AIM executable after the bound provider switches to native auth", async () => {
+		const directory = mkdtempSync(path.join(path.dirname(fileURLToPath(import.meta.url)), ".usage-helper-"));
+		const executable = path.join(directory, "aim");
+		writeFileSync(
+			executable,
+			`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  accounts: [{
+    provider: "anthropic",
+    label: "product_growth",
+    usage: {
+      ok: true,
+      plan: "max",
+      windows: [{ label: "5h", usedPercent: 15 }],
+      limitReached: false,
+      stale: false
+    }
+  }]
+}));
+`,
+			{ mode: 0o700 },
+		);
+		chmodSync(executable, 0o700);
+		const getAimExecutable = vi.fn((provider?: string) => (provider === undefined ? executable : undefined));
+		try {
+			const { harness, chatContainer } = createUsageHarness(
+				createConnectionState({
+					credentialBindings: [{ provider: "anthropic", source: "aimgr", binding: "product_growth" }],
+				}),
+				getAimExecutable,
+			);
+			await (InteractiveMode as any).prototype.handleUsageCommand.call(harness);
+			const output = normalizeRenderedOutput(chatContainer);
+			expect(output).toContain("Claude: AIM · product_growth");
+			expect(output).toContain("Plan: max");
+			expect(output).toContain("5h: 15% used");
+			expect(output).not.toContain("Provider usage unavailable");
+			expect(getAimExecutable).toHaveBeenNthCalledWith(1, "anthropic");
+			expect(getAimExecutable).toHaveBeenNthCalledWith(2);
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -2806,6 +2930,11 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 
 class EventEmittingReplacementRuntime {
 	private rebindSession: Parameters<AgentSessionRuntime["setRebindSession"]>[0];
+	readonly services = {
+		authStorage: {
+			getAimCredentialBindings: () => [],
+		},
+	};
 
 	constructor(
 		public session: AgentSessionRuntime["session"],

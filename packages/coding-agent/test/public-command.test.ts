@@ -103,6 +103,24 @@ describe("public command routing", () => {
 		expect(mocks.daemonCommands).toEqual([["daemon", "list", "--all", "--json"]]);
 	});
 
+	it("routes the hidden AIM handoff bridge without publishing a public command", async () => {
+		const handoff = [
+			"session-1",
+			"openai-codex",
+			"gpt-5.6-sol",
+			"account-a",
+			"fingerprint-a",
+			"account-b",
+			"fingerprint-b",
+			"--json",
+		];
+
+		await expect(handlePublicCommand(["__aim-handoff-credential", ...handoff])).resolves.toMatchObject({
+			handled: true,
+		});
+		expect(mocks.daemonCommands).toEqual([["daemon", "handoff-aim-credential", ...handoff]]);
+	});
+
 	it("forwards a custom daemon socket when stopping an agent", async () => {
 		await expect(
 			handlePublicCommand(["stop", "worker", "--daemon-socket", "/tmp/custom-daemon.sock"]),

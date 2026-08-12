@@ -51,6 +51,7 @@ import {
 	createAgentSessionFromServices,
 	createAgentSessionServices,
 } from "./core/agent-session-services.js";
+import { AIM_CREDENTIAL_BINDING_CUSTOM_TYPE } from "./core/aim-external-auth.js";
 import { formatNoModelsAvailableMessage } from "./core/auth-guidance.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { exportFromFile } from "./core/export-html/index.js";
@@ -723,12 +724,15 @@ async function prepareRuntimeServices(options: {
 	sessionManager: SessionManager;
 	extensionFactories?: ExtensionFactory[];
 	sessionOptionsOverride?: CreateAgentSessionOptions;
+	authStorage?: AuthStorage;
 }): Promise<PreparedRuntimeServices> {
 	const { config, sessionManager } = options;
 	const effectiveAgentDir = config.agentDir ?? options.agentDir;
-	const authStorage = AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
-		usePrimeCliConfig: effectiveAgentDir === options.agentDir,
-	});
+	const authStorage =
+		options.authStorage ??
+		AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
+			usePrimeCliConfig: effectiveAgentDir === options.agentDir,
+		});
 	const services = await createAgentSessionServices({
 		cwd: options.cwd,
 		agentDir: effectiveAgentDir,
@@ -1266,8 +1270,20 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionStartEvent,
 		sessionConfig,
 		sessionOptions: runtimeSessionOptions,
+		authStorage,
 	}) => {
 		const config = mergeAgentSessionRuntimeConfig(runtimeDefaultSessionConfig, sessionConfig);
+		const effectiveAgentDir = config.agentDir ?? agentDir;
+		const runtimeAuthStorage =
+			authStorage ??
+			AuthStorage.create(join(effectiveAgentDir, "auth.json"), {
+				usePrimeCliConfig: effectiveAgentDir === agentDir,
+			});
+		if (!authStorage) {
+			runtimeAuthStorage.startAimExternalSession(sessionManager.getBranch(), (binding) => {
+				sessionManager.appendCustomEntryWithRollback(AIM_CREDENTIAL_BINDING_CUSTOM_TYPE, binding);
+			});
+		}
 		const prepared = await prepareRuntimeServices({
 			config,
 			cwd,
@@ -1275,6 +1291,7 @@ export async function main(args: string[], options?: MainOptions) {
 			sessionManager,
 			extensionFactories: options?.extensionFactories,
 			sessionOptionsOverride: runtimeSessionOptions,
+			authStorage: runtimeAuthStorage,
 		});
 		const { services, sessionOptions, diagnostics } = prepared;
 		const resolvedSessionOptions = resolveRuntimeSessionOptions(sessionOptions, runtimeSessionOptions);

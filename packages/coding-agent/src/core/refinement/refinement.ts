@@ -12,10 +12,10 @@ import {
 import { join } from "node:path";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
-import { completeSimple } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../../config.js";
 import { serializeConversation } from "../compaction/utils.js";
 import { convertToLlm } from "../messages.js";
+import type { ProviderRequestCompletion } from "../model-registry.js";
 import type { CustomEntry } from "../session-manager.js";
 
 export const REFINEMENT_CUSTOM_TYPE = "prime-agent.refinement";
@@ -865,9 +865,8 @@ export async function planRefinement(
 	state: HarnessState,
 	history: RefinementResult[],
 	model: Model<any>,
-	apiKey: string,
+	requestCompletion: ProviderRequestCompletion,
 	options: RefineOptions = {},
-	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<RefinementPlan> {
@@ -910,13 +909,13 @@ export async function planRefinement(
 	// Keep the refinement request non-reasoning regardless of the interactive session
 	// thinking level so the model uses its output budget for the JSON object.
 	void thinkingLevel;
-	const response = await completeSimple(
+	const response = await requestCompletion.completeSimpleWithRequestAdmission(
 		model,
 		{
 			systemPrompt: REFINEMENT_SYSTEM_PROMPT,
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
 		},
-		{ maxTokens: refinementMaxOutputTokens(model), signal, apiKey, headers },
+		{ maxTokens: refinementMaxOutputTokens(model), signal },
 	);
 
 	if (response.stopReason === "error") {
@@ -951,9 +950,8 @@ export async function reviewAutoRefine(
 	state: HarnessState,
 	history: RefinementResult[],
 	model: Model<any>,
-	apiKey: string,
+	requestCompletion: ProviderRequestCompletion,
 	context: AutoRefineReviewContext,
-	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<AutoRefineReview> {
@@ -976,13 +974,13 @@ ${conversationText}
 	// Auto-refine review requires parseable JSON. Keep it non-reasoning so
 	// reasoning-capable models use final text budget for the JSON object.
 	void thinkingLevel;
-	const response = await completeSimple(
+	const response = await requestCompletion.completeSimpleWithRequestAdmission(
 		model,
 		{
 			systemPrompt: AUTO_REFINE_REVIEW_SYSTEM_PROMPT,
 			messages: [{ role: "user", content: [{ type: "text", text: userPrompt }], timestamp: Date.now() }],
 		},
-		{ maxTokens: autoRefineReviewMaxOutputTokens(model), signal, apiKey, headers },
+		{ maxTokens: autoRefineReviewMaxOutputTokens(model), signal },
 	);
 	if (response.stopReason === "error") {
 		throw new Error(`Auto-refine review failed: ${response.errorMessage || "Unknown error"}`);
@@ -1002,13 +1000,21 @@ export async function refineHarness(
 	state: HarnessState,
 	history: RefinementResult[],
 	model: Model<any>,
-	apiKey: string,
+	requestCompletion: ProviderRequestCompletion,
 	options: RefineOptions = {},
-	headers?: Record<string, string>,
 	signal?: AbortSignal,
 	thinkingLevel?: ThinkingLevel,
 ): Promise<RefinementResult> {
-	const plan = await planRefinement(messages, state, history, model, apiKey, options, headers, signal, thinkingLevel);
+	const plan = await planRefinement(
+		messages,
+		state,
+		history,
+		model,
+		requestCompletion,
+		options,
+		signal,
+		thinkingLevel,
+	);
 	return applyRefinementProposal(state, plan.proposal, {
 		id: plan.id,
 		rollbackOf: plan.rollbackOf,

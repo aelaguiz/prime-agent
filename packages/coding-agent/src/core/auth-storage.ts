@@ -20,6 +20,16 @@ import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../config.js";
 import {
+	type AimCredentialAdvanceReason,
+	type AimCredentialBinding,
+	type AimCredentialRequestAdmission,
+	AimExternalAuthSession,
+	type AimPersistedCredentialBinding,
+	type AimResolvedCredential,
+	foldAimCredentialSessionState,
+	isAimExternalCredentialDescriptor,
+} from "./aim-external-auth.js";
+import {
 	clearPrimeCliCredentials,
 	getPrimeCliConfigPath,
 	loadPrimeCliConfig,
@@ -251,6 +261,7 @@ export class AuthStorage {
 	private fallbackResolver?: (provider: string) => string | undefined;
 	private loadError: Error | null = null;
 	private errors: Error[] = [];
+	private aimExternalSession?: AimExternalAuthSession;
 
 	private constructor(
 		private storage: AuthStorageBackend,
@@ -396,7 +407,7 @@ export class AuthStorage {
 		options?: { resolveCommandValue?: boolean; resolvedCommandValue?: string },
 	): AuthSourceCandidate | undefined {
 		const credential = this.data[provider];
-		if (!credential) {
+		if (!credential || isAimExternalCredentialDescriptor(credential)) {
 			return undefined;
 		}
 		const isCommandApiKey = credential.type === "api_key" && credential.key.startsWith("!");
@@ -544,6 +555,10 @@ export class AuthStorage {
 	}
 
 	private getAuthStatusFromCandidates(provider: string): AuthStatus {
+		const aimBinding = this.aimExternalSession?.getBinding(provider);
+		if (aimBinding) {
+			return { configured: true, source: "stored", label: aimBinding.binding };
+		}
 		const { candidate, hasStaleCandidate } = this.getAvailableAuthCandidate(provider);
 		if (candidate) {
 			return this.toAuthStatus(candidate);
@@ -576,6 +591,15 @@ export class AuthStorage {
 	}
 
 	getCurrentAuthSourceToken(provider: string): AuthSourceToken | undefined {
+		const external = this.aimExternalSession?.getResolved(provider);
+		if (external) {
+			return {
+				provider,
+				source: "stored",
+				identityFingerprint: external.identityFingerprint,
+				valueFingerprint: external.valueFingerprint,
+			};
+		}
 		const { candidate } = this.getAvailableAuthCandidate(provider);
 		if (!candidate) {
 			return undefined;
@@ -665,7 +689,8 @@ export class AuthStorage {
 	 * Get credential for a provider.
 	 */
 	get(provider: string): AuthCredential | undefined {
-		return this.data[provider] ?? undefined;
+		const credential = this.data[provider];
+		return credential && !isAimExternalCredentialDescriptor(credential) ? credential : undefined;
 	}
 
 	/**
@@ -690,7 +715,7 @@ export class AuthStorage {
 	 * List all providers with credentials.
 	 */
 	list(): string[] {
-		return Object.keys(this.data);
+		return Object.keys(this.data).filter((provider) => !isAimExternalCredentialDescriptor(this.data[provider]));
 	}
 
 	/**
@@ -705,7 +730,97 @@ export class AuthStorage {
 	 * Unlike getApiKey(), this doesn't refresh OAuth tokens.
 	 */
 	hasAuth(provider: string): boolean {
+		if (this.aimExternalSession?.isManaged(provider)) return true;
 		return this.getAvailableAuthCandidate(provider).candidate !== undefined;
+	}
+
+	/** Pin AIM descriptors and bindings to one root session tree. */
+	startAimExternalSession(
+		entries: readonly unknown[],
+		persistInitialBinding: (binding: AimPersistedCredentialBinding) => void,
+	): void {
+		const persisted = foldAimCredentialSessionState(entries);
+		this.aimExternalSession = new AimExternalAuthSession(
+			this.data as Readonly<Record<string, unknown>>,
+			persisted,
+			persistInitialBinding,
+		);
+	}
+
+	getAimCredentialBinding(provider: string): AimCredentialBinding | undefined {
+		return this.aimExternalSession?.getBinding(provider);
+	}
+
+	getAimCredentialBindings(): AimCredentialBinding[] {
+		return this.aimExternalSession?.getBindings() ?? [];
+	}
+
+	/**
+	 * Return an installed AIM helper executable without exposing credential material.
+	 * A provider lookup stays exact. An unscoped lookup succeeds only when every
+	 * installed AIM descriptor agrees, for read-only AIM-wide status queries.
+	 */
+	getAimExecutable(provider?: string): string | undefined {
+		if (this.aimExternalSession) return this.aimExternalSession.getExecutable(provider);
+		const credentials = this.data as Readonly<Record<string, unknown>>;
+		if (provider !== undefined) {
+			const credential = credentials[provider];
+			return isAimExternalCredentialDescriptor(credential) ? credential.executable : undefined;
+		}
+		const executables = new Set(
+			Object.values(credentials).flatMap((credential) =>
+				isAimExternalCredentialDescriptor(credential) ? [credential.executable] : [],
+			),
+		);
+		return executables.size === 1 ? executables.values().next().value : undefined;
+	}
+
+	handoffAimCredential(
+		provider: string,
+		binding: string,
+		identityFingerprint: string,
+		beforePublish: (binding: AimPersistedCredentialBinding) => void,
+	): Promise<AimResolvedCredential> {
+		if (!this.aimExternalSession) throw new Error("AIM external credentials are not initialized for this session");
+		return this.aimExternalSession.handoff(provider, binding, identityFingerprint, beforePublish);
+	}
+
+	advanceAimCredential(
+		provider: "openai-codex",
+		expectedTransportAuthIdentity: string,
+		reason: AimCredentialAdvanceReason,
+		beforePublish: (binding: AimPersistedCredentialBinding) => void,
+	): Promise<AimResolvedCredential> {
+		if (!this.aimExternalSession) throw new Error("AIM external credentials are not initialized for this session");
+		return this.aimExternalSession.advance(provider, expectedTransportAuthIdentity, reason, beforePublish);
+	}
+
+	/** Advance one unopened Codex request through the root session's durable binding journal. */
+	async advanceAimCredentialForRequest(
+		provider: "openai-codex",
+		expectedTransportAuthIdentity: string,
+		reason: AimCredentialAdvanceReason,
+	): Promise<AimCredentialBinding> {
+		if (!this.aimExternalSession) throw new Error("AIM external credentials are not initialized for this session");
+		const resolved = await this.aimExternalSession.advanceRequest(provider, expectedTransportAuthIdentity, reason);
+		return {
+			provider: resolved.provider,
+			source: "aimgr",
+			binding: resolved.binding,
+			identityFingerprint: resolved.identityFingerprint,
+		};
+	}
+
+	/** Resolve and synchronously admit one provider request against a stable AIM generation. */
+	async withProviderRequestAdmission<TResolved, TResult>(
+		provider: string,
+		resolve: () => Promise<TResolved>,
+		admit: (resolved: TResolved, admission?: AimCredentialRequestAdmission) => TResult,
+	): Promise<TResult> {
+		if (!this.aimExternalSession?.isManaged(provider)) {
+			return admit(await resolve());
+		}
+		return this.aimExternalSession.admitRequest(provider, resolve, admit);
 	}
 
 	/**
@@ -810,15 +925,30 @@ export class AuthStorage {
 	/**
 	 * Get API key for a provider.
 	 * Priority:
-	 * 1. Runtime override (CLI --api-key)
-	 * 2. Prime Inference: environment variable, Prime CLI config, auth.json
-	 * 3. Other providers: auth.json, environment variable
-	 * 4. Fallback resolver (models.json custom providers)
+	 * 1. Root-scoped AIM external binding
+	 * 2. Runtime override (CLI --api-key)
+	 * 3. Prime Inference: environment variable, Prime CLI config, auth.json
+	 * 4. Other providers: auth.json, environment variable
+	 * 5. Fallback resolver (models.json custom providers)
 	 */
 	async getApiKeyWithSourceToken(
 		providerId: string,
 		options?: { includeFallback?: boolean },
 	): Promise<AuthApiKeyResult> {
+		// A root-scoped AIM binding is authoritative for its managed provider.
+		const external = await this.aimExternalSession?.getAccess(providerId);
+		if (external) {
+			return {
+				apiKey: external.accessToken,
+				sourceToken: {
+					provider: providerId,
+					source: "stored",
+					identityFingerprint: external.identityFingerprint,
+					valueFingerprint: external.valueFingerprint,
+				},
+			};
+		}
+
 		// Runtime override takes highest priority
 		const runtimeCandidate = this.getRuntimeAuthCandidate(providerId);
 		const runtimeKey = this.runtimeOverrides.get(providerId);

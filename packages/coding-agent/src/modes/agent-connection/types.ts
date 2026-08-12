@@ -309,6 +309,13 @@ export interface AgentConnectionScopedModel {
 	thinkingLevel?: ThinkingLevel;
 }
 
+/** Secret-free, UI-owned view of one session's AIM credential binding. */
+export interface AgentConnectionCredentialBinding {
+	provider: string;
+	source: "aimgr";
+	binding: string;
+}
+
 export interface AgentConnectionModelCycleResult {
 	model: AgentConnectionModel;
 	thinkingLevel: ThinkingLevel;
@@ -343,6 +350,8 @@ export interface AgentConnectionState {
 	scopedModels: AgentConnectionScopedModel[];
 	activeToolNames: string[];
 	contextUsage: SessionStats["contextUsage"];
+	/** Secret-free AIM credential labels pinned to this session tree. */
+	credentialBindings?: AgentConnectionCredentialBinding[];
 	/** One-line recap of the agent's recent work, shown above the prompt. */
 	recap?: string;
 }

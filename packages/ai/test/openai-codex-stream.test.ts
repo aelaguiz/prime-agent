@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	closeOpenAICodexWebSocketSessions,
 	getOpenAICodexWebSocketDebugStats,
 	resetOpenAICodexWebSocketDebugStats,
 	streamOpenAICodexResponses,
@@ -22,13 +23,14 @@ afterEach(() => {
 	} else {
 		process.env.PI_CODING_AGENT_DIR = originalAgentDir;
 	}
+	closeOpenAICodexWebSocketSessions();
 	resetOpenAICodexWebSocketDebugStats();
 	vi.restoreAllMocks();
 });
 
-function mockToken(): string {
+function mockToken(accountId = "acc_test"): string {
 	const payload = Buffer.from(
-		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "acc_test" } }),
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: accountId } }),
 		"utf8",
 	).toString("base64");
 	return `aaa.${payload}.bbb`;
@@ -1007,6 +1009,214 @@ describe("openai-codex streaming", () => {
 			deltaRequests: 1,
 			lastDeltaInputItems: 1,
 			lastPreviousResponseId: "resp_1",
+		});
+	});
+
+	it.each([
+		["usage_limit_reached", "rate_limit", 429],
+		["rate_limit_exceeded", "rate_limit", 429],
+	] as const)("preserves nested websocket %s failures", async (providerErrorType, kind, status) => {
+		const token = mockToken();
+		const providerEvent = {
+			type: "error",
+			error: {
+				type: providerErrorType,
+				message: providerErrorType === "usage_limit_reached" ? "The usage limit has been reached" : "Slow down",
+				plan_type: "pro",
+				resets_at: 1_786_235_559,
+			},
+			status_code: status,
+			headers: { "x-request-id": "req_nested_failure" },
+		};
+
+		class ErrorWebSocket {
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor(_url: string, _protocols?: string | string[] | { headers?: Record<string, string> }) {
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				let listeners = this.listeners.get(type);
+				if (!listeners) {
+					listeners = new Set();
+					this.listeners.set(type, listeners);
+				}
+				listeners.add(listener);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			send(): void {
+				queueMicrotask(() => this.dispatch("message", { data: JSON.stringify(providerEvent) }));
+			}
+
+			close(): void {}
+
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) listener(event);
+			}
+		}
+
+		global.fetch = vi.fn(async () => new Response("unexpected fetch", { status: 500 })) as typeof fetch;
+		globalThis.WebSocket = ErrorWebSocket as unknown as typeof WebSocket;
+
+		const result = await streamOpenAICodexResponses(
+			{
+				id: "gpt-5.6-sol",
+				name: "GPT-5.6 Sol",
+				api: "openai-codex-responses",
+				provider: "openai-codex",
+				baseUrl: "https://chatgpt.com/backend-api",
+				reasoning: true,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 1_000_000,
+				maxTokens: 128_000,
+			},
+			{ messages: [{ role: "user", content: "hello", timestamp: 1 }] },
+			{ apiKey: token, sessionId: "session-nested-error", transport: "websocket-cached" },
+		).result();
+
+		expect(result).toMatchObject({ stopReason: "error", content: [], usage: { totalTokens: 0 } });
+		expect(result.diagnostics).toContainEqual(
+			expect.objectContaining({
+				type: "provider_stream_failure",
+				details: expect.objectContaining({
+					kind,
+					providerErrorType,
+					status,
+					requestId: "req_nested_failure",
+				}),
+			}),
+		);
+		expect(global.fetch).not.toHaveBeenCalled();
+	});
+
+	it("does not reuse websocket continuation across credential generations", async () => {
+		const sentBodies: Array<Record<string, unknown>> = [];
+		const connectedAccounts: string[] = [];
+		let connectionCount = 0;
+
+		class GenerationWebSocket {
+			static OPEN = 1;
+			readonly connectionNumber = ++connectionCount;
+			readyState = GenerationWebSocket.OPEN;
+			private listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor(_url: string, protocols?: string | string[] | { headers?: Record<string, string> }) {
+				if (protocols && typeof protocols === "object" && !Array.isArray(protocols)) {
+					connectedAccounts.push(protocols.headers?.["chatgpt-account-id"] ?? "");
+				}
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				let listeners = this.listeners.get(type);
+				if (!listeners) {
+					listeners = new Set();
+					this.listeners.set(type, listeners);
+				}
+				listeners.add(listener);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			send(data: string): void {
+				sentBodies.push(JSON.parse(data) as Record<string, unknown>);
+				const suffix = String(this.connectionNumber);
+				const events = [
+					{ type: "response.created", response: { id: `resp_${suffix}` } },
+					{
+						type: "response.output_item.added",
+						item: { type: "message", id: `msg_${suffix}`, role: "assistant", status: "in_progress", content: [] },
+					},
+					{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+					{ type: "response.output_text.delta", delta: `reply-${suffix}` },
+					{
+						type: "response.output_item.done",
+						item: {
+							type: "message",
+							id: `msg_${suffix}`,
+							role: "assistant",
+							status: "completed",
+							content: [{ type: "output_text", text: `reply-${suffix}` }],
+						},
+					},
+					{
+						type: "response.completed",
+						response: {
+							id: `resp_${suffix}`,
+							status: "completed",
+							usage: {
+								input_tokens: 5,
+								output_tokens: 3,
+								total_tokens: 8,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				];
+				queueMicrotask(() => {
+					for (const event of events) this.dispatch("message", { data: JSON.stringify(event) });
+				});
+			}
+
+			close(): void {
+				this.readyState = 3;
+			}
+
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) listener(event);
+			}
+		}
+
+		globalThis.WebSocket = GenerationWebSocket as unknown as typeof WebSocket;
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		};
+		const firstContext: Context = {
+			messages: [{ role: "user", content: "first", timestamp: 1 }],
+		};
+		const first = await streamOpenAICodexResponses(model, firstContext, {
+			apiKey: mockToken("account-a"),
+			sessionId: "session-generation",
+			transport: "websocket-cached",
+			metadata: { aimCredentialCacheKey: "generation-a" },
+		}).result();
+		const secondContext: Context = {
+			messages: [...firstContext.messages, first, { role: "user", content: "second", timestamp: 2 }],
+		};
+		await streamOpenAICodexResponses(model, secondContext, {
+			apiKey: mockToken("account-b"),
+			sessionId: "session-generation",
+			transport: "websocket-cached",
+			metadata: { aimCredentialCacheKey: "generation-b" },
+		}).result();
+
+		expect(connectionCount).toBe(2);
+		expect(connectedAccounts).toEqual(["account-a", "account-b"]);
+		expect(sentBodies).toHaveLength(2);
+		expect(sentBodies[1]?.previous_response_id).toBeUndefined();
+		expect(getOpenAICodexWebSocketDebugStats("session-generation")).toMatchObject({
+			requests: 2,
+			connectionsCreated: 2,
+			connectionsReused: 0,
+			fullContextRequests: 2,
+			deltaRequests: 0,
 		});
 	});
 });

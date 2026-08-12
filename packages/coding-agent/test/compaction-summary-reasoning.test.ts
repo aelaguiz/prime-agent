@@ -1,7 +1,14 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { generateSummary } from "../src/core/compaction/index.js";
+import {
+	compact,
+	DEFAULT_COMPACTION_SETTINGS,
+	generateBranchSummary,
+	generateSummary,
+} from "../src/core/compaction/index.js";
+import type { ProviderRequestCompletion } from "../src/core/model-registry.js";
+import type { SessionMessageEntry } from "../src/core/session-manager.js";
 
 const { completeSimpleMock } = vi.hoisted(() => ({
 	completeSimpleMock: vi.fn(),
@@ -49,6 +56,10 @@ const mockSummaryResponse: AssistantMessage = {
 };
 
 const messages: AgentMessage[] = [{ role: "user", content: "Summarize this.", timestamp: Date.now() }];
+const requestCompletion: ProviderRequestCompletion = {
+	completeSimpleWithRequestAdmission: (model, context, options) =>
+		completeSimpleMock(model, context, { ...options, apiKey: "test-key" }),
+};
 
 describe("generateSummary reasoning options", () => {
 	beforeEach(() => {
@@ -61,8 +72,7 @@ describe("generateSummary reasoning options", () => {
 			messages,
 			createModel(true),
 			2000,
-			"test-key",
-			undefined,
+			requestCompletion,
 			undefined,
 			undefined,
 			undefined,
@@ -81,8 +91,7 @@ describe("generateSummary reasoning options", () => {
 			messages,
 			createModel(true),
 			2000,
-			"test-key",
-			undefined,
+			requestCompletion,
 			undefined,
 			undefined,
 			undefined,
@@ -101,8 +110,7 @@ describe("generateSummary reasoning options", () => {
 			messages,
 			createModel(false),
 			2000,
-			"test-key",
-			undefined,
+			requestCompletion,
 			undefined,
 			undefined,
 			undefined,
@@ -114,5 +122,37 @@ describe("generateSummary reasoning options", () => {
 			apiKey: "test-key",
 		});
 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("reasoning");
+	});
+
+	it("routes split-turn and branch summary constructors through request admission", async () => {
+		completeSimpleMock.mockResolvedValue(mockSummaryResponse);
+		await compact(
+			{
+				firstKeptEntryId: "kept",
+				messagesToSummarize: messages,
+				turnPrefixMessages: messages,
+				isSplitTurn: true,
+				tokensBefore: 10,
+				fileOps: { read: new Set(), edited: new Set(), written: new Set() },
+				settings: DEFAULT_COMPACTION_SETTINGS,
+			},
+			createModel(false),
+			requestCompletion,
+		);
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "entry-1",
+			parentId: null,
+			timestamp: new Date().toISOString(),
+			message: messages[0],
+		};
+		await generateBranchSummary([entry], {
+			model: createModel(false),
+			requestCompletion,
+			signal: new AbortController().signal,
+		});
+		expect(completeSimpleMock).toHaveBeenCalledTimes(3);
 	});
 });

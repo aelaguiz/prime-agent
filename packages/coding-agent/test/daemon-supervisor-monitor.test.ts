@@ -18,7 +18,8 @@ import {
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
-import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonSupervisor, DaemonWorkerRuntimeIdentityError } from "../src/modes/daemon/daemon-supervisor.js";
+import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
 import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
@@ -1377,6 +1378,140 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(recoverWorker).not.toHaveBeenCalled();
 		releaseStop.resolve();
 		await stopping;
+	});
+
+	it("rejects a worker with no runtime identity before authentication without entering adoption recovery", async () => {
+		type AdoptionWorker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				socketPath: string;
+				authenticationToken: string;
+				rootActiveSessionId: string;
+				lifecycle: "recovering" | "failed";
+				lastError?: string;
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+		};
+		const worker: AdoptionWorker = {
+			descriptor: {
+				workerId: "worker-build-mismatch-adoption",
+				pid: process.pid,
+				socketPath: "/tmp/worker-build-mismatch.sock",
+				authenticationToken: "token",
+				rootActiveSessionId: "active-build-mismatch",
+				lifecycle: "recovering",
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const connect = vi.spyOn(DaemonWorkerClient.prototype, "connect").mockResolvedValue();
+		const waitForHello = vi.spyOn(DaemonWorkerClient.prototype, "waitForHello").mockResolvedValue({
+			type: "daemon_hello",
+		} as Awaited<ReturnType<DaemonWorkerClient["waitForHello"]>>);
+		const authenticate = vi.spyOn(DaemonWorkerClient.prototype, "authenticateWorker").mockResolvedValue();
+		const close = vi.spyOn(DaemonWorkerClient.prototype, "close").mockImplementation(() => undefined);
+		const recoverWorker = vi.fn(async () => undefined);
+		const subscribeWorker = vi.fn(async () => undefined);
+		const refreshWorkerSummaries = vi.fn(async () => undefined);
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			recoverWorker,
+			subscribeWorker,
+			refreshWorkerSummaries,
+			persistWorker,
+			log: vi.fn(),
+		}) as {
+			adoptOrRecoverWorker(worker: AdoptionWorker): Promise<void>;
+		};
+
+		try {
+			await supervisor.adoptOrRecoverWorker(worker);
+
+			expect(connect).toHaveBeenCalledOnce();
+			expect(waitForHello).toHaveBeenCalledOnce();
+			expect(authenticate).not.toHaveBeenCalled();
+			expect(subscribeWorker).not.toHaveBeenCalled();
+			expect(refreshWorkerSummaries).not.toHaveBeenCalled();
+			expect(recoverWorker).not.toHaveBeenCalled();
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(worker.descriptor.lastError).toContain("worker=missing");
+			expect(persistWorker).toHaveBeenCalledOnce();
+		} finally {
+			close.mockRestore();
+			authenticate.mockRestore();
+			waitForHello.mockRestore();
+			connect.mockRestore();
+		}
+	});
+
+	it("never kills or relaunches a live worker after a runtime identity rejection", async () => {
+		vi.useFakeTimers();
+		type RecoveryWorker = {
+			descriptor: {
+				workerId: string;
+				pid: number;
+				rootActiveSessionId: string;
+				createCommand: { type: "create" };
+				lifecycle: "recovering" | "failed";
+				consecutiveFailures: number;
+				lastError?: string;
+			};
+			intentionalStop: boolean;
+			stopRevision: number;
+			recovery?: Promise<void>;
+		};
+		const worker: RecoveryWorker = {
+			descriptor: {
+				workerId: "worker-build-mismatch-recovery",
+				pid: process.pid,
+				rootActiveSessionId: "active-build-mismatch",
+				createCommand: { type: "create" },
+				lifecycle: "recovering",
+				consecutiveFailures: 0,
+			},
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const mismatch = new DaemonWorkerRuntimeIdentityError(undefined, {
+			buildId: "supervisor-build",
+			executablePath: "/node",
+		});
+		const connectWorker = vi.fn(async () => {
+			throw mismatch;
+		});
+		const recoverUncertainWorkerOperations = vi.fn(async () => undefined);
+		const launchWorker = vi.fn(async () => worker);
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			connectWorker,
+			recoverUncertainWorkerOperations,
+			launchWorker,
+			persistWorker,
+			syncAgentPeers: vi.fn(async () => undefined),
+			log: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+		}) as {
+			recoverWorker(worker: RecoveryWorker): Promise<void>;
+		};
+
+		const recovery = supervisor.recoverWorker(worker);
+		await vi.advanceTimersByTimeAsync(250);
+		await recovery;
+
+		expect(connectWorker).toHaveBeenCalledOnce();
+		expect(recoverUncertainWorkerOperations).not.toHaveBeenCalled();
+		expect(launchWorker).not.toHaveBeenCalled();
+		expect(worker.descriptor.lifecycle).toBe("failed");
+		expect(worker.descriptor.lastError).toContain("worker=missing");
+		expect(worker.descriptor.consecutiveFailures).toBe(0);
+		expect(persistWorker).toHaveBeenCalledOnce();
 	});
 
 	it("cancels an in-flight recovery after an intentional stop tombstone", async () => {

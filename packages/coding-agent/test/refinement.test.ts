@@ -5,6 +5,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type * as PiAi from "@earendil-works/pi-ai";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ProviderRequestCompletion } from "../src/core/model-registry.js";
 import {
 	appendGlobalRefinement,
 	applyRefinementProposal,
@@ -26,6 +27,7 @@ import {
 	type RefinementProposal,
 	type RefinementResult,
 	refineHarness,
+	reviewAutoRefine,
 	saveHarnessState,
 } from "../src/core/refinement/index.js";
 import type { CustomEntry } from "../src/core/session-manager.js";
@@ -109,6 +111,13 @@ function assistantText(text: string): AssistantMessage {
 		},
 		stopReason: "stop",
 		timestamp: Date.now(),
+	};
+}
+
+function requestCompletion(headers?: Record<string, string>): ProviderRequestCompletion {
+	return {
+		completeSimpleWithRequestAdmission: (model, context, options) =>
+			completeSimpleMock(model, context, { ...options, apiKey: "api-key", headers }),
 	};
 }
 
@@ -1008,9 +1017,8 @@ describe("harness refinement", () => {
 			state,
 			[],
 			createRefineModel(true),
-			"api-key",
+			requestCompletion({ "x-test-header": "1" }),
 			{},
-			{ "x-test-header": "1" },
 			undefined,
 			"xhigh",
 		);
@@ -1056,9 +1064,31 @@ describe("harness refinement", () => {
 		// A large model must receive the policy ceiling, not its full output width.
 		const wideModel = { ...createRefineModel(false), maxTokens: 128_000 };
 
-		await refineHarness([], state, [], wideModel, "api-key", {});
+		await refineHarness([], state, [], wideModel, requestCompletion(), {});
 
 		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ maxTokens: 32_000 });
+	});
+
+	it("routes the auto-refine review constructor through request admission", async () => {
+		const state = loadHarnessState(makeTempDir());
+		completeSimpleMock.mockResolvedValueOnce(
+			assistantText(JSON.stringify({ shouldRefine: true, rationale: "Reusable evidence." })),
+		);
+
+		const review = await reviewAutoRefine(
+			[],
+			state,
+			[],
+			createRefineModel(true),
+			requestCompletion(),
+			{ reason: "turn_interval", turnsSinceLastReview: 3 },
+			undefined,
+			"xhigh",
+		);
+
+		expect(review).toEqual({ shouldRefine: true, rationale: "Reusable evidence.", instructions: undefined });
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({ maxTokens: 4096, apiKey: "api-key" });
+		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("reasoning");
 	});
 
 	it("reports an exhausted output budget instead of a JSON parse error", async () => {
@@ -1074,7 +1104,7 @@ describe("harness refinement", () => {
     { "action": "create", "kind": "memory", "id": "b", "title": "t2", "content": "second`;
 		completeSimpleMock.mockResolvedValueOnce({ ...assistantText(truncated), stopReason: "length" });
 
-		await expect(refineHarness([], state, [], createRefineModel(false), "api-key", {})).rejects.toThrow(
+		await expect(refineHarness([], state, [], createRefineModel(false), requestCompletion(), {})).rejects.toThrow(
 			/output budget was exhausted/,
 		);
 	});
@@ -1088,7 +1118,7 @@ describe("harness refinement", () => {
     { "action": "create", "kind": "memory", "id": "b", "title": "t2", "content": "second`;
 		completeSimpleMock.mockResolvedValueOnce(assistantText(truncated));
 
-		await expect(refineHarness([], state, [], createRefineModel(false), "api-key", {})).rejects.toThrow(
+		await expect(refineHarness([], state, [], createRefineModel(false), requestCompletion(), {})).rejects.toThrow(
 			/stopped before completing its JSON object/,
 		);
 	});
@@ -1103,7 +1133,7 @@ describe("harness refinement", () => {
     { "action": "create", "kind": "memory", "id": "a", "title": "t", "content": "first" }`;
 		completeSimpleMock.mockResolvedValueOnce(assistantText(truncated));
 
-		await expect(refineHarness([], state, [], createRefineModel(false), "api-key", {})).rejects.toThrow(
+		await expect(refineHarness([], state, [], createRefineModel(false), requestCompletion(), {})).rejects.toThrow(
 			/stopped before completing its JSON object/,
 		);
 	});
@@ -1114,7 +1144,7 @@ describe("harness refinement", () => {
 		// failure, not a truncation, and must not blame the output budget.
 		completeSimpleMock.mockResolvedValueOnce(assistantText('Here is the result: {"edits": [oops]}'));
 
-		await expect(refineHarness([], state, [], createRefineModel(false), "api-key", {})).rejects.toThrow(
+		await expect(refineHarness([], state, [], createRefineModel(false), requestCompletion(), {})).rejects.toThrow(
 			/did not return valid JSON/,
 		);
 	});
@@ -1156,7 +1186,7 @@ describe("harness refinement", () => {
 		expect(state.entries.memory.kept_memory.content).toBe("Updated memory content");
 		expect(state.entries.skill.deleted_skill).toBeUndefined();
 
-		const rollback = await refineHarness([], state, [target], {} as never, "api-key", {
+		const rollback = await refineHarness([], state, [target], {} as never, requestCompletion(), {
 			rollbackId: "refine_target",
 		});
 
@@ -1191,7 +1221,7 @@ describe("harness refinement", () => {
 		const state = loadHarnessState(makeTempDir());
 
 		await expect(
-			refineHarness([], state, [], {} as never, "api-key", { rollbackId: "missing_refinement" }),
+			refineHarness([], state, [], {} as never, requestCompletion(), { rollbackId: "missing_refinement" }),
 		).rejects.toThrow("Refinement missing_refinement not found");
 	});
 });
@@ -1339,7 +1369,7 @@ describe("global refinement history", () => {
 			state,
 			[],
 			createRefineModel(false),
-			"api-key",
+			requestCompletion(),
 			{},
 		);
 
@@ -1384,7 +1414,7 @@ describe("global refinement history", () => {
 			state,
 			[],
 			createRefineModel(false),
-			"api-key",
+			requestCompletion(),
 			{ global: true },
 		);
 
@@ -1404,7 +1434,7 @@ describe("global refinement history", () => {
 			{ id: "refine_rollback_target" },
 		);
 
-		const plan = await planRefinement([], state, [target], {} as never, "api-key", {
+		const plan = await planRefinement([], state, [target], {} as never, requestCompletion(), {
 			rollbackId: "refine_rollback_target",
 		});
 
@@ -1441,7 +1471,7 @@ describe("global refinement history", () => {
 		expect(sessionBState.entries.memory.session_a_memory).toBeDefined();
 
 		const globalHistory = mergeRefinementHistory(loadGlobalRefinementHistory(dir), getRefinementHistory([]));
-		const rollback = await refineHarness([], sessionBState, globalHistory, {} as never, "api-key", {
+		const rollback = await refineHarness([], sessionBState, globalHistory, {} as never, requestCompletion(), {
 			rollbackId: "refine_session_a",
 		});
 
@@ -1468,7 +1498,7 @@ describe("global refinement history", () => {
 		);
 		expect(target.scope).toBe("global");
 
-		const plan = await planRefinement([], state, [target], {} as never, "api-key", {
+		const plan = await planRefinement([], state, [target], {} as never, requestCompletion(), {
 			rollbackId: "refine_global_target",
 		});
 
@@ -1510,7 +1540,7 @@ describe("global refinement history", () => {
 		};
 		const legacyHistory = mergeRefinementHistory([{ ...legacyTarget, scope: "global" }], [legacyTarget]);
 
-		const plan = await planRefinement([], state, legacyHistory, {} as never, "api-key", {
+		const plan = await planRefinement([], state, legacyHistory, {} as never, requestCompletion(), {
 			rollbackId: "refine_legacy_global",
 		});
 

@@ -1,9 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { AgentStatus } from "../src/core/session-manager.js";
 import {
 	agentStatusChanged,
 	buildStatusContext,
+	generateAgentStatus,
 	parseAgentStatusResponse,
 } from "../src/modes/daemon/daemon-session-summarizer.js";
 
@@ -17,6 +18,31 @@ function assistantMessage(text: string, tools: string[] = []): AgentMessage {
 }
 
 describe("daemon session summarizer", () => {
+	test("constructs the status request through the registry admission boundary", async () => {
+		const model = {
+			id: "qwen/qwen3-30b-a3b-instruct-2507",
+			provider: "prime-inference",
+		};
+		const completeSimpleWithRequestAdmission = vi.fn().mockResolvedValue({
+			stopReason: "stop",
+			content: [{ type: "text", text: "<recap>Reviewing the request seam</recap><status>COMPLETED</status>" }],
+		});
+		const registry = {
+			find: () => model,
+			hasConfiguredAuth: () => true,
+			completeSimpleWithRequestAdmission,
+		};
+
+		await expect(
+			generateAgentStatus({
+				registry: registry as never,
+				messages: [userMessage("review the request seam")],
+				isWorking: false,
+			}),
+		).resolves.toEqual({ summary: "Reviewing the request seam", taskState: "completed" });
+		expect(completeSimpleWithRequestAdmission).toHaveBeenCalledOnce();
+	});
+
 	describe("parseAgentStatusResponse", () => {
 		test("parses recap and completion verdict for an idle session", () => {
 			const result = parseAgentStatusResponse(

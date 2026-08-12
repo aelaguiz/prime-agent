@@ -1,9 +1,22 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { clampThinkingLevel, type Message, type Model, streamSimple, supportsFastMode } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	type AssistantMessageEventStream,
+	appendAssistantMessageDiagnostic,
+	clampThinkingLevel,
+	createAssistantMessageEventStream,
+	type Message,
+	type Model,
+	type SimpleStreamOptions,
+	streamSimple,
+	supportsFastMode,
+} from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
+import { AimExternalCredentialError } from "./aim-external-auth.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
@@ -82,6 +95,135 @@ export interface CreateAgentSessionResult {
 	extensionsResult: LoadExtensionsResult;
 	/** Warning if session was restored with a different model than saved */
 	modelFallbackMessage?: string;
+}
+
+type CredentialAwareSimpleStreamOptions = SimpleStreamOptions & {
+	transportAuthIdentity?: string;
+};
+
+interface AdmittedProviderStream {
+	stream: AssistantMessageEventStream;
+	transportAuthIdentity?: string;
+	binding?: string;
+}
+
+function eventMessage(event: AssistantMessageEvent): AssistantMessage {
+	if (event.type === "done") return event.message;
+	if (event.type === "error") return event.error;
+	return event.partial;
+}
+
+function isExactUnopenedCodexExhaustion(event: AssistantMessageEvent, semanticOutputEmitted: boolean): boolean {
+	if (event.type !== "error" || event.reason !== "error" || semanticOutputEmitted) return false;
+	if (event.error.content.length > 0) return false;
+	return (
+		event.error.diagnostics?.some(
+			(diagnostic) =>
+				diagnostic.type === "provider_stream_failure" &&
+				diagnostic.details?.providerErrorType === "usage_limit_reached" &&
+				diagnostic.details?.status === 429,
+		) ?? false
+	);
+}
+
+function appendAimRecoveryDiagnostic(
+	message: AssistantMessage,
+	fromBinding: string | undefined,
+	toBinding: string,
+): void {
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "aim_credential_failover")) return;
+	appendAssistantMessageDiagnostic(message, {
+		type: "aim_credential_failover",
+		timestamp: Date.now(),
+		details: {
+			...(fromBinding ? { fromBinding } : {}),
+			toBinding,
+		},
+	});
+}
+
+function appendAimRecoveryFailure(message: AssistantMessage, error: unknown): void {
+	const code = error instanceof AimExternalCredentialError ? error.code : "handoff_failed";
+	appendAssistantMessageDiagnostic(message, {
+		type: "aim_credential_failover_unavailable",
+		timestamp: Date.now(),
+		details: { code },
+	});
+	const reason = error instanceof Error ? error.message : "Automatic AIM credential failover failed.";
+	message.errorMessage = `${message.errorMessage ?? "Codex account exhausted."} Automatic recovery unavailable: ${reason}`;
+}
+
+/** Retry one unopened exact Codex exhaustion after the root-owned AIM generation advances. */
+function streamWithAimCodexFailover(
+	authStorage: AuthStorage,
+	startRequest: () => Promise<AdmittedProviderStream>,
+	first: AdmittedProviderStream,
+): AssistantMessageEventStream {
+	const output = createAssistantMessageEventStream();
+	void (async () => {
+		let admitted = first;
+		let retryUsed = false;
+		let recovery: { fromBinding?: string; toBinding: string } | undefined;
+
+		while (true) {
+			let bufferedStart: AssistantMessageEvent | undefined;
+			let semanticOutputEmitted = false;
+			let retry = false;
+			for await (const event of admitted.stream) {
+				if (event.type === "start") {
+					bufferedStart = event;
+					continue;
+				}
+				if (event.type !== "done" && event.type !== "error") {
+					semanticOutputEmitted = true;
+					if (bufferedStart) {
+						if (recovery) {
+							appendAimRecoveryDiagnostic(eventMessage(bufferedStart), recovery.fromBinding, recovery.toBinding);
+						}
+						output.push(bufferedStart);
+						bufferedStart = undefined;
+					}
+					output.push(event);
+					continue;
+				}
+
+				if (
+					!retryUsed &&
+					event.type === "error" &&
+					admitted.transportAuthIdentity &&
+					isExactUnopenedCodexExhaustion(event, semanticOutputEmitted)
+				) {
+					retryUsed = true;
+					const fromBinding = admitted.binding;
+					try {
+						const next = await authStorage.advanceAimCredentialForRequest(
+							"openai-codex",
+							admitted.transportAuthIdentity,
+							"usage_limit_reached",
+						);
+						admitted = await startRequest();
+						recovery = { fromBinding, toBinding: next.binding };
+						retry = true;
+						break;
+					} catch (error) {
+						appendAimRecoveryFailure(event.error, error);
+					}
+				}
+
+				if (bufferedStart) {
+					if (recovery)
+						appendAimRecoveryDiagnostic(eventMessage(bufferedStart), recovery.fromBinding, recovery.toBinding);
+					output.push(bufferedStart);
+				}
+				if (recovery) appendAimRecoveryDiagnostic(eventMessage(event), recovery.fromBinding, recovery.toBinding);
+				output.push(event);
+				output.end(eventMessage(event));
+				return;
+			}
+			if (!retry) return;
+		}
+	})();
+	return output;
 }
 
 // Re-exports
@@ -304,19 +446,34 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
-			const auth = await modelRegistry.getApiKeyAndHeaders(model);
-			if (!auth.ok) {
-				throw new Error(auth.error);
-			}
-			const providerRetrySettings = settingsManager.getProviderRetrySettings();
-			return streamSimple(model, context, {
-				...options,
-				apiKey: auth.apiKey,
-				timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-				maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
-				maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-				headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
-			});
+			const startRequest = (): Promise<AdmittedProviderStream> =>
+				authStorage.withProviderRequestAdmission(
+					model.provider,
+					() => modelRegistry.getApiKeyAndHeaders(model),
+					(auth, admission) => {
+						if (!auth.ok) {
+							throw new Error(auth.error);
+						}
+						const providerRetrySettings = settingsManager.getProviderRetrySettings();
+						const requestOptions: CredentialAwareSimpleStreamOptions = {
+							...options,
+							apiKey: auth.apiKey,
+							timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
+							maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+							maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+							headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
+							...(admission ? { transportAuthIdentity: admission.transportAuthIdentity } : {}),
+						};
+						return {
+							stream: streamSimple(model, context, requestOptions),
+							transportAuthIdentity: admission?.transportAuthIdentity,
+							binding: admission ? authStorage.getAimCredentialBinding(model.provider)?.binding : undefined,
+						};
+					},
+				);
+			const first = await startRequest();
+			if (model.provider !== "openai-codex" || !first.transportAuthIdentity) return first.stream;
+			return streamWithAimCodexFailover(authStorage, startRequest, first);
 		},
 		onPayload: async (payload, _model) => {
 			const runner = extensionRunnerRef.current;

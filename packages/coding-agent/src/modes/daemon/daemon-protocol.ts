@@ -57,8 +57,9 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 12 publishes idle-residency metadata on session summary rows.
 // Revision 13 narrows agent-origin reach and roster wire shapes to the nuclear family.
 // Revision 14 carries the client's monotonic telemetry opt-out on attach and reattach.
-export const DAEMON_SCHEMA_REVISION = 14;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-14-816309b1cd50";
+// Revision 15 adds capability-gated AIM credential handoff for active root sessions.
+export const DAEMON_SCHEMA_REVISION = 15;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-15-610272005198";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -96,7 +97,8 @@ export type DaemonServerCapability =
 	// identity). Clients must check before sending.
 	| "transient_bash"
 	| "session_input_admission"
-	| "prompt_admission_cancellation";
+	| "prompt_admission_cancellation"
+	| "aim_credential_handoff";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -134,6 +136,7 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"transient_bash",
 	"session_input_admission",
 	"prompt_admission_cancellation",
+	"aim_credential_handoff",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -390,6 +393,17 @@ export type DaemonCommand =
 	| { id?: string; type: "rename"; activeSessionId: string; name: string }
 	| {
 			id?: string;
+			type: "handoff_aim_credential";
+			activeSessionId: string;
+			provider: "openai-codex" | "anthropic";
+			expectedModel: string;
+			expectedBinding: string;
+			expectedIdentityFingerprint: string;
+			requestedBinding: string;
+			requestedIdentityFingerprint: string;
+	  }
+	| {
+			id?: string;
 			type: "prompt";
 			activeSessionId: string;
 			message: string;
@@ -635,6 +649,11 @@ const DELETE_RLM_SUBAGENT_COMMAND = {
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
+const AIM_CREDENTIAL_HANDOFF_COMMAND = {
+	minProtocol: 7,
+	minSchemaRevision: 15,
+	capability: "aim_credential_handoff",
+} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
@@ -648,6 +667,7 @@ export const DAEMON_COMMAND_COMPATIBILITY = {
 	promote_owned_session: CLIENT_OWNED_DAEMON_COMMAND,
 	kill: LEGACY_DAEMON_COMMAND,
 	rename: LEGACY_DAEMON_COMMAND,
+	handoff_aim_credential: AIM_CREDENTIAL_HANDOFF_COMMAND,
 	prompt: SESSION_INPUT_ADMISSION_COMMAND,
 	cancel_prompt_admission: PROMPT_ADMISSION_CANCELLATION_COMMAND,
 	prompt_and_wait: SESSION_INPUT_ADMISSION_COMMAND,

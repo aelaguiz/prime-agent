@@ -100,16 +100,14 @@ describe("built-in slash commands", () => {
 describe("slash command aliases", () => {
 	test("keeps aliases hidden on canonical command entries", () => {
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "clear")).toBeUndefined();
-		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "usage")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "rename")).toBeUndefined();
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "new")).toMatchObject({
 			description: "Start a new session, optionally named and/or with an initial prompt",
 			argumentHint: '[--name "session name" --] [prompt]',
 			aliases: ["clear"],
 		});
-		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "context")).toMatchObject({
-			description: "Show token, cost, and context usage for agent and sub-agents",
-			aliases: ["usage"],
+		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "usage")).toMatchObject({
+			description: "Show account, provider, token, cost, and context usage",
 		});
 		expect(BUILTIN_SLASH_COMMANDS.find((command) => command.name === "name")).toMatchObject({
 			description: "Set or show the session display name",
@@ -172,14 +170,14 @@ describe("slash command aliases", () => {
 		});
 	});
 
-	test("preserves arguments when resolving aliases", () => {
+	test("keeps /usage as its own command", () => {
 		const parsed = parseSlashCommand("/usage latest turn");
 
 		expect(resolveSlashCommand(parsed!)).toEqual({
-			name: "context",
+			name: "usage",
 			args: "latest turn",
 			originalName: "usage",
-			isAlias: true,
+			isAlias: false,
 		});
 	});
 

@@ -4,6 +4,7 @@ import { getModel } from "@earendil-works/pi-ai";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { beforeEach, describe, expect, it } from "vitest";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import {
 	buildSummarizationPrompt,
 	type CompactionSettings,
@@ -16,6 +17,7 @@ import {
 	prepareCompaction,
 	shouldCompact,
 } from "../src/core/compaction/index.js";
+import { ModelRegistry } from "../src/core/model-registry.js";
 import {
 	buildSessionContext,
 	type CompactionEntry,
@@ -65,6 +67,10 @@ function createAssistantMessage(text: string, usage?: Usage): AssistantMessage {
 		provider: "anthropic",
 		model: "claude-sonnet-4-5",
 	};
+}
+
+function createRequestCompletion(apiKey: string): ModelRegistry {
+	return ModelRegistry.inMemory(AuthStorage.inMemory({ anthropic: { type: "api_key", key: apiKey } }));
 }
 
 let entryCounter = 0;
@@ -560,7 +566,11 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		const preparation = prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS);
 		expect(preparation).toBeDefined();
 
-		const compactionResult = await compact(preparation!, model, process.env.ANTHROPIC_OAUTH_TOKEN!);
+		const compactionResult = await compact(
+			preparation!,
+			model,
+			createRequestCompletion(process.env.ANTHROPIC_OAUTH_TOKEN!),
+		);
 
 		expect(compactionResult.summary.length).toBeGreaterThan(100);
 		expect(compactionResult.firstKeptEntryId).toBeTruthy();
@@ -581,7 +591,11 @@ describe.skipIf(!process.env.ANTHROPIC_OAUTH_TOKEN)("LLM summarization", () => {
 		const preparation = prepareCompaction(entries, DEFAULT_COMPACTION_SETTINGS);
 		expect(preparation).toBeDefined();
 
-		const compactionResult = await compact(preparation!, model, process.env.ANTHROPIC_OAUTH_TOKEN!);
+		const compactionResult = await compact(
+			preparation!,
+			model,
+			createRequestCompletion(process.env.ANTHROPIC_OAUTH_TOKEN!),
+		);
 
 		// Simulate appending compaction to entries by creating a proper entry
 		const lastEntry = entries[entries.length - 1];
