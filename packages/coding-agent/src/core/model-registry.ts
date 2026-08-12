@@ -546,6 +546,12 @@ export class ModelRegistry {
 		for (const oauthProvider of this.authStorage.getOAuthProviders()) {
 			const cred = this.authStorage.get(oauthProvider.id);
 			if (cred?.type === "oauth" && oauthProvider.modifyModels) {
+				// Only reshape models while the stored OAuth credential is the
+				// active auth source; a runtime --api-key override or an
+				// environment fallback after a stale credential outranks it.
+				if (this.authStorage.getAuthStatus(oauthProvider.id).source !== "stored") {
+					continue;
+				}
 				combined = oauthProvider.modifyModels(combined, cred);
 			}
 		}
@@ -1345,6 +1351,10 @@ export class ModelRegistry {
 				}
 			}
 			this.setLastProviderAuthSourceToken(model.provider, apiKey === undefined ? undefined : authSourceToken);
+
+			if (apiKey === undefined && authStorageAuth.error) {
+				return { ok: false, error: authStorageAuth.error };
+			}
 
 			const providerHeaders = resolveHeadersOrThrow(providerConfig?.headers, `provider "${model.provider}"`);
 			const authStorageHeaders = this.authStorage.getProviderHeaders(model.provider);

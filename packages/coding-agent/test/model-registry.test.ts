@@ -1684,4 +1684,136 @@ describe("ModelRegistry", () => {
 			});
 		});
 	});
+
+	describe("xAI OAuth models", () => {
+		test("serves xAI models over the Responses API while OAuth credentials are stored", () => {
+			authStorage.set("xai", {
+				type: "oauth",
+				refresh: "refresh",
+				access: "access",
+				expires: Date.now() + 3600_000,
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const xaiModels = getModelsForProvider(registry, "xai");
+			expect(xaiModels.length).toBeGreaterThan(0);
+			expect(xaiModels.some((model) => model.id === "grok-4.6")).toBe(true);
+			for (const model of xaiModels) {
+				expect(model.api).toBe("openai-responses");
+			}
+			const grok46 = xaiModels.find((model) => model.id === "grok-4.6");
+			expect(grok46?.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+			});
+		});
+
+		test("keeps xAI models on Chat Completions without OAuth credentials", () => {
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const xaiModels = getModelsForProvider(registry, "xai");
+			expect(xaiModels.length).toBeGreaterThan(0);
+			expect(xaiModels.some((model) => model.id === "grok-4.6")).toBe(false);
+			for (const model of xaiModels) {
+				expect(model.api).toBe("openai-completions");
+			}
+		});
+
+		test("keeps xAI models on Chat Completions when a stale OAuth credential falls back to the environment key", async () => {
+			authStorage.set("xai", {
+				type: "oauth",
+				refresh: "refresh",
+				access: "access",
+				expires: Date.now() + 3600_000,
+			});
+			await authStorage.getApiKey("xai");
+			expect(authStorage.markAuthStale("xai")).toBe(true);
+			process.env.XAI_API_KEY = "env-key";
+			try {
+				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+				const xaiModels = getModelsForProvider(registry, "xai");
+				expect(xaiModels.length).toBeGreaterThan(0);
+				expect(xaiModels.some((model) => model.id === "grok-4.6")).toBe(false);
+				for (const model of xaiModels) {
+					expect(model.api).toBe("openai-completions");
+				}
+			} finally {
+				delete process.env.XAI_API_KEY;
+			}
+		});
+
+		test("surfaces the revoked-refresh-token guidance through request auth", async () => {
+			const providerId = `test-oauth-revoked-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+			registerOAuthProvider({
+				id: providerId,
+				name: "Test OAuth Revoked",
+				async login() {
+					throw new Error("Not used in this test");
+				},
+				async refreshToken() {
+					throw new Error(
+						"xAI OAuth token refresh failed (HTTP 400): invalid_grant. Run /login and sign in to xAI again.",
+					);
+				},
+				getApiKey(credentials) {
+					return credentials.access;
+				},
+			});
+			authStorage.set(providerId, {
+				type: "oauth",
+				refresh: "revoked-refresh-token",
+				access: "expired-access-token",
+				expires: Date.now() - 10_000,
+			});
+			writeRawModelsJson({
+				[providerId]: { baseUrl: "https://api.example.com/v1", api: "openai-completions", models: [] },
+			});
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			const model: Model<Api> = {
+				id: "test-model",
+				name: "Test Model",
+				api: "openai-completions",
+				provider: providerId,
+				baseUrl: "https://api.example.com/v1",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 100000,
+				maxTokens: 8000,
+			};
+
+			const auth = await registry.getApiKeyAndHeaders(model);
+			expect(auth.ok).toBe(false);
+			if (!auth.ok) {
+				expect(auth.error).toContain("Run /login and sign in to xAI again.");
+			}
+		});
+
+		test("keeps xAI models on Chat Completions while a runtime API key outranks the OAuth credential", () => {
+			authStorage.set("xai", {
+				type: "oauth",
+				refresh: "refresh",
+				access: "access",
+				expires: Date.now() + 3600_000,
+			});
+			authStorage.setRuntimeApiKey("xai", "xai-runtime-key");
+
+			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
+			for (const model of getModelsForProvider(registry, "xai")) {
+				expect(model.api).toBe("openai-completions");
+			}
+			expect(getModelsForProvider(registry, "xai").some((model) => model.id === "grok-4.6")).toBe(false);
+
+			authStorage.removeRuntimeApiKey("xai");
+			registry.refresh();
+			for (const model of getModelsForProvider(registry, "xai")) {
+				expect(model.api).toBe("openai-responses");
+			}
+			expect(getModelsForProvider(registry, "xai").some((model) => model.id === "grok-4.6")).toBe(true);
+		});
+	});
 });
