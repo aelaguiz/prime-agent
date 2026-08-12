@@ -108,6 +108,8 @@ type AuthSourceCandidate = {
 type AuthApiKeyResult = {
 	apiKey?: string;
 	sourceToken?: AuthSourceToken;
+	/** Auth was found but could not produce a key (e.g. OAuth refresh failed). */
+	error?: string;
 };
 
 export interface AuthStorageBackend {
@@ -1050,9 +1052,10 @@ export class AuthStorage {
 							};
 						}
 
-						// Refresh truly failed - return undefined so model discovery skips this provider
-						// User can /login to re-authenticate (credentials preserved for retry)
-						return {};
+						// Refresh truly failed - return no key so model discovery skips
+						// this provider, but carry the provider's own error message so
+						// request-time callers can surface actionable guidance.
+						return { error: error instanceof Error ? error.message : String(error) };
 					}
 				} else {
 					// Token not expired, use current access token

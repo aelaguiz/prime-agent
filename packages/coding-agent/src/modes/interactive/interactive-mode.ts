@@ -2521,12 +2521,15 @@ export class InteractiveMode {
 
 	private async refreshConnectionCatalog(): Promise<void> {
 		this.invalidateConnectionModelRefresh();
-		const [state, commands, modelCatalog, resources] = await Promise.all([
-			this.agentConnection.getState(),
+		// Fetch the catalog before the state: serving the catalog can rebind the
+		// session's live models (e.g. auth.json changed while detached), and the
+		// state snapshot must reflect the rebound models.
+		const [commands, modelCatalog, resources] = await Promise.all([
 			this.agentConnection.getCommands().catch(() => []),
 			this.agentConnection.getModelCatalog(),
 			this.agentConnection.getResourceSnapshot(),
 		]);
+		const state = await this.agentConnection.getState();
 		this.applyConnectionStateSnapshot(state);
 		this.connectionCommands = commands;
 		this.applyConnectionModelCatalog(modelCatalog);
@@ -2703,6 +2706,11 @@ export class InteractiveMode {
 		if (!marked) {
 			this.modelRegistry.markProviderAuthStale(event.provider);
 		}
+		// The auth source change can reshape provider models, so refetch the
+		// catalog (the session rebinds its live models during that refresh).
+		void this.refreshConnectionModelsAfterAuthChange().catch((error) => {
+			this.showError(error instanceof Error ? error.message : String(error));
+		});
 		this.footer.invalidate();
 		this.updateEditorBorderColor();
 	}
@@ -7551,12 +7559,28 @@ export class InteractiveMode {
 		}
 
 		const version = this.connectionModelsRefreshVersion;
-		const promise = this.agentConnection.getModelCatalog().then((catalog) => {
+		const promise = this.agentConnection.getModelCatalog().then(async (catalog) => {
 			if (version !== this.connectionModelsRefreshVersion) {
 				return [...this.connectionModels];
 			}
 			this.applyConnectionModelCatalog(catalog);
 			this.connectionModelsFetchedAt = Date.now();
+			// The catalog refresh may have rebound the session's live and scoped
+			// models (e.g. an auth change switching API rails), so pull the
+			// fields that mirror them into the connection snapshot. This sync is
+			// best-effort: the models were already fetched, and the next state
+			// event refreshes the snapshot anyway.
+			try {
+				const state = await this.agentConnection.getState();
+				if (version === this.connectionModelsRefreshVersion) {
+					this.patchConnectionState({
+						model: state.model,
+						scopedModels: state.scopedModels,
+						availableThinkingLevels: state.availableThinkingLevels,
+						thinkingLevel: state.thinkingLevel,
+					});
+				}
+			} catch {}
 			return [...this.connectionModels];
 		});
 		this.connectionModelsRefreshInFlight = { version, promise };

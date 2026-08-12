@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added xAI SuperGrok / X Premium device-code OAuth and remapped stored subscription models onto the Responses API, including Grok 4.6.
+
 ## [0.7.1] - 2026-08-07
 
 ## [0.7.0] - 2026-08-05
