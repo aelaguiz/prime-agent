@@ -168,7 +168,7 @@ process.stdout.write(JSON.stringify({
 for await (const chunk of process.stdin) input += chunk;
 const request = JSON.parse(input);
 const payload = Buffer.from(JSON.stringify({
-  "https://api.openai.com/auth": { chatgpt_account_id: request.binding },
+  "https://api.openai.com/auth": { chatgpt_account_id: "shared-account" },
 })).toString("base64url");
 process.stdout.write(JSON.stringify({
   schemaVersion: 1,
@@ -304,7 +304,7 @@ process.stdout.write(JSON.stringify({
 			await session.prompt("second");
 
 			expect(connectionCount).toBe(2);
-			expect(connectedAccounts).toEqual(["codex-a", "codex-b"]);
+			expect(connectedAccounts).toEqual(["shared-account", "shared-account"]);
 			expect(sentBodies).toHaveLength(2);
 			expect(sentBodies[1]?.previous_response_id).toBeUndefined();
 		} finally {

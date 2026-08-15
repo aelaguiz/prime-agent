@@ -1193,7 +1193,7 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "first", timestamp: 1 }],
 		};
 		const first = await streamOpenAICodexResponses(model, firstContext, {
-			apiKey: mockToken("account-a"),
+			apiKey: mockToken("same-account"),
 			sessionId: "session-generation",
 			transport: "websocket-cached",
 			transportAuthIdentity: "generation-a",
@@ -1202,14 +1202,14 @@ describe("openai-codex streaming", () => {
 			messages: [...firstContext.messages, first, { role: "user", content: "second", timestamp: 2 }],
 		};
 		await streamOpenAICodexResponses(model, secondContext, {
-			apiKey: mockToken("account-b"),
+			apiKey: mockToken("same-account"),
 			sessionId: "session-generation",
 			transport: "websocket-cached",
 			transportAuthIdentity: "generation-b",
 		}).result();
 
 		expect(connectionCount).toBe(2);
-		expect(connectedAccounts).toEqual(["account-a", "account-b"]);
+		expect(connectedAccounts).toEqual(["same-account", "same-account"]);
 		expect(sentBodies).toHaveLength(2);
 		expect(sentBodies[1]?.previous_response_id).toBeUndefined();
 		expect(getOpenAICodexWebSocketDebugStats("session-generation")).toMatchObject({
