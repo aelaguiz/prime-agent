@@ -35,7 +35,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
-import { SessionManager } from "../src/core/session-manager.js";
+import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
@@ -471,6 +471,7 @@ function makeDaemonFixture(tempDir: string) {
 			reason?: RlmLedgerDeleteReason,
 		): Promise<void>;
 		setStateSessionName(state: ActiveSessionState, name: string): Promise<void>;
+		handleCommand(client: unknown, command: DaemonCommand): Promise<unknown>;
 		rlmSpawnLedger(): RlmSpawnLedger;
 	};
 	return { daemon, internals, sessionsDir };
@@ -685,6 +686,93 @@ describe("rlm spawn ledger daemon wiring", () => {
 				"delete ledger unavailable",
 			);
 			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-faildelete" })]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back a routed active-context saved rename when the ledger write fails", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-routed-rename-failure-"));
+		try {
+			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
+			const parentManager = SessionManager.create(tempDir, sessionsDir);
+			parentManager.newSession();
+			const parentFile = parentManager.getSessionFile();
+			const parentArtifactDir = parentManager.getSessionArtifactDir();
+			if (!parentFile || !parentArtifactDir) throw new Error("Missing parent session paths");
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
+			const child = makeChildSession(tempDir, join(parentArtifactDir, "sub-routed-rename"), parentFile, 1, "before");
+			const ledger = internals.rlmSpawnLedger();
+			await ledger.appendSpawn({
+				childId: "sub-routed-rename",
+				parent: parentFile,
+				child: child.file,
+				depth: 1,
+				name: "before",
+			});
+			vi.spyOn(ledger, "appendRenameByChildPath").mockRejectedValueOnce(
+				new Error("routed rename ledger unavailable"),
+			);
+
+			await expect(
+				internals.handleCommand(
+					{},
+					{
+						type: "rename_saved_session",
+						activeSessionId: parentState.activeSessionId,
+						sessionPath: child.file,
+						name: "after",
+					},
+				),
+			).rejects.toThrow("routed rename ledger unavailable");
+			expect((await readSessionInfo(child.file))?.name).toBe("before");
+			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ name: "before" })]);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a routed active-context saved delete when the ledger tombstone fails", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-routed-delete-failure-"));
+		try {
+			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
+			const parentManager = SessionManager.create(tempDir, sessionsDir);
+			parentManager.newSession();
+			const parentFile = parentManager.getSessionFile();
+			const parentArtifactDir = parentManager.getSessionArtifactDir();
+			if (!parentFile || !parentArtifactDir) throw new Error("Missing parent session paths");
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
+			const child = makeChildSession(
+				tempDir,
+				join(parentArtifactDir, "sub-routed-delete"),
+				parentFile,
+				1,
+				"delete-me",
+			);
+			const ledger = internals.rlmSpawnLedger();
+			await ledger.appendSpawn({
+				childId: "sub-routed-delete",
+				parent: parentFile,
+				child: child.file,
+				depth: 1,
+				name: "delete-me",
+			});
+			vi.spyOn(ledger, "appendDeleteByChildPath").mockRejectedValueOnce(
+				new Error("routed delete ledger unavailable"),
+			);
+
+			await expect(
+				internals.handleCommand(
+					{},
+					{
+						type: "delete_saved_session",
+						activeSessionId: parentState.activeSessionId,
+						sessionPath: child.file,
+					},
+				),
+			).rejects.toThrow("routed delete ledger unavailable");
+			expect(existsSync(child.file)).toBe(false);
+			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-routed-delete" })]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}

@@ -3847,13 +3847,19 @@ export class AgentDaemon {
 								true,
 							);
 							SessionManager.open(command.sessionPath).appendSessionInfo(name);
-							await this.rlmSpawnLedger()
-								.appendRenameByChildPath(command.sessionPath, name)
-								.catch((error) => {
-									this.log(
-										`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
+							try {
+								await this.rlmSpawnLedger().appendRenameByChildPath(command.sessionPath, name);
+							} catch (error) {
+								try {
+									SessionManager.open(command.sessionPath).appendSessionInfo(info.name ?? "");
+								} catch (rollbackError) {
+									throw new AggregateError(
+										[error, rollbackError],
+										`Failed to persist and roll back saved-session rename for ${command.sessionPath}`,
 									);
-								});
+								}
+								throw error;
+							}
 						},
 					);
 				}
@@ -3872,6 +3878,7 @@ export class AgentDaemon {
 						this.cancelScheduledJobsForSessionFile(command.sessionPath);
 					},
 				});
+				await this.rlmSpawnLedger().appendDeleteByChildPath(command.sessionPath, "user");
 				return success(command.id, "delete_saved_session", result);
 			}
 
