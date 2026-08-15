@@ -1819,6 +1819,47 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.descriptor.lifecycle).toBe("failed");
 	});
 
+	it("coalesces peer-sync bursts into one active pass and one dirty follow-up", async () => {
+		let releaseFirst!: (response: { success: true; type: "response"; command: string }) => void;
+		const firstPass = new Promise<{ success: true; type: "response"; command: string }>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const requestWorker = vi
+			.fn()
+			.mockImplementationOnce(() => firstPass)
+			.mockResolvedValue({ success: true, type: "response", command: "worker_sync_agent_peers" });
+		const worker = {
+			descriptor: {
+				workerId: "peer-worker",
+				rootActiveSessionId: "peer-root",
+				lifecycle: "ready",
+			},
+			intentionalStop: false,
+			summaries: new Map(),
+			client: { requestWorker },
+		};
+		type PeerSyncHarness = {
+			syncAgentPeers(): Promise<void>;
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			agentPeerSyncDirty: false,
+			agentPeerSyncInFlight: undefined,
+		}) as PeerSyncHarness;
+
+		const first = supervisor.syncAgentPeers();
+		await vi.waitFor(() => expect(requestWorker).toHaveBeenCalledTimes(1));
+		const second = supervisor.syncAgentPeers();
+		const third = supervisor.syncAgentPeers();
+		expect(second).toBe(first);
+		expect(third).toBe(first);
+		expect(requestWorker).toHaveBeenCalledTimes(1);
+
+		releaseFirst({ success: true, type: "response", command: "worker_sync_agent_peers" });
+		await Promise.all([first, second, third]);
+		expect(requestWorker).toHaveBeenCalledTimes(2);
+	});
+
 	it("keeps a recovered worker ready when peer synchronization fails", async () => {
 		vi.useFakeTimers();
 		type RecoveryWorker = {
