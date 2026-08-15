@@ -4,6 +4,7 @@ import { join } from "node:path";
 import {
 	type AssistantMessage,
 	fauxAssistantMessage,
+	type Model,
 	registerFauxProvider,
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
@@ -141,6 +142,174 @@ process.stdout.write(JSON.stringify({
 			expect(observedMaxRetries).toBe(0);
 		} finally {
 			await session.disposeAsync();
+		}
+	});
+
+	it("starts a fresh Codex continuation after a same-session AIM credential handoff", async () => {
+		const tempDir = join(tmpdir(), `pi-aim-codex-generation-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		const trustedHelperDir = join(
+			process.cwd(),
+			`.aim-helper-codex-generation-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+		);
+		mkdirSync(tempDir, { recursive: true });
+		mkdirSync(trustedHelperDir, { mode: 0o700 });
+		cleanupPaths.push(tempDir, trustedHelperDir);
+
+		const helperPath = join(tempDir, "resolve-helper.mjs");
+		const helperExecutable = join(trustedHelperDir, "resolve-credential");
+		writeFileSync(
+			helperExecutable,
+			`#!/bin/sh\nexec "${process.execPath.replace(/\\/g, "/").replace(/"/g, '\\"')}" "$@"\n`,
+			{ mode: 0o700 },
+		);
+		writeFileSync(
+			helperPath,
+			`let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+const payload = Buffer.from(JSON.stringify({
+  "https://api.openai.com/auth": { chatgpt_account_id: request.binding },
+})).toString("base64url");
+process.stdout.write(JSON.stringify({
+  schemaVersion: 1,
+  ok: true,
+  provider: request.provider,
+  binding: request.binding,
+  identityFingerprint: request.expectedIdentityFingerprint,
+  credentialVersion: request.binding === "codex-a" ? 1 : 2,
+  accessToken: "aaa." + payload + ".bbb",
+  expiresAt: Date.now() + 60 * 60 * 1000,
+}));
+`,
+		);
+
+		const connectedAccounts: string[] = [];
+		const sentBodies: Array<Record<string, unknown>> = [];
+		let connectionCount = 0;
+		class GenerationWebSocket {
+			static OPEN = 1;
+			readonly connectionNumber = ++connectionCount;
+			readyState = GenerationWebSocket.OPEN;
+			private readonly listeners = new Map<string, Set<(event: unknown) => void>>();
+
+			constructor(_url: string, protocols?: string | string[] | { headers?: Record<string, string> }) {
+				if (protocols && typeof protocols === "object" && !Array.isArray(protocols)) {
+					connectedAccounts.push(protocols.headers?.["chatgpt-account-id"] ?? "");
+				}
+				queueMicrotask(() => this.dispatch("open", {}));
+			}
+
+			addEventListener(type: string, listener: (event: unknown) => void): void {
+				const listeners = this.listeners.get(type) ?? new Set<(event: unknown) => void>();
+				listeners.add(listener);
+				this.listeners.set(type, listeners);
+			}
+
+			removeEventListener(type: string, listener: (event: unknown) => void): void {
+				this.listeners.get(type)?.delete(listener);
+			}
+
+			send(data: string): void {
+				sentBodies.push(JSON.parse(data) as Record<string, unknown>);
+				const suffix = String(this.connectionNumber);
+				const events = [
+					{ type: "response.created", response: { id: `resp_${suffix}` } },
+					{
+						type: "response.output_item.added",
+						item: { type: "message", id: `msg_${suffix}`, role: "assistant", status: "in_progress", content: [] },
+					},
+					{ type: "response.content_part.added", part: { type: "output_text", text: "" } },
+					{ type: "response.output_text.delta", delta: `reply-${suffix}` },
+					{
+						type: "response.output_item.done",
+						item: {
+							type: "message",
+							id: `msg_${suffix}`,
+							role: "assistant",
+							status: "completed",
+							content: [{ type: "output_text", text: `reply-${suffix}` }],
+						},
+					},
+					{
+						type: "response.completed",
+						response: {
+							id: `resp_${suffix}`,
+							status: "completed",
+							usage: {
+								input_tokens: 5,
+								output_tokens: 3,
+								total_tokens: 8,
+								input_tokens_details: { cached_tokens: 0 },
+							},
+						},
+					},
+				];
+				queueMicrotask(() => {
+					for (const event of events) this.dispatch("message", { data: JSON.stringify(event) });
+				});
+			}
+
+			close(): void {
+				this.readyState = 3;
+			}
+
+			private dispatch(type: string, event: unknown): void {
+				for (const listener of this.listeners.get(type) ?? []) listener(event);
+			}
+		}
+
+		const originalWebSocket = globalThis.WebSocket;
+		globalThis.WebSocket = GenerationWebSocket as unknown as typeof WebSocket;
+		const authStorage = AuthStorage.inMemory({
+			"openai-codex": {
+				type: "external",
+				source: "aimgr",
+				protocol: AIM_EXTERNAL_CREDENTIAL_PROTOCOL,
+				executable: helperExecutable,
+				args: [helperPath],
+				binding: "codex-a",
+				expectedIdentityFingerprint: "identity-a",
+			} as never,
+		});
+		authStorage.startAimExternalSession([], () => undefined);
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		};
+		const settingsManager = SettingsManager.inMemory();
+		settingsManager.setTransport("websocket-cached");
+		const resourceLoader = new DefaultResourceLoader({ cwd: tempDir, agentDir: tempDir, settingsManager });
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			model,
+			resourceLoader,
+			settingsManager,
+			sessionManager: SessionManager.inMemory(tempDir),
+			noTools: "all",
+		});
+		try {
+			await session.prompt("first");
+			await authStorage.handoffAimCredential("openai-codex", "codex-b", "identity-b", () => undefined);
+			await session.prompt("second");
+
+			expect(connectionCount).toBe(2);
+			expect(connectedAccounts).toEqual(["codex-a", "codex-b"]);
+			expect(sentBodies).toHaveLength(2);
+			expect(sentBodies[1]?.previous_response_id).toBeUndefined();
+		} finally {
+			await session.disposeAsync();
+			globalThis.WebSocket = originalWebSocket;
 		}
 	});
 

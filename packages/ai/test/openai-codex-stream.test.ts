@@ -1195,7 +1195,7 @@ describe("openai-codex streaming", () => {
 			apiKey: mockToken("account-a"),
 			sessionId: "session-generation",
 			transport: "websocket-cached",
-			metadata: { aimCredentialCacheKey: "generation-a" },
+			transportAuthIdentity: "generation-a",
 		}).result();
 		const secondContext: Context = {
 			messages: [...firstContext.messages, first, { role: "user", content: "second", timestamp: 2 }],
@@ -1204,7 +1204,7 @@ describe("openai-codex streaming", () => {
 			apiKey: mockToken("account-b"),
 			sessionId: "session-generation",
 			transport: "websocket-cached",
-			metadata: { aimCredentialCacheKey: "generation-b" },
+			transportAuthIdentity: "generation-b",
 		}).result();
 
 		expect(connectionCount).toBe(2);

@@ -692,7 +692,7 @@ const websocketSseFallbackSessions = new Set<string>();
 const WEBSOCKET_CACHE_KEY_SEPARATOR = "\0";
 
 function resolveCodexCredentialCacheKey(options: OpenAICodexResponsesOptions | undefined, accountId: string): string {
-	const configured = options?.metadata?.aimCredentialCacheKey;
+	const configured = options?.transportAuthIdentity;
 	return typeof configured === "string" && configured.length > 0 ? configured : accountId;
 }
 

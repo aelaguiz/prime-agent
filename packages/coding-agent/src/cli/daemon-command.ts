@@ -858,8 +858,8 @@ async function runHandoffAimCredential(client: DaemonClient, args: string[], jso
 		requestedBinding,
 		requestedIdentityFingerprint,
 	] = args as [string, string, string, string, string, string, string];
-	if (provider !== "openai-codex" && provider !== "anthropic") {
-		throw new Error(`${usage}\nProvider must be openai-codex or anthropic.`);
+	if (provider !== "openai-codex" && provider !== "anthropic" && provider !== "xai") {
+		throw new Error(`${usage}\nProvider must be openai-codex, anthropic, or xai.`);
 	}
 
 	await printResponseData(

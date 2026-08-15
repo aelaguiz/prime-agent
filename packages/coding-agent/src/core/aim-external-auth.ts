@@ -30,7 +30,7 @@ const HELPER_ERROR_CODES = new Set([
 	"automatic_failover_disabled",
 ]);
 
-export type AimCredentialProvider = "openai-codex" | "anthropic";
+export type AimCredentialProvider = "openai-codex" | "anthropic" | "xai";
 export type AimCredentialAdvanceReason = "usage_limit_reached";
 
 export interface AimExternalCredentialDescriptor {

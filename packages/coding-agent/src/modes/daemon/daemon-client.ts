@@ -18,6 +18,7 @@ import {
 	type DaemonServerCapability,
 	getDaemonCommandCompatibilities,
 	isDaemonMutatingCommand,
+	meetsDaemonCommandCompatibility,
 } from "./daemon-protocol.js";
 import type { DaemonWorkerCommand, DaemonWorkerCommandBody } from "./daemon-worker-protocol.js";
 
@@ -319,13 +320,7 @@ export class DaemonClient {
 	}
 
 	private meetsCommandCompatibility(hello: DaemonHello, compatibility: DaemonCommandCompatibility): boolean {
-		return (
-			hello.protocol.version >= compatibility.minProtocol &&
-			(compatibility.minSchemaRevision === undefined ||
-				(hello.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
-			(compatibility.capability === undefined ||
-				hello.serverCapabilities?.includes(compatibility.capability) === true)
-		);
+		return meetsDaemonCommandCompatibility(hello, compatibility);
 	}
 
 	async authenticateWorker(token: string, timeoutMs = 3000): Promise<void> {

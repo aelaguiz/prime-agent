@@ -62,7 +62,7 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 16 adds the "stopping" workerState and stops reporting disconnected workers as "ready".
 // Revision 17 composes capability-gated AIM credential handoff with the upstream schema.
 export const DAEMON_SCHEMA_REVISION = 17;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-0477c0d9be3f";
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-17-e2862d7825af";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -400,7 +400,7 @@ export type DaemonCommand =
 			id?: string;
 			type: "handoff_aim_credential";
 			activeSessionId: string;
-			provider: "openai-codex" | "anthropic";
+			provider: "openai-codex" | "anthropic" | "xai";
 			expectedModel: string;
 			expectedBinding: string;
 			expectedIdentityFingerprint: string;
@@ -639,6 +639,25 @@ export interface DaemonCommandCompatibility {
 	minProtocol: number;
 	minSchemaRevision?: number;
 	capability?: DaemonServerCapability;
+}
+
+export interface DaemonCommandCompatibilityAdvertisement {
+	protocol: { version: number };
+	schemaRevision?: number;
+	serverCapabilities?: readonly DaemonServerCapability[];
+}
+
+export function meetsDaemonCommandCompatibility(
+	advertisement: DaemonCommandCompatibilityAdvertisement,
+	compatibility: DaemonCommandCompatibility,
+): boolean {
+	return (
+		advertisement.protocol.version >= compatibility.minProtocol &&
+		(compatibility.minSchemaRevision === undefined ||
+			(advertisement.schemaRevision ?? 0) >= compatibility.minSchemaRevision) &&
+		(compatibility.capability === undefined ||
+			advertisement.serverCapabilities?.includes(compatibility.capability) === true)
+	);
 }
 
 const LEGACY_DAEMON_COMMAND = { minProtocol: 7 } as const;

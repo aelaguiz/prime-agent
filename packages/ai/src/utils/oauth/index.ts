@@ -22,7 +22,13 @@ export {
 export { loginOpenAICodex, openaiCodexOAuthProvider, refreshOpenAICodexToken } from "./openai-codex.js";
 export * from "./types.js";
 // xAI (SuperGrok/X Premium)
-export { applyXaiOAuthModels, loginXai, refreshXaiToken, xaiOAuthProvider } from "./xai.js";
+export {
+	applyXaiOAuthModels,
+	applyXaiSubscriptionModels,
+	loginXai,
+	refreshXaiToken,
+	xaiOAuthProvider,
+} from "./xai.js";
 
 // ============================================================================
 // Provider Registry

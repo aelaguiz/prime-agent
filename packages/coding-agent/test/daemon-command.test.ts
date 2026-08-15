@@ -201,6 +201,38 @@ describe("daemon command", () => {
 		expect(client?.closeListenerCountAtClose).toBe(0);
 	});
 
+	it("accepts xAI for a manual AIM credential handoff", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"handoff-aim-credential",
+				"active-grok",
+				"xai",
+				"grok-4.6",
+				"grok-a",
+				"aimgr-id-v1:grok-a",
+				"grok-b",
+				"aimgr-id-v1:grok-b",
+				"--json",
+			]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([
+			{
+				type: "handoff_aim_credential",
+				activeSessionId: "active-grok",
+				provider: "xai",
+				expectedModel: "grok-4.6",
+				expectedBinding: "grok-a",
+				expectedIdentityFingerprint: "aimgr-id-v1:grok-a",
+				requestedBinding: "grok-b",
+				requestedIdentityFingerprint: "aimgr-id-v1:grok-b",
+			},
+		]);
+	});
+
 	it.each([
 		{
 			name: "requires JSON output",

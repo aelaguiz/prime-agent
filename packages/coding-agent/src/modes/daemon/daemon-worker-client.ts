@@ -1,7 +1,13 @@
 import { createConnection, type Socket } from "node:net";
 import { serializeJsonLine } from "../rpc/jsonl.js";
 import { type PrivateFrame, PrivateFramedChannel } from "../session-worker/private-framing.js";
-import type { DaemonCommand, DaemonOutbound, DaemonResponse } from "./daemon-protocol.js";
+import {
+	type DaemonCommand,
+	type DaemonOutbound,
+	type DaemonResponse,
+	getDaemonCommandCompatibilities,
+	meetsDaemonCommandCompatibility,
+} from "./daemon-protocol.js";
 import {
 	type DaemonWorkerCommand,
 	type DaemonWorkerCommandBody,
@@ -17,7 +23,19 @@ type DaemonWorkerAuthentication = Omit<Extract<DaemonWorkerCommand, { type: "wor
 
 export type DaemonWorkerFrameListener = (frame: PrivateFrame<DaemonWorkerFrameHeader>) => void;
 export type DaemonWorkerCloseListener = (error: Error) => void;
-type DaemonHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
+export type DaemonWorkerHello = Extract<DaemonOutbound, { type: "daemon_hello" }>;
+
+export function assertDaemonWorkerCommandCompatibility(hello: DaemonWorkerHello, command: DaemonCommand): void {
+	const missing = getDaemonCommandCompatibilities(command).find(
+		(compatibility) => !meetsDaemonCommandCompatibility(hello, compatibility),
+	);
+	if (!missing) return;
+	throw new Error(
+		missing.capability
+			? `The target Prime Agent worker does not support ${missing.capability}.`
+			: `The target Prime Agent worker does not support ${command.type}.`,
+	);
+}
 
 export class DaemonWorkerClient {
 	private socket?: Socket;
@@ -33,9 +51,9 @@ export class DaemonWorkerClient {
 		}
 	>();
 	private requestId = 0;
-	private hello?: DaemonHello;
+	private hello?: DaemonWorkerHello;
 	private readonly helloWaiters = new Set<{
-		resolve: (hello: DaemonHello) => void;
+		resolve: (hello: DaemonWorkerHello) => void;
 		reject: (error: Error) => void;
 		timeout: ReturnType<typeof setTimeout>;
 	}>();
@@ -78,7 +96,7 @@ export class DaemonWorkerClient {
 		socket.on("close", () => this.notifyClosed(socket, new Error("Daemon worker socket closed")));
 	}
 
-	waitForHello(timeoutMs = 3000): Promise<DaemonHello> {
+	waitForHello(timeoutMs = 3000): Promise<DaemonWorkerHello> {
 		if (this.hello) {
 			return Promise.resolve(this.hello);
 		}
@@ -109,6 +127,10 @@ export class DaemonWorkerClient {
 	}
 
 	request(command: DaemonCommandBody, timeoutMs = 30_000): Promise<DaemonResponse> {
+		if (!this.hello) {
+			return Promise.reject(new Error("Daemon worker has not advertised its command capabilities"));
+		}
+		assertDaemonWorkerCommandCompatibility(this.hello, command as DaemonCommand);
 		return this.requestWire(command, timeoutMs);
 	}
 

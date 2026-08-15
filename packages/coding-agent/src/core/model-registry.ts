@@ -23,7 +23,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
-import { registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { applyXaiSubscriptionModels, registerOAuthProvider, resetOAuthProviders } from "@earendil-works/pi-ai/oauth";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { type Static, type TProperties, Type } from "typebox";
@@ -569,6 +569,12 @@ export class ModelRegistry {
 				}
 				combined = oauthProvider.modifyModels(combined, cred);
 			}
+		}
+
+		// AIM-managed xAI credentials are subscription tokens too. The root-scoped
+		// binding is authoritative even when another terminal changes global auth.
+		if (this.authStorage.getAimCredentialBinding("xai")) {
+			combined = applyXaiSubscriptionModels(combined);
 		}
 
 		this.models = combined;

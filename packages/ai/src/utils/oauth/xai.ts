@@ -255,9 +255,9 @@ export async function refreshXaiToken(refreshToken: string): Promise<OAuthCreden
 
 /**
  * Move xAI models to the Responses API rail used by subscription tokens.
- * Exported for the provider's `modifyModels` hook and tests.
+ * Shared by native OAuth and AIM-managed subscription credentials.
  */
-export function applyXaiOAuthModels(models: Model<Api>[]): Model<Api>[] {
+export function applyXaiSubscriptionModels(models: Model<Api>[]): Model<Api>[] {
 	const remapped = models.map((model) => {
 		if (model.provider !== "xai" || model.api !== "openai-completions") return model;
 		const { compat: _compat, ...rest } = model as Model<"openai-completions">;
@@ -278,11 +278,14 @@ export function applyXaiOAuthModels(models: Model<Api>[]): Model<Api>[] {
 	return remapped;
 }
 
+/** @deprecated Use applyXaiSubscriptionModels for new call sites. */
+export const applyXaiOAuthModels = applyXaiSubscriptionModels;
+
 export const xaiOAuthProvider: OAuthProviderInterface = {
 	id: "xai",
 	name: "xAI (SuperGrok/X Premium)",
 	login: loginXai,
 	refreshToken: (credentials) => refreshXaiToken(credentials.refresh),
 	getApiKey: (credentials) => credentials.access,
-	modifyModels: (models) => applyXaiOAuthModels(models),
+	modifyModels: (models) => applyXaiSubscriptionModels(models),
 };

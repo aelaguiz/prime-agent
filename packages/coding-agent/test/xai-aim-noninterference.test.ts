@@ -83,4 +83,32 @@ describe("xAI OAuth does not interfere with AIM-managed providers", () => {
 		expect(storage.getAimCredentialBinding("anthropic")?.binding).toBe("pro1");
 		expect(storage.getAimCredentialBinding("xai")).toBeUndefined();
 	});
+
+	it("uses the subscription Responses rail for an AIM-managed xAI binding", () => {
+		const storage = AuthStorage.inMemory({
+			xai: {
+				type: "external",
+				source: "aimgr",
+				protocol: AIM_EXTERNAL_CREDENTIAL_PROTOCOL,
+				executable: "/usr/bin/true",
+				args: ["credential-helper"],
+				binding: "grok-primary",
+				expectedIdentityFingerprint: "xai-identity",
+			} as never,
+		});
+		storage.startAimExternalSession([], () => undefined);
+
+		const registry = isolatedRegistry(storage);
+		const baseline = isolatedRegistry(AuthStorage.inMemory({}));
+		const xaiModels = registry.getAll().filter((model) => model.provider === "xai");
+		const unrelated = (models: ReturnType<ModelRegistry["getAll"]>) =>
+			models
+				.filter((model) => model.provider === "openai-codex" || model.provider === "anthropic")
+				.map((model) => ({ provider: model.provider, id: model.id, api: model.api }));
+		expect(storage.getAimCredentialBinding("xai")?.binding).toBe("grok-primary");
+		expect(unrelated(registry.getAll())).toEqual(unrelated(baseline.getAll()));
+		expect(xaiModels.length).toBeGreaterThan(0);
+		expect(xaiModels.every((model) => model.api === "openai-responses")).toBe(true);
+		expect(xaiModels.some((model) => model.id === "grok-4.6")).toBe(true);
+	});
 });
