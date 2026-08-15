@@ -2471,6 +2471,7 @@ export class AgentDaemon {
 				if (runtime.session.sessionName !== options.sessionName) {
 					runtime.session.setSessionName(options.sessionName);
 				}
+				options.onSessionPublished?.(runtime.session);
 			},
 		);
 
@@ -2479,8 +2480,11 @@ export class AgentDaemon {
 		let ledgerSpawned = false;
 		let registryPersisted = false;
 		try {
-			if (!parentSessionFile || !childSessionFile) {
-				throw new Error(`RLM subagent ${options.id} was published without durable session paths`);
+			// In-memory roots intentionally have no durable topology. Persisted roots
+			// must never report admission without a durable child path and ledger edge.
+			if (!parentSessionFile) return runtime;
+			if (!childSessionFile) {
+				throw new Error(`RLM subagent ${options.id} was published without a durable child session path`);
 			}
 			// Admission is complete only once topology and metadata are durable.
 			// Await the exact append promise: the ledger queue deliberately remains
@@ -2513,7 +2517,6 @@ export class AgentDaemon {
 			if (!registryPersisted) {
 				throw new Error(`Failed to persist admission for RLM subagent ${options.id}`);
 			}
-			options.onSessionPublished?.(runtime.session);
 			return runtime;
 		} catch (error) {
 			let rollbackError: unknown;

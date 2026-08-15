@@ -620,7 +620,7 @@ describe("rlm spawn ledger daemon wiring", () => {
 					}),
 				),
 			).rejects.toThrow("spawn ledger unavailable");
-			expect(onSessionPublished).not.toHaveBeenCalled();
+			expect(onSessionPublished).toHaveBeenCalledOnce();
 			expect(internals.sessions.size).toBe(1);
 			await expect(ledger.edges()).resolves.toEqual([]);
 		} finally {
