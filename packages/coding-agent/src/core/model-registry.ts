@@ -30,6 +30,7 @@ import { type Static, type TProperties, Type } from "typebox";
 import type { Validator } from "typebox/compile";
 import type { TLocalizedValidationError } from "typebox/error";
 import { getAgentDir, VERSION } from "../config.js";
+import { getAimAdmittedProviderMaxRetries } from "./aim-external-auth.js";
 import { formatAuthenticationFailedMessage, formatNoApiKeyFoundMessage } from "./auth-guidance.js";
 import type { AuthSourceToken, AuthStatus, AuthStorage } from "./auth-storage.js";
 import { PRIME_INFERENCE_PROVIDER_ID } from "./prime-inference-auth.js";
@@ -1403,6 +1404,7 @@ export class ModelRegistry {
 				const requestOptions: CredentialAwareSimpleStreamOptions = {
 					...options,
 					apiKey: auth.apiKey,
+					maxRetries: getAimAdmittedProviderMaxRetries(model.provider, admission, options?.maxRetries),
 					headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 					...(admission ? { transportAuthIdentity: admission.transportAuthIdentity } : {}),
 				};

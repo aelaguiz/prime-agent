@@ -13,6 +13,7 @@ export type StreamFailureKind =
 	| "safety"
 	| "overloaded"
 	| "rate_limit"
+	| "usage_limit"
 	| "server_error"
 	| "auth"
 	| "invalid_request"
@@ -25,6 +26,10 @@ export interface StreamFailureInfo {
 	providerErrorType?: string;
 	status?: number;
 	requestId?: string;
+	/** Provider-requested retry delay, retained without allowing a hidden SDK sleep. */
+	retryAfterMs?: number;
+	/** Provider usage-window reset as epoch milliseconds. */
+	resetAt?: number;
 	/** Truncated raw provider payload for post-mortems. */
 	raw?: string;
 }
@@ -44,6 +49,7 @@ const KIND_MESSAGES: Record<StreamFailureKind, string> = {
 	safety: "Response blocked by provider safety filters",
 	overloaded: "Provider overloaded",
 	rate_limit: "Provider rate limit exceeded",
+	usage_limit: "Provider usage limit reached",
 	server_error: "Provider server error",
 	auth: "Provider authentication failed",
 	invalid_request: "Provider rejected the request",
@@ -58,6 +64,9 @@ export function streamFailureMessage(info: StreamFailureInfo, detail?: string): 
 		.join(", ");
 	let message = KIND_MESSAGES[info.kind];
 	if (qualifiers) message += ` (${qualifiers})`;
+	if (info.kind === "usage_limit" && info.resetAt !== undefined) {
+		message += `; resets at ${new Date(info.resetAt).toISOString()}`;
+	}
 	if (detail) message += `: ${detail}`;
 	if (info.requestId) message += ` [request_id: ${info.requestId}]`;
 	return message;
@@ -114,6 +123,28 @@ export function truncateRawPayload(raw: string): string {
 	return raw.length > MAX_RAW_LENGTH ? `${raw.slice(0, MAX_RAW_LENGTH)}…` : raw;
 }
 
+function getHeaderValue(headers: unknown, name: string): string | undefined {
+	if (!headers) return undefined;
+	if (typeof (headers as Headers).get === "function") {
+		return (headers as Headers).get(name) ?? undefined;
+	}
+	if (typeof headers !== "object") return undefined;
+	const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name.toLowerCase());
+	return typeof entry?.[1] === "string" ? entry[1] : undefined;
+}
+
+function parseSecondsAsMilliseconds(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const seconds = Number(value);
+	return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+}
+
+function parseEpochSecondsAsMilliseconds(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const seconds = Number(value);
+	return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : undefined;
+}
+
 function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; detail?: string } {
 	if (error instanceof StreamFailureError) return { info: error.info };
 	if (!(error instanceof Error)) return { info: { kind: "unknown" } };
@@ -150,22 +181,24 @@ function extractStreamFailureParts(error: unknown): { info: StreamFailureInfo; d
 					: undefined;
 
 	const headers = err.headers;
-	const headerRequestId =
-		headers && typeof (headers as Headers).get === "function"
-			? ((headers as Headers).get("request-id") ?? (headers as Headers).get("x-request-id"))
-			: headers && typeof headers === "object"
-				? ((headers as Record<string, unknown>)["request-id"] ??
-					(headers as Record<string, unknown>)["x-request-id"])
-				: undefined;
+	const headerRequestId = getHeaderValue(headers, "request-id") ?? getHeaderValue(headers, "x-request-id");
 	const rawRequestId = err.requestID ?? err.request_id ?? err.$metadata?.requestId ?? headerRequestId;
 	const requestId = typeof rawRequestId === "string" ? rawRequestId : undefined;
+	const classifiedKind = classifyStreamFailure(providerErrorType ?? error.message, status);
+	const unifiedStatus = getHeaderValue(headers, "anthropic-ratelimit-unified-status");
+	const kind =
+		classifiedKind === "rate_limit" && unifiedStatus?.toLowerCase() === "rejected" ? "usage_limit" : classifiedKind;
+	const retryAfterMs = parseSecondsAsMilliseconds(getHeaderValue(headers, "retry-after"));
+	const resetAt = parseEpochSecondsAsMilliseconds(getHeaderValue(headers, "anthropic-ratelimit-unified-reset"));
 
 	return {
 		info: {
-			kind: classifyStreamFailure(providerErrorType ?? error.message, status),
+			kind,
 			providerErrorType,
 			status,
 			requestId,
+			retryAfterMs,
+			resetAt,
 		},
 		detail: typeof bodyMessage === "string" ? bodyMessage : undefined,
 	};
@@ -225,6 +258,8 @@ export function recordStreamFailure(
 		providerErrorType: info.providerErrorType,
 		status: info.status,
 		requestId: info.requestId,
+		retryAfterMs: info.retryAfterMs,
+		resetAt: info.resetAt,
 		message: output.errorMessage,
 		// errorMessage is user-facing and concise; keep the raw cause for debugging.
 		cause: rawMessage === output.errorMessage ? undefined : truncateRawPayload(rawMessage),

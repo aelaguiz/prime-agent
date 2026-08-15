@@ -185,6 +185,31 @@ describe("AgentSession retry and event characterization", () => {
 		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
 	});
 
+	it("does not retry structured provider usage exhaustion", async () => {
+		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
+		harnesses.push(harness);
+		const exhausted: AssistantMessage = {
+			...fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "Provider usage limit reached; resets at 2026-08-18T02:00:00.000Z",
+			}),
+			diagnostics: [
+				{
+					type: "provider_stream_failure",
+					timestamp: Date.now(),
+					details: { kind: "usage_limit", status: 429, resetAt: 1_787_018_400_000 },
+				},
+			],
+		};
+		harness.setResponses([exhausted, fauxAssistantMessage("must not run")]);
+
+		await harness.session.prompt("test");
+
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(harness.session.isRetrying).toBe(false);
+	});
+
 	it("does not retry faux provider queue exhaustion", async () => {
 		const harness = await createHarness({ settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } });
 		harnesses.push(harness);

@@ -8,7 +8,11 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { AIM_CREDENTIAL_BINDING_CUSTOM_TYPE, AIM_EXTERNAL_CREDENTIAL_PROTOCOL } from "../src/core/aim-external-auth.js";
+import {
+	AIM_CREDENTIAL_BINDING_CUSTOM_TYPE,
+	AIM_EXTERNAL_CREDENTIAL_PROTOCOL,
+	getAimAdmittedProviderMaxRetries,
+} from "../src/core/aim-external-auth.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { DefaultResourceLoader } from "../src/core/resource-loader.js";
 import { createAgentSession } from "../src/core/sdk.js";
@@ -27,7 +31,14 @@ describe("AIM provider request admission", () => {
 		}
 	});
 
-	it("passes the admitted credential identity into normal and side-door stream constructors", async () => {
+	it("preserves configured retries outside AIM-admitted Anthropic requests", () => {
+		const admission = { transportAuthIdentity: "identity" };
+		expect(getAimAdmittedProviderMaxRetries("anthropic", undefined, 2)).toBe(2);
+		expect(getAimAdmittedProviderMaxRetries("openai-codex", admission, 2)).toBe(2);
+		expect(getAimAdmittedProviderMaxRetries("anthropic", admission, 2)).toBe(0);
+	});
+
+	it("disables hidden SDK retries for AIM-admitted Anthropic normal and side-door requests", async () => {
 		const tempDir = join(tmpdir(), `pi-aim-admission-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		const trustedHelperDir = join(
 			process.cwd(),
@@ -64,25 +75,27 @@ process.stdout.write(JSON.stringify({
 `,
 		);
 		const authStorage = AuthStorage.inMemory({
-			"openai-codex": {
+			anthropic: {
 				type: "external",
 				source: "aimgr",
 				protocol: AIM_EXTERNAL_CREDENTIAL_PROTOCOL,
 				executable: helperExecutable,
 				args: [helperPath],
-				binding: "codex-bound",
-				expectedIdentityFingerprint: "identity-codex",
+				binding: "claude-bound",
+				expectedIdentityFingerprint: "identity-claude",
 			} as never,
 		});
 		authStorage.startAimExternalSession([], () => undefined);
 
-		const faux = registerFauxProvider({ provider: "openai-codex" });
+		const faux = registerFauxProvider({ provider: "anthropic" });
 		unregisters.push(() => faux.unregister());
 		let observedTransportAuthIdentity: string | undefined;
+		let observedMaxRetries: number | undefined;
 		faux.setResponses([
 			(_context, options) => {
 				observedTransportAuthIdentity = (options as SimpleStreamOptions & { transportAuthIdentity?: string })
 					.transportAuthIdentity;
+				observedMaxRetries = options?.maxRetries;
 				return fauxAssistantMessage("admitted");
 			},
 		]);
@@ -107,12 +120,15 @@ process.stdout.write(JSON.stringify({
 		try {
 			await session.prompt("hello");
 			expect(observedTransportAuthIdentity).toMatch(/^[a-f0-9]{64}$/);
+			expect(observedMaxRetries).toBe(0);
 
 			observedTransportAuthIdentity = undefined;
+			observedMaxRetries = undefined;
 			faux.setResponses([
 				(_context, options) => {
 					observedTransportAuthIdentity = (options as SimpleStreamOptions & { transportAuthIdentity?: string })
 						.transportAuthIdentity;
+					observedMaxRetries = options?.maxRetries;
 					return fauxAssistantMessage("side-door admitted");
 				},
 			]);
@@ -122,6 +138,7 @@ process.stdout.write(JSON.stringify({
 				{ maxTokens: 8 },
 			);
 			expect(observedTransportAuthIdentity).toMatch(/^[a-f0-9]{64}$/);
+			expect(observedMaxRetries).toBe(0);
 		} finally {
 			await session.disposeAsync();
 		}

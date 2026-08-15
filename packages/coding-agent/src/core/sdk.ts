@@ -16,7 +16,7 @@ import {
 import { getAgentDir } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import type { AgentSessionCreationOptions } from "./agent-session-services.js";
-import { AimExternalCredentialError } from "./aim-external-auth.js";
+import { AimExternalCredentialError, getAimAdmittedProviderMaxRetries } from "./aim-external-auth.js";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
@@ -459,7 +459,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							...options,
 							apiKey: auth.apiKey,
 							timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,
-							maxRetries: options?.maxRetries ?? providerRetrySettings.maxRetries,
+							maxRetries: getAimAdmittedProviderMaxRetries(
+								model.provider,
+								admission,
+								options?.maxRetries ?? providerRetrySettings.maxRetries,
+							),
 							maxRetryDelayMs: options?.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
 							headers: auth.headers || options?.headers ? { ...auth.headers, ...options?.headers } : undefined,
 							...(admission ? { transportAuthIdentity: admission.transportAuthIdentity } : {}),

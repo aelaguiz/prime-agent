@@ -10021,6 +10021,10 @@ export class AgentSession {
 			return false;
 		}
 
+		if (this._getProviderStreamFailureKind(message) === "usage_limit") {
+			return false;
+		}
+
 		if (
 			message.diagnostics?.some(
 				(diagnostic) =>

@@ -94,6 +94,39 @@ describe("extractStreamFailureInfo", () => {
 		});
 	});
 
+	test("distinguishes Anthropic subscription usage exhaustion from a generic 429", () => {
+		const exhausted = Object.assign(new Error("429 usage exhausted"), {
+			status: 429,
+			error: {
+				type: "error",
+				error: {
+					type: "rate_limit_error",
+					message: "This request would exceed your account's rate limit. Please try again later.",
+				},
+			},
+			headers: new Headers({
+				"anthropic-ratelimit-unified-status": "rejected",
+				"anthropic-ratelimit-unified-reset": "1787018400",
+				"retry-after": "261858",
+				"request-id": "req_usage",
+			}),
+		});
+		expect(extractStreamFailureInfo(exhausted)).toMatchObject({
+			kind: "usage_limit",
+			providerErrorType: "rate_limit_error",
+			status: 429,
+			requestId: "req_usage",
+			retryAfterMs: 261_858_000,
+			resetAt: 1_787_018_400_000,
+		});
+
+		const generic429 = Object.assign(new Error("429 burst limit"), {
+			status: 429,
+			error: { type: "rate_limit_error", message: "Too many requests" },
+		});
+		expect(extractStreamFailureInfo(generic429).kind).toBe("rate_limit");
+	});
+
 	test("extracts AWS SDK request id and exception name", () => {
 		const awsError = Object.assign(new Error("throttled"), {
 			name: "ThrottlingException",
@@ -120,6 +153,24 @@ describe("formatStreamFailureMessage", () => {
 		);
 		expect(formatStreamFailureMessage(sdkError)).toBe(
 			"Provider authentication failed (authentication_error, 401): invalid x-api-key [request_id: req_1]",
+		);
+	});
+
+	test("formats Anthropic usage exhaustion with its reset time", () => {
+		const exhausted = Object.assign(new Error("429 usage exhausted"), {
+			status: 429,
+			error: {
+				type: "error",
+				error: { type: "rate_limit_error", message: "This request would exceed your account's rate limit." },
+			},
+			headers: new Headers({
+				"anthropic-ratelimit-unified-status": "rejected",
+				"anthropic-ratelimit-unified-reset": "1787018400",
+				"retry-after": "261858",
+			}),
+		});
+		expect(formatStreamFailureMessage(exhausted)).toBe(
+			"Provider usage limit reached (rate_limit_error, 429); resets at 2026-08-18T02:00:00.000Z: This request would exceed your account's rate limit.",
 		);
 	});
 

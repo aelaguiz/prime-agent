@@ -13,6 +13,7 @@
 - Fixed the agents view collapsing expanded subagent lists when returning from an opened agent ([ENG-5105](https://linear.app/primeintellect/issue/ENG-5105/keep-the-agents-view-state-persistent)).
 - Kept the subagent summary row visible and selectable while its list is expanded in the agents view, so pressing enter on it collapses the list again ([ENG-5105](https://linear.app/primeintellect/issue/ENG-5105/keep-the-agents-view-state-persistent)).
 - Fixed daemon-restored sessions losing their AIM credential route after another terminal changed the global provider binding.
+- Fixed AIM-managed Claude sessions silently waiting through multi-hour subscription usage-limit retries instead of failing with the reset time.
 
 ## [0.7.1] - 2026-08-07
 

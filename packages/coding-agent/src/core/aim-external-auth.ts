@@ -77,6 +77,18 @@ export interface AimCredentialRequestAdmission {
 	transportAuthIdentity: string;
 }
 
+/**
+ * AIM-managed Anthropic requests must fail back to Prime immediately instead of
+ * sleeping inside the provider SDK for a subscription-window Retry-After.
+ */
+export function getAimAdmittedProviderMaxRetries(
+	provider: string,
+	admission: AimCredentialRequestAdmission | undefined,
+	configuredMaxRetries: number | undefined,
+): number | undefined {
+	return provider === "anthropic" && admission ? 0 : configuredMaxRetries;
+}
+
 interface ResolvingCredential {
 	generation: number;
 	promise: Promise<AimResolvedCredential>;
