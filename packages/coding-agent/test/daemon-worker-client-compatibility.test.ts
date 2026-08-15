@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import {
 	assertDaemonWorkerCommandCompatibility,
+	DaemonWorkerClient,
 	type DaemonWorkerHello,
 } from "../src/modes/daemon/daemon-worker-client.js";
 
@@ -52,6 +53,17 @@ describe("daemon worker command compatibility", () => {
 		expect(() => assertDaemonWorkerCommandCompatibility(worker, handoff)).toThrow(
 			"does not support aim_credential_handoff",
 		);
+	});
+
+	it("rejects an unsupported command before writing it to the worker transport", () => {
+		const requestWire = vi.fn();
+		const client = Object.assign(Object.create(DaemonWorkerClient.prototype), {
+			hello: hello(15, ["aim_credential_handoff"]),
+			requestWire,
+		}) as { request(command: unknown): Promise<unknown> };
+
+		expect(() => client.request(queueMutation)).toThrow("does not support queue_message_mutation");
+		expect(requestWire).not.toHaveBeenCalled();
 	});
 
 	it("lets the merged worker accept both capability-gated commands", () => {
