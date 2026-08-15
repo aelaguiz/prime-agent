@@ -103,3 +103,11 @@ Current checkpoint: source integration approved by final audit at `16d292e23`; p
 - Final targeted proof before ledger update: coding-agent 494/494 at `16d292e23`, AI provider 43/43 (plus the 6-test coding-agent admission suite rerun after `321b28861`), and AIM companion 34/34. Repeated `npm run check` passed, including installer and browser smoke checks.
 - Final independent verdict: PASS with no remaining blocker after bounded verification of `16d292e23`.
 - Original dirty Prime/AIM checkouts and live sessions remain untouched. No source branch was pushed.
+
+
+### 2026-08-15 — approved live Codex canary
+
+- AIM reported the existing managed `openai-codex` binding `qa` installed and ready; no credential rebinding or rotation was performed.
+- The first ordinary worktree CLI attempt contacted the protected local supervisor, received the expected mixed-build refusal with seven busy sessions, and made no mutation; no supervisor or session was stopped.
+- Retried through an isolated owned-worker process from this worktree with `--print --no-session --offline`, `openai-codex/gpt-5.6-sol`, low reasoning, and all tools/resources disabled. The real provider returned exactly `PRIME_CODEX_CANARY_OK`.
+- The temporary working directory was removed. No Prime session was saved, no install/release bundle was produced, and both integration branches remained unpushed.
