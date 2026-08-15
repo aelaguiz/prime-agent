@@ -350,7 +350,6 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-state",
 		});
 		const { close, worker } = workerHarness();
-		worker.intentionalStop = true;
 		const client = socketClient("public", new PassThrough());
 		const streamSnapshot = vi.fn(async () => {});
 		const internals = supervisor as unknown as {
@@ -435,7 +434,6 @@ describe("ENG-4602 snapshot transfer containment", () => {
 			descriptorDir: "/tmp/eng-4602-supervisor-gate-state",
 		});
 		const { close, request, worker } = workerHarness();
-		worker.intentionalStop = true;
 		const client = socketClient("catchup", new PassThrough());
 		const streamSnapshot = vi.fn(async () => {});
 		const internals = supervisor as unknown as {

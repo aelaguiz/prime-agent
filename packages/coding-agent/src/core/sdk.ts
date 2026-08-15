@@ -97,10 +97,6 @@ export interface CreateAgentSessionResult {
 	modelFallbackMessage?: string;
 }
 
-type CredentialAwareSimpleStreamOptions = SimpleStreamOptions & {
-	transportAuthIdentity?: string;
-};
-
 interface AdmittedProviderStream {
 	stream: AssistantMessageEventStream;
 	transportAuthIdentity?: string;
@@ -246,11 +242,11 @@ export type { Skill } from "./skills.js";
 export type { Tool } from "./tools/index.js";
 
 export {
-	withFileMutationQueue,
-	// Tool factories (for custom cwd)
-	createIpythonTool,
 	createBashTool,
 	createEditTool,
+	// Tool factories (for custom cwd)
+	createIpythonTool,
+	withFileMutationQueue,
 };
 
 // Helper Functions
@@ -455,7 +451,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							throw new Error(auth.error);
 						}
 						const providerRetrySettings = settingsManager.getProviderRetrySettings();
-						const requestOptions: CredentialAwareSimpleStreamOptions = {
+						const requestOptions: SimpleStreamOptions = {
 							...options,
 							apiKey: auth.apiKey,
 							timeoutMs: options?.timeoutMs ?? providerRetrySettings.timeoutMs,

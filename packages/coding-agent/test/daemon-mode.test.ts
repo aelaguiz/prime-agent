@@ -696,7 +696,7 @@ describe("daemon mode helpers", () => {
 				{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
 				"cancelled",
 			);
-		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1");
+		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1", "revoked");
 		expect(recordDeletion.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[1]!);
 		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
@@ -8299,6 +8299,36 @@ describe("daemon mode helpers", () => {
 		});
 	});
 
+	it("routes queued message mutation to the active session", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const mutateQueuedMessage = vi.fn(() => "applied" as const);
+		const state = makeState("active-1") as ActiveSessionState;
+		(state.runtime as { session: unknown }).session = { mutateQueuedMessage };
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		const client = makeClient("client-1", state.activeSessionId);
+		const mutation = { type: "replace", text: "edited", lane: "followUp" } as const;
+		await expect(
+			internals.handleCommand(client, {
+				type: "mutate_queued_message",
+				activeSessionId: state.activeSessionId,
+				lane: "followUp",
+				index: 0,
+				expectedText: "edited",
+				mutation,
+			}),
+		).resolves.toMatchObject({ success: true, data: { status: "applied" } });
+		expect(mutateQueuedMessage).toHaveBeenCalledWith("followUp", 0, "edited", mutation);
+	});
+
 	it("gets and sets RLM max depth directly on the active session", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -9775,9 +9805,15 @@ function makePersistedRlmDaemonFixture(
 			extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
 				ReturnType<CreateAgentSessionRuntimeFactory>
 			>["extensionsResult"],
-			services: { cwd: runtimeOptions.cwd, agentDir: runtimeOptions.agentDir } as Awaited<
-				ReturnType<CreateAgentSessionRuntimeFactory>
-			>["services"],
+			services: {
+				cwd: runtimeOptions.cwd,
+				agentDir: runtimeOptions.agentDir,
+				authStorage:
+					runtimeOptions.authStorage ??
+					({ getAimCredentialBindings: () => [] } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"]["authStorage"]),
+			} as Awaited<ReturnType<CreateAgentSessionRuntimeFactory>>["services"],
 			diagnostics: [],
 		};
 	});

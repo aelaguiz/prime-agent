@@ -137,13 +137,19 @@ export interface StreamOptions {
 	 * For example, Anthropic uses `user_id` for abuse tracking and rate limiting.
 	 */
 	metadata?: Record<string, unknown>;
+	/**
+	 * Opaque process-local credential generation used to isolate provider transport caches.
+	 * Callers must not persist, log, or send this value as request metadata.
+	 */
+	transportAuthIdentity?: string;
 }
 
 export type ProviderStreamOptions = StreamOptions & Record<string, unknown>;
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
-	reasoning?: ThinkingLevel;
+	/** Explicit model reasoning selection. Omit to preserve the provider default. */
+	reasoning?: ModelThinkingLevel;
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
 }
