@@ -1788,16 +1788,23 @@ export class DaemonSupervisor {
 				return await this.withSessionNameReservation(target, async () => {
 					await this.assertSupervisorSavedSessionNameAvailable(command.sessionPath, target.name);
 					if (!command.activeSessionId) {
+						const previousName = (await readSessionInfo(command.sessionPath))?.name ?? "";
 						await this.catalog.rename(command.sessionPath, command.name);
-						// Third rename write point: an offline saved-session rename
-						// changes the name the ledger carries for that child.
-						await this.rlmSpawnLedger()
-							.appendRenameByChildPath(command.sessionPath, target.name)
-							.catch((error) => {
-								this.log(
-									`failed to append RLM ledger rename: ${error instanceof Error ? error.message : String(error)}`,
+						try {
+							// An offline saved-session rename changes the topology metadata;
+							// do not report success until the ledger append is durable.
+							await this.rlmSpawnLedger().appendRenameByChildPath(command.sessionPath, target.name);
+						} catch (error) {
+							try {
+								await this.catalog.rename(command.sessionPath, previousName);
+							} catch (rollbackError) {
+								throw new AggregateError(
+									[error, rollbackError],
+									`Failed to persist and roll back saved-session rename for ${command.sessionPath}`,
 								);
-							});
+							}
+							throw error;
+						}
 						return success(command.id, command.type);
 					}
 					const match = await this.findWorkerForClient(client, command.activeSessionId);
@@ -1814,6 +1821,9 @@ export class DaemonSupervisor {
 						throw new Error("Cannot delete the currently active session");
 					}
 					const result = await this.catalog.delete(command.sessionPath);
+					// The file is already gone, so reconciliation also hides the edge;
+					// still surface a durable ledger failure for explicit retry/repair.
+					await this.rlmSpawnLedger().appendDeleteByChildPath(command.sessionPath, "user");
 					return success(command.id, command.type, result);
 				}
 				break;

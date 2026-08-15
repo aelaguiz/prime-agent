@@ -364,6 +364,25 @@ export class RlmSpawnLedger {
 		});
 	}
 
+	/** Delete by child session path when the offline catalog has no childId. */
+	appendDeleteByChildPath(child: string, reason: RlmLedgerDeleteReason): Promise<void> {
+		return this.enqueue(() => {
+			const target = canonicalSessionPath(child);
+			for (const edge of this.replaySync().values()) {
+				if (!edge.deleted && canonicalSessionPath(edge.child) === target) {
+					this.appendRecord({
+						v: 1,
+						op: "delete",
+						at: nowIso(),
+						childId: edge.childId,
+						child: target,
+						reason,
+					});
+				}
+			}
+		});
+	}
+
 	/** Resolves once every operation enqueued so far has completed (durably, for appends). */
 	flush(): Promise<void> {
 		return this.queue.then(() => undefined);
