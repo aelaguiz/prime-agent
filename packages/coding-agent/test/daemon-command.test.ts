@@ -45,7 +45,10 @@ const daemonClientMock = vi.hoisted(() => {
 		}
 
 		async connect(): Promise<void> {
-			if (behavior.connectFails) throw new Error("mock connect failed");
+			if (behavior.connectFails) {
+				behavior.connectFails = false;
+				throw new Error("mock connect failed");
+			}
 		}
 
 		async request(command: Command): Promise<Response> {
