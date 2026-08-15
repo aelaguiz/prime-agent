@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,6 +33,26 @@ describe("KernelManager startup", () => {
 			await expect(manager.execute("print(1)")).rejects.toThrow(
 				/Kernel exited before resolving ports[\s\S]*fake kernel died before binding/,
 			);
+		} finally {
+			errorSpy.mockRestore();
+			await manager.dispose();
+		}
+	});
+
+	it("disables shared IPython history for direct kernel launches", async () => {
+		const python = join(tempDir, "python");
+		const argvPath = join(tempDir, "kernel-argv.txt");
+		writeExecutable(
+			python,
+			["#!/bin/sh", `printf '%s\n' "$@" > ${JSON.stringify(argvPath)}`, "exit 42", ""].join("\n"),
+		);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const manager = new KernelManager({ python, cwd: tempDir });
+
+		try {
+			await expect(manager.execute("print(1)")).rejects.toThrow(/Kernel exited before resolving ports/);
+			const argv = readFileSync(argvPath, "utf8").trim().split("\n");
+			expect(argv.slice(0, 4)).toEqual(["-m", "ipykernel_launcher", "--HistoryManager.enabled=False", "-f"]);
 		} finally {
 			errorSpy.mockRestore();
 			await manager.dispose();

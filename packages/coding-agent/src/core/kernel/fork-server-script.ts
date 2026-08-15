@@ -75,7 +75,7 @@ def _run_child(connection_path, cwd, env):
     # initialize() binds the 5 ZMQ ports, writes the resolved ports back into
     # connection.json, and starts the heartbeat thread + ioloop — all post-fork,
     # so no thread/loop/socket is ever inherited across the fork boundary.
-    app.initialize([])
+    app.initialize(["--HistoryManager.enabled=False"])
     app.start()
 
 

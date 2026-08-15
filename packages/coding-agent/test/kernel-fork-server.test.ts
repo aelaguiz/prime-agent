@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "../src/core/kernel/fork-server.js";
+import { FORK_SERVER_SCRIPT } from "../src/core/kernel/fork-server-script.js";
 
 const FORK_ENV = "PRIME_AGENT_KERNEL_FORKSERVER";
 
@@ -45,5 +46,9 @@ describe("fork-server gating", () => {
 				}),
 			).rejects.toBeInstanceOf(ForkServerUnavailable);
 		}
+	});
+
+	it("disables shared IPython history in forked kernel children", () => {
+		expect(FORK_SERVER_SCRIPT).toContain('app.initialize(["--HistoryManager.enabled=False"])');
 	});
 });
