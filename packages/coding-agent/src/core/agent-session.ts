@@ -6907,9 +6907,6 @@ export class AgentSession {
 
 		if (isChanging) {
 			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
-			if (this.supportsThinking() || effectiveLevel !== "off") {
-				this.settingsManager.setDefaultThinkingLevel(effectiveLevel);
-			}
 			this._emit({ type: "thinking_level_changed", level: effectiveLevel });
 			void this._extensionRunner.emit({
 				type: "thinking_level_select",

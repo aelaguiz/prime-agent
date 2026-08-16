@@ -20,7 +20,7 @@ import { AimExternalCredentialError, getAimAdmittedProviderMaxRetries } from "./
 import { formatNoModelsAvailableMessage } from "./auth-guidance.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { AgentAutonomousConfig } from "./autonomous.js";
-import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { DEFAULT_THINKING_LEVEL, getDefaultThinkingLevelForModel } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { McpManager } from "./mcp/mcp-manager.js";
 import { convertToLlm } from "./messages.js";
@@ -360,17 +360,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	let thinkingLevel = options.thinkingLevel;
+	const defaultThinkingLevel = getDefaultThinkingLevelForModel(
+		model,
+		settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
+	);
 
-	// If session has data, restore thinking level from it
+	// If session has data, restore thinking level from it.
 	if (thinkingLevel === undefined && hasExistingSession) {
-		thinkingLevel = hasThinkingEntry
-			? (existingSession.thinkingLevel as ThinkingLevel)
-			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
+		thinkingLevel = hasThinkingEntry ? (existingSession.thinkingLevel as ThinkingLevel) : defaultThinkingLevel;
 	}
 
-	// Fall back to settings default
+	// Fall back to the selected model's default for a fresh session.
 	if (thinkingLevel === undefined) {
-		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+		thinkingLevel = defaultThinkingLevel;
 	}
 
 	// Clamp to model capabilities

@@ -8,7 +8,7 @@ import chalk from "chalk";
 import { minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.js";
 import { APP_NAME } from "../config.js";
-import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
+import { DEFAULT_THINKING_LEVEL, getDefaultThinkingLevelForModel } from "./defaults.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { isPrivatePrimeInferenceModel } from "./prime-inference-models.js";
 
@@ -533,8 +533,6 @@ export async function findInitialModel(options: {
 		modelRegistry,
 	} = options;
 
-	let model: Model<Api> | undefined;
-	let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL;
 	let cachedAvailableModels: Model<Api>[] | undefined;
 	const getAvailableModels = async (): Promise<Model<Api>[]> => {
 		cachedAvailableModels ??= await modelRegistry.refreshAvailableModels();
@@ -565,17 +563,28 @@ export async function findInitialModel(options: {
 					console.error(chalk.red(error));
 					process.exit(1);
 				}
-				return { model: availableModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+				return {
+					model: availableModel,
+					thinkingLevel: getDefaultThinkingLevelForModel(availableModel),
+					fallbackMessage: undefined,
+				};
 			}
-			return { model: resolvedModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+			return {
+				model: resolvedModel,
+				thinkingLevel: getDefaultThinkingLevelForModel(resolvedModel),
+				fallbackMessage: undefined,
+			};
 		}
 	}
 
 	// 2. Use first model from scoped models (skip if continuing/resuming)
 	if (scopedModels.length > 0 && !isContinuing) {
+		const scopedModel = scopedModels[0];
 		return {
-			model: scopedModels[0].model,
-			thinkingLevel: scopedModels[0].thinkingLevel ?? defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL,
+			model: scopedModel.model,
+			thinkingLevel:
+				scopedModel.thinkingLevel ??
+				getDefaultThinkingLevelForModel(scopedModel.model, defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL),
 			fallbackMessage: undefined,
 		};
 	}
@@ -593,11 +602,11 @@ export async function findInitialModel(options: {
 				? buildFallbackModel(defaultProvider, defaultModelId, availableModels)
 				: undefined);
 		if (found) {
-			model = found;
-			if (defaultThinkingLevel) {
-				thinkingLevel = defaultThinkingLevel;
-			}
-			return { model, thinkingLevel, fallbackMessage: undefined };
+			return {
+				model: found,
+				thinkingLevel: getDefaultThinkingLevelForModel(found, defaultThinkingLevel ?? DEFAULT_THINKING_LEVEL),
+				fallbackMessage: undefined,
+			};
 		}
 	}
 
@@ -605,11 +614,19 @@ export async function findInitialModel(options: {
 	if (availableModels.length > 0) {
 		const defaultModel = findPreferredDefaultModel(availableModels);
 		if (defaultModel) {
-			return { model: defaultModel, thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+			return {
+				model: defaultModel,
+				thinkingLevel: getDefaultThinkingLevelForModel(defaultModel),
+				fallbackMessage: undefined,
+			};
 		}
 
 		// If no default found, use first available
-		return { model: availableModels[0], thinkingLevel: DEFAULT_THINKING_LEVEL, fallbackMessage: undefined };
+		return {
+			model: availableModels[0],
+			thinkingLevel: getDefaultThinkingLevelForModel(availableModels[0]),
+			fallbackMessage: undefined,
+		};
 	}
 
 	// 5. No model found

@@ -472,6 +472,26 @@ describe("default model selection", () => {
 		expect(result.thinkingLevel).toBe("medium");
 	});
 
+	test("findInitialModel uses xhigh for a fork-preferred model", async () => {
+		const preferredModel: Model<"anthropic-messages"> = {
+			...mockModels[0],
+			id: "claude-fable-5",
+			name: "Claude Fable 5",
+		};
+		const registry = {
+			refreshAvailableModels: async () => [preferredModel],
+		} as unknown as Parameters<typeof findInitialModel>[0]["modelRegistry"];
+
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: registry,
+		});
+
+		expect(result.model).toBe(preferredModel);
+		expect(result.thinkingLevel).toBe("xhigh");
+	});
+
 	test("findInitialModel prefers GLM 5.2 when Prime Inference is configured", async () => {
 		const anthropicModel: Model<"anthropic-messages"> = {
 			...mockModels[0],
