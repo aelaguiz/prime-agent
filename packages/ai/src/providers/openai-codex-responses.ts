@@ -363,7 +363,7 @@ function buildRequestBody(
 	});
 
 	const body: RequestBody = {
-		model: model.id,
+		model: model.requestModelId ?? model.id,
 		store: false,
 		stream: true,
 		instructions: context.systemPrompt || "You are a helpful assistant.",

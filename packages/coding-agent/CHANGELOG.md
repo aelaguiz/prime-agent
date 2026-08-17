@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Added per-model compaction thresholds, with GPT-5.6 Sol 1M compacting after 900K context tokens.
 - Changed TUI effort selections to remain session-local, and defaulted GPT-5.6 Sol, Claude Fable 5, and Claude Opus 5 to xhigh reasoning in new sessions.
 - Added `/login` support for xAI SuperGrok / X Premium subscriptions, with live-session model rebinding onto the Responses rail and Grok 4.6 available after subscription login.
 - Fixed daemon-restored sessions losing their AIM credential route after another terminal changed the global provider binding.

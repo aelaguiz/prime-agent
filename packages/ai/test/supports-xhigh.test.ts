@@ -85,6 +85,17 @@ describe("getSupportedThinkingLevels", () => {
 		},
 	);
 
+	it("declares the Codex Sol 1M alias and its compaction threshold", () => {
+		const model = getModel("openai-codex", "gpt-5.6-sol-1m");
+
+		expect(model).toBeDefined();
+		expect(model.requestModelId).toBe("gpt-5.6-sol");
+		expect(model.contextWindow).toBe(1_000_000);
+		expect(model.compactionThreshold).toBe(900_000);
+		expect(model.maxTokens).toBe(128_000);
+		expect(getSupportedThinkingLevels(model)).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+	});
+
 	it("supports disabling reasoning for the base GPT-5.6 API alias", () => {
 		const model = getModel("openai", "gpt-5.6");
 		expect(model).toBeDefined();

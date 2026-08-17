@@ -1731,6 +1731,39 @@ async function generateModels() {
 		});
 	}
 
+	// Preserve Gemini 2.0 aliases still used by callers after models.dev removed them.
+	const legacyGoogleModels: Model<"google-generative-ai">[] = [
+		{
+			id: "gemini-2.0-flash",
+			name: "Gemini 2.0 Flash",
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0.1, output: 0.4, cacheRead: 0.025, cacheWrite: 0 },
+			contextWindow: 1048576,
+			maxTokens: 8192,
+		},
+		{
+			id: "gemini-2.0-flash-lite",
+			name: "Gemini 2.0 Flash-Lite",
+			api: "google-generative-ai",
+			provider: "google",
+			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0.075, output: 0.3, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1048576,
+			maxTokens: 8192,
+		},
+	];
+	for (const model of legacyGoogleModels) {
+		if (!allModels.some((candidate) => candidate.provider === model.provider && candidate.id === model.id)) {
+			allModels.push(model);
+		}
+	}
+
 	// Add missing Gemini 3.1 Flash Lite Preview until models.dev includes it.
 	if (!allModels.some((m) => m.provider === "google" && m.id === "gemini-3.1-flash-lite-preview")) {
 		allModels.push({
@@ -2059,6 +2092,20 @@ async function generateModels() {
 			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
 			contextWindow: CODEX_CONTEXT,
 			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-5.6-sol-1m",
+			requestModelId: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol (1M)",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 1000000,
+			maxTokens: CODEX_MAX_TOKENS,
+			compactionThreshold: 900000,
 		},
 		{
 			id: "gpt-5.6-terra",
@@ -2413,6 +2460,12 @@ export const MODELS = {
 			output += `\t\t\t},\n`;
 			output += `\t\t\tcontextWindow: ${model.contextWindow},\n`;
 			output += `\t\t\tmaxTokens: ${model.maxTokens},\n`;
+			if (model.requestModelId) {
+				output += `\t\t\trequestModelId: "${model.requestModelId}",\n`;
+			}
+			if (model.compactionThreshold !== undefined) {
+				output += `\t\t\tcompactionThreshold: ${model.compactionThreshold},\n`;
+			}
 			if (model.featured) {
 				output += `\t\t\tfeatured: true,\n`;
 			}

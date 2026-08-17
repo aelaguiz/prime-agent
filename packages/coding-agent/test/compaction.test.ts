@@ -270,6 +270,18 @@ describe("shouldCompact", () => {
 		expect(shouldCompact(89000, 100000, settings)).toBe(false);
 	});
 
+	it("uses a model-specific threshold without changing the summary reserve", () => {
+		const settings: CompactionSettings = {
+			enabled: true,
+			reserveTokens: 10000,
+			keepRecentTokens: 20000,
+		};
+
+		expect(shouldCompact(900000, 1000000, settings, 900000)).toBe(false);
+		expect(shouldCompact(900001, 1000000, settings, 900000)).toBe(true);
+		expect(settings.reserveTokens).toBe(10000);
+	});
+
 	it("should return false when disabled", () => {
 		const settings: CompactionSettings = {
 			enabled: false,

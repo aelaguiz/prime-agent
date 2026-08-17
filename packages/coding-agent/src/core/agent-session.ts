@@ -2707,7 +2707,10 @@ export class AgentSession {
 		}
 
 		const contextTokens = this._getThresholdContextTokens(context.message, compactionTimestamp);
-		if (contextTokens === undefined || !shouldCompact(contextTokens, contextWindow, settings)) {
+		if (
+			contextTokens === undefined ||
+			!shouldCompact(contextTokens, contextWindow, settings, this.model?.compactionThreshold)
+		) {
 			return false;
 		}
 
@@ -8130,7 +8133,7 @@ export class AgentSession {
 		// assistant usage are included, matching the /usage context display.
 		const contextTokens = this._getThresholdContextTokens(assistantMessage, compactionTimestamp);
 		if (contextTokens === undefined) return false;
-		if (shouldCompact(contextTokens, contextWindow, settings)) {
+		if (shouldCompact(contextTokens, contextWindow, settings, this.model?.compactionThreshold)) {
 			if (
 				queueAutonomousContinuation &&
 				(await this._queueAutonomousContinuationForThresholdCompaction(assistantMessage))

@@ -225,11 +225,19 @@ export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEst
 
 /**
  * Check if compaction should trigger based on context usage.
+ * A model-specific threshold changes only when compaction starts; the reserve
+ * remains the summary-generation budget.
  */
-export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+export function shouldCompact(
+	contextTokens: number,
+	contextWindow: number,
+	settings: CompactionSettings,
+	compactionThreshold?: number,
+): boolean {
 	if (!settings.enabled) return false;
 	if (contextWindow <= 0) return false;
-	return contextTokens > contextWindow - settings.reserveTokens;
+	const threshold = compactionThreshold ?? contextWindow - settings.reserveTokens;
+	return contextTokens > threshold;
 }
 
 // ============================================================================

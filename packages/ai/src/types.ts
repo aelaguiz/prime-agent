@@ -444,6 +444,8 @@ export interface VercelGatewayRouting {
 // Model interface for the unified model system
 export interface Model<TApi extends Api> {
 	id: string;
+	/** Provider-facing model ID when this catalog entry is a local alias. */
+	requestModelId?: string;
 	name: string;
 	api: TApi;
 	provider: Provider;
@@ -463,6 +465,8 @@ export interface Model<TApi extends Api> {
 	};
 	contextWindow: number;
 	maxTokens: number;
+	/** Context-token count at which clients should compact instead of using the default reserve. */
+	compactionThreshold?: number;
 	/** Flagship model surfaced above non-featured models of the same provider in pickers. */
 	featured?: boolean;
 	headers?: Record<string, string>;
