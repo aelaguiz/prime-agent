@@ -8,7 +8,7 @@ import {
 	InteractiveMode,
 	START_HINTS,
 } from "../src/modes/interactive/interactive-mode.js";
-import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
+import { getMarkdownTheme, initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 describe("InteractiveMode startup hints", () => {
 	beforeAll(() => {
@@ -80,6 +80,27 @@ describe("InteractiveMode startup hints", () => {
 		const label = Reflect.get(InteractiveMode.prototype, "getTrayLocationLabel").call(mode);
 
 		expect(stripAnsi(label)).toBe("test-model • high  ? for shortcuts");
+	});
+
+	it("projects disabled Fast mode as a bold bright-red priority label", () => {
+		const mode = Object.assign(createMode(), {
+			connectionState: {
+				model: {
+					id: "gpt-5.6-sol",
+					name: "GPT-5.6 Sol",
+					provider: "openai-codex",
+					api: "openai-codex-responses",
+					reasoning: true,
+				},
+				thinkingLevel: "high",
+				serviceTier: "default",
+			},
+		});
+		const label = Reflect.get(InteractiveMode.prototype, "getTrayPriorityLabel").call(mode);
+
+		expect(stripAnsi(label)).toBe("FAST OFF");
+		expect(label).toBe(theme.bold(theme.fg("fastModeOff", "FAST OFF")));
+		expect(label).toContain(theme.getFgAnsi("fastModeOff"));
 	});
 
 	it("routes session-view requests through the existing agents-view return path", async () => {

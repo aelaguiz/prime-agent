@@ -41,6 +41,7 @@
 				"borderMuted",
 				"success",
 				"error",
+				"fastModeOff",
 				"warning",
 				"muted",
 				"dim",
@@ -115,6 +116,10 @@
 				"error": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Error states"
+				},
+				"fastModeOff": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Disabled Fast mode alarm"
 				},
 				"warning": {
 					"$ref": "#/$defs/colorValue",

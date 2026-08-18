@@ -26,6 +26,7 @@
 		"borderMuted": "lightGray",
 		"success": "green",
 		"error": "red",
+		"fastModeOff": "#c00000",
 		"warning": "yellow",
 		"muted": "mediumGray",
 		"dim": "dimGray",

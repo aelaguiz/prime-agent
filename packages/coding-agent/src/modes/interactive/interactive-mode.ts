@@ -1126,6 +1126,7 @@ export class InteractiveMode {
 			() => this.getTrayLocationLabel(),
 			() => this.getTrayContextLabel(),
 			() => this.getTrayOverrideLabel(),
+			() => this.getTrayPriorityLabel(),
 		);
 		this.subagentSummaryLine.setOpenable(this.options.returnToAgentsView === true);
 		this.subagentSummaryLine.onOpen = () => void this.openScopedAgentsView();
@@ -6040,6 +6041,12 @@ export class InteractiveMode {
 		return `${keyText("app.message.followUp")} to queue message`;
 	}
 
+	private getTrayPriorityLabel(): string | undefined {
+		const model = this.getCurrentModel();
+		if (!model || !supportsFastMode(model) || this.connectionState?.serviceTier === "priority") return undefined;
+		return theme.bold(theme.fg("fastModeOff", "FAST OFF"));
+	}
+
 	private getTrayLocationLabel(): string | undefined {
 		const modelLabel = this.getModelTrayLabel();
 		const hasChildren = this.options.sessionHasChildren === true || (this.subagentSnapshots?.size ?? 0) > 0;
@@ -6083,7 +6090,7 @@ export class InteractiveMode {
 				parts.push(level);
 			}
 		}
-		if (this.connectionState?.serviceTier === "priority") {
+		if (supportsFastMode(model) && this.connectionState?.serviceTier === "priority") {
 			parts.push("fast");
 		}
 		return parts.join(" • ");

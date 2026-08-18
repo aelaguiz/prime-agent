@@ -414,5 +414,12 @@ describe("InteractiveMode /effort", () => {
 
 			expect(fastInteractiveModePrototype.getModelTrayLabel.call(context)).toBe("gpt-5.5 • high • fast");
 		});
+
+		it("does not show Fast mode for an unsupported model with a stale priority tier", () => {
+			const context = makeFastContext(testModel("anthropic", "claude-opus", "anthropic-messages"));
+			context.connectionState = { sessionId: "session-1", serviceTier: "priority", thinkingLevel: "high" };
+
+			expect(fastInteractiveModePrototype.getModelTrayLabel.call(context)).toBe("claude-opus • high");
+		});
 	});
 });

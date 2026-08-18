@@ -49,6 +49,7 @@ export class SubagentSummaryLine implements Component, Focusable {
 		private readonly getLocationLabel: () => string | undefined = () => undefined,
 		private readonly getContextLabel: () => string | undefined = () => undefined,
 		private readonly getOverrideLabel: () => string | undefined = () => undefined,
+		private readonly getPriorityLabel: () => string | undefined = () => undefined,
 	) {}
 
 	setSubagentCounts(counts: SubagentSummaryCounts): void {
@@ -94,20 +95,34 @@ export class SubagentSummaryLine implements Component, Focusable {
 	}
 
 	private renderInfoLine(width: number): string[] {
+		const priorityLabel = this.getPriorityLabel()?.trim() ?? "";
 		const overrideLabel = this.getOverrideLabel()?.trim();
 		const locationLabel = this.getLocationLabel()?.trim();
 		const contextLabel = this.getContextLabel()?.trim();
 		const left = overrideLabel || locationLabel || "";
-		if (!left && !contextLabel) return [];
+		if (!priorityLabel && !left && !contextLabel) return [];
+
 		const safeWidth = Math.max(1, width);
 		const right = contextLabel ?? "";
-		const gap = left && right ? 2 : 0;
-		const rightWidth = Math.min(visibleWidth(right), Math.max(0, safeWidth - gap));
-		const leftWidth = Math.max(0, safeWidth - rightWidth - gap);
+		const renderedPriority = truncateToWidth(priorityLabel, safeWidth, "…");
+		const priorityWidth = visibleWidth(renderedPriority);
+		const priorityGap = priorityLabel && (left || right) ? Math.min(2, safeWidth - priorityWidth) : 0;
+		const remainingWidth = safeWidth - priorityWidth - priorityGap;
+		const leftRightGap = left && right ? Math.min(2, remainingWidth) : 0;
+		const rightWidth = Math.min(visibleWidth(right), Math.max(0, remainingWidth - leftRightGap));
+		const leftWidth = Math.max(0, remainingWidth - rightWidth - leftRightGap);
 		const renderedLeft = truncateToWidth(left, leftWidth, "…");
 		const renderedRight = truncateToWidth(right, rightWidth, "…");
-		const padding = Math.max(0, safeWidth - visibleWidth(renderedLeft) - visibleWidth(renderedRight));
-		return [theme.fg("muted", `${renderedLeft}${" ".repeat(padding)}${renderedRight}`)];
+		const padding = Math.max(
+			0,
+			safeWidth - priorityWidth - priorityGap - visibleWidth(renderedLeft) - visibleWidth(renderedRight),
+		);
+		return [
+			theme.fg(
+				"muted",
+				`${renderedPriority}${" ".repeat(priorityGap)}${renderedLeft}${" ".repeat(padding)}${renderedRight}`,
+			),
+		];
 	}
 
 	invalidate(): void {

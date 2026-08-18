@@ -36,13 +36,14 @@ const ThemeJsonSchema = Type.Object({
 	name: Type.String(),
 	vars: Type.Optional(Type.Record(Type.String(), ColorValueSchema)),
 	colors: Type.Object({
-		// Core UI (10 colors)
+		// Core UI (12 colors)
 		accent: ColorValueSchema,
 		border: ColorValueSchema,
 		borderAccent: ColorValueSchema,
 		borderMuted: ColorValueSchema,
 		success: ColorValueSchema,
 		error: ColorValueSchema,
+		fastModeOff: ColorValueSchema,
 		warning: ColorValueSchema,
 		muted: ColorValueSchema,
 		dim: ColorValueSchema,
@@ -131,6 +132,7 @@ export type ThemeColor =
 	| "borderMuted"
 	| "success"
 	| "error"
+	| "fastModeOff"
 	| "warning"
 	| "muted"
 	| "dim"

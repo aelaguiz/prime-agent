@@ -34,6 +34,7 @@
 		"borderMuted": "grid",
 		"success": "success",
 		"error": "error",
+		"fastModeOff": "#ff3131",
 		"warning": "warning",
 		"muted": "muted",
 		"dim": "dim",

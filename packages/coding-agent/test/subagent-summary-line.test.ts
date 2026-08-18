@@ -8,7 +8,7 @@ import {
 	SubagentSummaryLine,
 } from "../src/modes/interactive/components/subagent-summary-line.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
-import { initTheme } from "../src/modes/interactive/theme/theme.js";
+import { initTheme, theme } from "../src/modes/interactive/theme/theme.js";
 
 function child(
 	id: string,
@@ -22,6 +22,23 @@ describe("SubagentSummaryLine", () => {
 	beforeAll(() => {
 		initTheme("dark");
 		setKeybindings(new KeybindingsManager());
+	});
+
+	it("reserves a styled priority label before location and context at narrow widths", () => {
+		const fastModeOff = theme.bold(theme.fg("fastModeOff", "FAST OFF"));
+		const line = new SubagentSummaryLine(
+			() => "GPT-5.6 Sol • high",
+			() => "50% context",
+			() => "temporary override",
+			() => fastModeOff,
+		);
+
+		const narrow = line.render(8)[0]!;
+		expect(stripAnsi(narrow)).toBe("FAST OFF");
+		expect(narrow.indexOf(theme.getFgAnsi("fastModeOff"))).toBeGreaterThan(narrow.indexOf(theme.getFgAnsi("muted")));
+		expect(narrow).toContain("\u001b[1m");
+		expect(stripAnsi(line.render(7)[0]!)).toBe("FAST O…");
+		expect(stripAnsi(line.render(24)[0]!)).toMatch(/^FAST OFF {2}/);
 	});
 
 	it("renders no subagent line without children and uses singular and plural labels", () => {
