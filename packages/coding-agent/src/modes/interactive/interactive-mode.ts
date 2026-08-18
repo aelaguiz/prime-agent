@@ -9255,22 +9255,23 @@ export class InteractiveMode {
 		const installedAimExecutable = providerAimExecutables.some((executable) => executable === undefined)
 			? this.modelRegistry.authStorage.getAimExecutable()
 			: undefined;
-		const aimExecutables = providerAimExecutables.map((executable) => executable ?? installedAimExecutable);
-		const aimExecutable =
-			aimExecutables.length > 0 &&
-			aimExecutables.every((executable): executable is string => typeof executable === "string") &&
-			new Set(aimExecutables).size === 1
-				? aimExecutables[0]
-				: undefined;
-		let accountUsage: Awaited<ReturnType<typeof queryAimAccountUsage>> = [];
-		let usageUnavailable = aimBindings.length > 0 && !aimExecutable;
-		if (aimExecutable) {
+		const bindingAimExecutables = providerAimExecutables.map((executable) => executable ?? installedAimExecutable);
+		const aimExecutables = [
+			...new Set(bindingAimExecutables.filter((executable): executable is string => typeof executable === "string")),
+		];
+		const accountUsageByExecutable = new Map<string, Awaited<ReturnType<typeof queryAimAccountUsage>>>();
+		const unavailableAimExecutables = new Set<string>();
+		if (aimExecutables.length > 0) {
 			this.showStatus("Checking AIM account usage…");
-			try {
-				accountUsage = await queryAimAccountUsage(aimExecutable);
-			} catch {
-				usageUnavailable = true;
-			}
+			await Promise.all(
+				aimExecutables.map(async (executable) => {
+					try {
+						accountUsageByExecutable.set(executable, await queryAimAccountUsage(executable));
+					} catch {
+						unavailableAimExecutables.add(executable);
+					}
+				}),
+			);
 		}
 
 		const formatReset = (resetAt: number | undefined): string => {
@@ -9312,15 +9313,19 @@ export class InteractiveMode {
 		} else if (aimBindings.length === 0) {
 			info += `${theme.fg("dim", "Account:")} Native or unmanaged\n`;
 		} else {
-			for (const binding of aimBindings) {
+			for (const [index, binding] of aimBindings.entries()) {
 				const source = binding.source === "aimgr" ? "AIM" : binding.source;
 				info += `${theme.fg("dim", `${providerLabel(binding.provider)}:`)} ${source} · ${binding.binding}\n`;
-				const usage = accountUsage.find(
-					(account) => account.provider === binding.provider && account.label === binding.binding,
-				);
+				const aimExecutable = bindingAimExecutables[index];
+				const usage = aimExecutable
+					? accountUsageByExecutable
+							.get(aimExecutable)
+							?.find((account) => account.provider === binding.provider && account.label === binding.binding)
+					: undefined;
 				if (usage) {
 					info += formatAccountUsage(usage);
 				} else {
+					const usageUnavailable = !aimExecutable || unavailableAimExecutables.has(aimExecutable);
 					const unavailable = usageUnavailable ? "Provider usage unavailable" : "Account not found in AIM";
 					info += `  ${theme.fg("dim", unavailable)}\n`;
 				}

@@ -325,6 +325,80 @@ process.stdout.write(JSON.stringify({
 			rmSync(directory, { recursive: true, force: true });
 		}
 	});
+
+	test("queries mixed AIM helper installations independently", async () => {
+		const directory = mkdtempSync(path.join(path.dirname(fileURLToPath(import.meta.url)), ".usage-helpers-"));
+		const codexExecutable = path.join(directory, "aim-codex");
+		const xaiExecutable = path.join(directory, "aim-xai");
+		writeFileSync(
+			codexExecutable,
+			`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  accounts: [{
+    provider: "openai-codex",
+    label: "growth",
+    usage: {
+      ok: true,
+      plan: "pro",
+      windows: [{ label: "168h", usedPercent: 44 }],
+      limitReached: false,
+      stale: false
+    }
+  }]
+}));
+`,
+			{ mode: 0o700 },
+		);
+		writeFileSync(
+			xaiExecutable,
+			`#!/usr/bin/env node
+process.stdout.write(JSON.stringify({
+  accounts: [{
+    provider: "xai",
+    label: "grok-seat",
+    usage: {
+      ok: true,
+      plan: "supergrok",
+      windows: [{ label: "1m", usedPercent: 25 }],
+      limitReached: false,
+      stale: false
+    }
+  }]
+}));
+`,
+			{ mode: 0o700 },
+		);
+		chmodSync(codexExecutable, 0o700);
+		chmodSync(xaiExecutable, 0o700);
+		const getAimExecutable = vi.fn((provider?: string) => {
+			if (provider === "openai-codex") return codexExecutable;
+			if (provider === "xai") return xaiExecutable;
+			return undefined;
+		});
+		try {
+			const { harness, chatContainer } = createUsageHarness(
+				createConnectionState({
+					credentialBindings: [
+						{ provider: "openai-codex", source: "aimgr", binding: "growth" },
+						{ provider: "xai", source: "aimgr", binding: "grok-seat" },
+					],
+				}),
+				getAimExecutable,
+			);
+			await (InteractiveMode as any).prototype.handleUsageCommand.call(harness);
+			const output = normalizeRenderedOutput(chatContainer);
+			expect(output).toContain("Codex: AIM · growth");
+			expect(output).toContain("168h: 44% used");
+			expect(output).toContain("xai: AIM · grok-seat");
+			expect(output).toContain("1m: 25% used");
+			expect(output).not.toContain("Provider usage unavailable");
+			expect(getAimExecutable).toHaveBeenCalledWith("openai-codex");
+			expect(getAimExecutable).toHaveBeenCalledWith("xai");
+			expect(getAimExecutable).not.toHaveBeenCalledWith();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 });
 
 type RenderSessionContextHarness = {

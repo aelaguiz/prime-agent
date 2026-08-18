@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed `/usage` hiding healthy AIM account limits when managed providers use different trusted AIM executables.
 - Added a bold red `FAST OFF` status alarm for fast-capable models when Fast mode is disabled.
 - Added provider-scoped credential rebinding when forking a saved session.
 - Added per-model compaction thresholds, with GPT-5.6 Sol 1M compacting after 900K context tokens.
