@@ -89,6 +89,14 @@ prime-agent --no-session        # Ephemeral mode; do not save
 prime-agent --fork <path|id>    # Fork a session into a new session file
 ```
 
+A fork can bind one externally managed provider afresh without changing the source session:
+
+```bash
+prime-agent --fork <path|id> --reset-credential-binding openai-codex
+```
+
+The option is repeatable and valid only with `--fork`. It copies the saved conversation while omitting the selected provider's non-secret binding metadata from the new root.
+
 Useful session commands:
 
 - `/session` shows the current session file and ID.
@@ -220,6 +228,7 @@ Use `prime-agent model list [search]` to list available models.
 | `-c`, `--continue` | Continue the most recent session |
 | `-r`, `--resume [path\|id]` | Browse and select a session, or resume a specific session file or partial UUID |
 | `--fork <path\|id>` | Fork a session file or partial UUID into a new session |
+| `--reset-credential-binding <provider>` | Bind that external provider afresh in the fork; repeatable and requires `--fork` |
 | `--session-dir <dir>` | Custom session storage directory |
 | `--no-session` | Ephemeral mode; do not save |
 

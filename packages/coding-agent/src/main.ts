@@ -435,9 +435,14 @@ function validateForkFlags(parsed: Args): void {
 	}
 }
 
-function forkSessionOrExit(sourcePath: string, cwd: string, sessionDir?: string): SessionManager {
+function forkSessionOrExit(
+	sourcePath: string,
+	cwd: string,
+	sessionDir?: string,
+	resetCredentialBindings?: readonly string[],
+): SessionManager {
 	try {
-		return SessionManager.forkFrom(sourcePath, cwd, sessionDir);
+		return SessionManager.forkFrom(sourcePath, cwd, sessionDir, { resetCredentialBindings });
 	} catch (error: unknown) {
 		const message = error instanceof Error ? error.message : String(error);
 		console.error(chalk.red(`Error: ${message}`));
@@ -467,7 +472,7 @@ export async function createSessionManager(
 			case "path":
 			case "local":
 			case "global":
-				return forkSessionOrExit(resolved.path, cwd, sessionDir);
+				return forkSessionOrExit(resolved.path, cwd, sessionDir, parsed.resetCredentialBindings);
 		}
 	}
 

@@ -23,6 +23,7 @@ export interface Args {
 	daemonSocket?: string;
 	noSession?: boolean;
 	fork?: string;
+	resetCredentialBindings?: string[];
 	sessionDir?: string;
 	models?: string[];
 	tools?: string[];
@@ -145,6 +146,11 @@ export function parseArgs(args: string[]): Args {
 			result.noSession = true;
 		} else if (arg === "--fork" && i + 1 < args.length) {
 			result.fork = args[++i];
+		} else if (arg === "--reset-credential-binding") {
+			if (hasRequiredOptionValue(args, i, arg, result)) {
+				result.resetCredentialBindings = result.resetCredentialBindings ?? [];
+				result.resetCredentialBindings.push(args[++i]);
+			}
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
 			result.sessionDir = args[++i];
 		} else if (arg === "--models" && i + 1 < args.length) {
@@ -321,6 +327,12 @@ export function parseArgs(args: string[]): Args {
 		result.diagnostics.push({
 			type: "error",
 			message: "--goal-token-budget requires --goal",
+		});
+	}
+	if (result.resetCredentialBindings !== undefined && !result.fork) {
+		result.diagnostics.push({
+			type: "error",
+			message: "--reset-credential-binding requires --fork",
 		});
 	}
 

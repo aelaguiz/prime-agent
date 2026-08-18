@@ -91,6 +91,11 @@ export interface NewSessionOptions {
 	rlmDepth?: number;
 }
 
+export interface ForkSessionOptions {
+	/** External credential providers that should bind afresh in the forked root. */
+	resetCredentialBindings?: Iterable<string>;
+}
+
 export type SessionPersistListener = (sessionFile: string) => void;
 
 export interface SessionEntryBase {
@@ -264,6 +269,23 @@ export type SessionEntry =
 
 /** Raw file entry (includes header) */
 export type FileEntry = SessionHeader | SessionEntry;
+
+const AIM_CREDENTIAL_BINDING_CUSTOM_TYPE = "aimgr_credential_binding_v1";
+
+function getAimCredentialBindingProvider(entry: FileEntry): string | undefined {
+	const record = entry as unknown as Record<string, unknown>;
+	if (record.type === "credential_binding") {
+		return typeof record.provider === "string" ? record.provider : undefined;
+	}
+	if (entry.type !== "custom" || entry.customType !== AIM_CREDENTIAL_BINDING_CUSTOM_TYPE) {
+		return undefined;
+	}
+	if (typeof entry.data !== "object" || entry.data === null || Array.isArray(entry.data)) {
+		return undefined;
+	}
+	const provider = (entry.data as Record<string, unknown>).provider;
+	return typeof provider === "string" ? provider : undefined;
+}
 
 /** Tree node for getTree() - defensive copy of session structure */
 export interface SessionTreeFlatNode {
@@ -2231,8 +2253,14 @@ export class SessionManager {
 	 * @param sourcePath Path to the source session file
 	 * @param targetCwd Target working directory (where the new session will be stored)
 	 * @param sessionDir Optional session directory. If omitted, uses default for targetCwd.
+	 * @param options Optional metadata resets for the new root.
 	 */
-	static forkFrom(sourcePath: string, targetCwd: string, sessionDir?: string): SessionManager {
+	static forkFrom(
+		sourcePath: string,
+		targetCwd: string,
+		sessionDir?: string,
+		options: ForkSessionOptions = {},
+	): SessionManager {
 		const sourceEntries = loadEntriesFromFile(sourcePath);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${sourcePath}`);
@@ -2268,11 +2296,19 @@ export class SessionManager {
 		};
 		appendFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`);
 
-		// Drop the source's git_state entries (re-linking children): they describe the source repo,
-		// so the fork would otherwise report the source's git instead of its own target context.
+		// Source git snapshots do not describe the target repo. Selected external
+		// bindings are also root metadata: dropping them lets only those providers
+		// bind from the target's current descriptor on first use.
+		const resetCredentialBindings = new Set(
+			[...(options.resetCredentialBindings ?? [])].map((provider) => provider.trim()).filter(Boolean),
+		);
 		const droppedParent = new Map<string, string | null>();
 		for (const entry of sourceEntries) {
-			if (entry.type === "git_state") droppedParent.set(entry.id, entry.parentId);
+			if (entry.type === "session") continue;
+			const bindingProvider = getAimCredentialBindingProvider(entry);
+			if (entry.type === "git_state" || (bindingProvider && resetCredentialBindings.has(bindingProvider))) {
+				droppedParent.set(entry.id, entry.parentId);
+			}
 		}
 		const liveParent = (parentId: string | null): string | null => {
 			let pid = parentId;
@@ -2280,7 +2316,7 @@ export class SessionManager {
 			return pid;
 		};
 		for (const entry of sourceEntries) {
-			if (entry.type === "session" || entry.type === "git_state") continue;
+			if (entry.type === "session" || droppedParent.has(entry.id)) continue;
 			const parentId = liveParent(entry.parentId);
 			const out = parentId === entry.parentId ? entry : { ...entry, parentId };
 			appendFileSync(newSessionFile, `${JSON.stringify(out)}\n`);
