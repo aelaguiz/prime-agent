@@ -101,6 +101,9 @@ describe("InteractiveMode startup hints", () => {
 		expect(stripAnsi(label)).toBe("FAST OFF");
 		expect(label).toBe(theme.bold(theme.fg("fastModeOff", "FAST OFF")));
 		expect(label).toContain(theme.getFgAnsi("fastModeOff"));
+		if (theme.bold("FAST OFF") !== "FAST OFF") {
+			expect(label).toContain("\u001b[1m");
+		}
 	});
 
 	it("routes session-view requests through the existing agents-view return path", async () => {

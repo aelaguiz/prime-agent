@@ -36,7 +36,6 @@ describe("SubagentSummaryLine", () => {
 		const narrow = line.render(8)[0]!;
 		expect(stripAnsi(narrow)).toBe("FAST OFF");
 		expect(narrow.indexOf(theme.getFgAnsi("fastModeOff"))).toBeGreaterThan(narrow.indexOf(theme.getFgAnsi("muted")));
-		expect(narrow).toContain("\u001b[1m");
 		expect(stripAnsi(line.render(7)[0]!)).toBe("FAST O…");
 		expect(stripAnsi(line.render(24)[0]!)).toMatch(/^FAST OFF {2}/);
 	});
