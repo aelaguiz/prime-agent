@@ -6,7 +6,6 @@
  */
 
 import { join, resolve } from "node:path";
-import { createInterface } from "node:readline";
 import { type Api, type ImageContent, type Model, modelsAreEqual } from "@earendil-works/pi-ai";
 import { registerBuiltinMcpOAuthProviders } from "@earendil-works/pi-ai/mcp";
 import { ProcessTerminal, setKeybindings, TUI } from "@earendil-works/pi-tui";
@@ -21,7 +20,12 @@ import {
 	StaleDaemonError,
 	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
-import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions } from "./cli/daemon-stop-confirm.js";
+import {
+	confirmDaemonSessionLoss,
+	type DaemonSessionLossCopy,
+	pluralizeSessions,
+	promptYesNo,
+} from "./cli/daemon-stop-confirm.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
@@ -341,20 +345,6 @@ async function prepareInitialMessage(
 	});
 }
 
-/** Prompt user for yes/no confirmation */
-async function promptConfirm(message: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		const rl = createInterface({
-			input: process.stdin,
-			output: process.stdout,
-		});
-		rl.question(`${message} [y/N] `, (answer) => {
-			rl.close();
-			resolve(answer.toLowerCase() === "y" || answer.toLowerCase() === "yes");
-		});
-	});
-}
-
 // Only busy sessions (streaming, compacting, or pending messages) lose work;
 // idle loaded sessions reload from disk on the fresh daemon.
 const STARTUP_SESSION_LOSS_COPY: DaemonSessionLossCopy = {
@@ -487,7 +477,7 @@ export async function createSessionManager(
 
 			case "global": {
 				console.log(chalk.yellow(`Session found in different project: ${resolved.cwd}`));
-				const shouldFork = await promptConfirm("Fork this session into current directory?");
+				const shouldFork = await promptYesNo("Fork this session into current directory?");
 				if (!shouldFork) {
 					console.log(chalk.dim("Aborted."));
 					process.exit(0);

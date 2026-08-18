@@ -14,14 +14,26 @@ import { createInterface } from "node:readline";
 import chalk from "chalk";
 import { isSessionBusy, type RunningDaemonProbe } from "./daemon-launch.js";
 
-/** Prompt for a yes/no answer at a TTY. Empty/anything-but-yes resolves false (default No). */
-export function promptYesNo(message: string): Promise<boolean> {
+interface PromptYesNoIo {
+	input?: NodeJS.ReadableStream;
+	output?: NodeJS.WritableStream;
+}
+
+/** Prompt for a yes/no answer at a TTY. Empty, EOF, and anything-but-yes resolve false (default No). */
+export function promptYesNo(message: string, io: PromptYesNoIo = {}): Promise<boolean> {
 	return new Promise((resolve) => {
-		const rl = createInterface({ input: process.stdin, output: process.stdout });
+		const rl = createInterface({ input: io.input ?? process.stdin, output: io.output ?? process.stdout });
+		let settled = false;
+		const settle = (answer: boolean): void => {
+			if (settled) return;
+			settled = true;
+			resolve(answer);
+		};
+		rl.once("close", () => settle(false));
 		rl.question(`${message} [y/N] `, (answer) => {
-			rl.close();
 			const normalized = answer.trim().toLowerCase();
-			resolve(normalized === "y" || normalized === "yes");
+			settle(normalized === "y" || normalized === "yes");
+			rl.close();
 		});
 	});
 }

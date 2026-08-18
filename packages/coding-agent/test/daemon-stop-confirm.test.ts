@@ -1,9 +1,11 @@
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RunningDaemonProbe } from "../src/cli/daemon-launch.js";
 import {
 	confirmDaemonSessionLoss,
 	type DaemonSessionLossCopy,
 	pluralizeSessions,
+	promptYesNo,
 } from "../src/cli/daemon-stop-confirm.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
@@ -110,6 +112,18 @@ describe("confirmDaemonSessionLoss", () => {
 			const probe: RunningDaemonProbe = { reachable: true, activeSessions: [session(overrides)] };
 			expect(await confirmDaemonSessionLoss(probe, { force: false, copy: COPY })).toBe(false);
 		}
+	});
+});
+
+describe("promptYesNo", () => {
+	it("settles to the safe default when input closes before an answer", async () => {
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const answer = promptYesNo("Continue?", { input, output });
+
+		input.end();
+
+		await expect(answer).resolves.toBe(false);
 	});
 });
 
