@@ -11,7 +11,6 @@ import {
 	readFileSync,
 	readSync,
 	realpathSync,
-	renameSync,
 	rmSync,
 	statSync,
 	writeSync,
@@ -19,7 +18,7 @@ import {
 import { readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { canonicalSessionPath } from "../../core/session-lease.js";
-import { readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
+import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { readFirstLineSync } from "../../utils/file-lines.js";
 
 /**
@@ -134,7 +133,7 @@ export function createRlmLedgerRegistrySeedSource(): RlmLedgerSeedSource {
 				return [];
 			}
 			if (!headerId) return [];
-			const registryPath = join(dirname(dirname(sessionFile)), "session-artifacts", headerId, "rlm-subagents.jsonl");
+			const registryPath = join(getSessionArtifactPathForFile(sessionFile, headerId), "rlm-subagents.jsonl");
 			let contents: string;
 			try {
 				contents = await readFile(registryPath, "utf8");
@@ -388,9 +387,14 @@ export class RlmSpawnLedger {
 		return this.queue.then(() => undefined);
 	}
 
-	/** Replay live (non-deleted) edges, without liveness reconciliation. */
-	edges(): Promise<RlmLedgerEdge[]> {
-		return this.enqueue(() => [...this.replaySync().values()].filter((edge) => !edge.deleted));
+	/**
+	 * Replay edges without liveness reconciliation. Deleted edges are filtered
+	 * by default; `includeDeleted` keeps the tombstones (marked with their
+	 * delete reason) for consumers that need a deleted child's identity, such
+	 * as cleanup retries.
+	 */
+	edges(includeDeleted = false): Promise<RlmLedgerEdge[]> {
+		return this.enqueue(() => [...this.replaySync().values()].filter((edge) => includeDeleted || !edge.deleted));
 	}
 
 	/**
@@ -694,25 +698,20 @@ export class RlmSpawnLedger {
 	private publishSeedFile(tempPath: string): void {
 		// Atomic no-clobber publish: link() fails with EEXIST if a live append
 		// created the real file meanwhile — that append wins (its data is
-		// fresher than the registries) and the seed is discarded. A clobbering
-		// rename() here would overwrite and lose that append.
+		// fresher than the registries) and the seed is discarded. No-clobber
+		// publication is a hard requirement for seeding: post-consolidation,
+		// deletes live only in the ledger, so any clobber window can lose live
+		// appends and resurrect deleted edges. Filesystems that cannot provide
+		// link() therefore get flat pre-ledger history (the documented
+		// degradation mode) rather than a check-then-rename race.
 		try {
 			linkSync(tempPath, this.path);
-			return;
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "EEXIST") {
 				return;
 			}
-			// Filesystems without hard links (network/synced homes, non-NTFS
-			// Windows volumes): fall back to check-then-rename. Non-atomic, but
-			// strictly better than never seeding; the residual window is the
-			// documented O_APPEND trust bucket.
-			this.log(`RLM ledger: link publish failed (${code ?? "unknown"}), falling back to rename`);
-			if (existsSync(this.path)) {
-				return;
-			}
-			renameSync(tempPath, this.path);
+			this.log(`RLM ledger: link publish unavailable (${code ?? "unknown"}); skipping seeding`);
 		}
 	}
 

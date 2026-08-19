@@ -35,7 +35,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../src/core/rlm-runtime.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
-import { readSessionInfo, SessionManager } from "../src/core/session-manager.js";
+import { SessionManager } from "../src/core/session-manager.js";
 import type { ActiveSessionState } from "../src/modes/daemon/active-session-state.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
@@ -598,181 +598,41 @@ describe("rlm spawn ledger daemon wiring", () => {
 		}
 	});
 
-	it("fails spawn admission and rolls back the resident runtime when the ledger append fails", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-spawn-failure-"));
+	it("fails admission when the spawn record cannot be made durable", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-spawn-fail-"));
 		try {
 			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
 			const parentManager = SessionManager.create(tempDir, sessionsDir);
 			parentManager.newSession();
+			parentManager.appendSessionInfo("parent");
 			const parentFile = parentManager.getSessionFile();
 			if (!parentFile) throw new Error("Missing parent session file");
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
 			const ledger = internals.rlmSpawnLedger();
-			vi.spyOn(ledger, "appendSpawn").mockRejectedValueOnce(new Error("spawn ledger unavailable"));
-			const onSessionPublished = vi.fn();
+			const failingAppend = vi.spyOn(ledger, "appendSpawn").mockRejectedValue(new Error("ledger disk exploded"));
+			const childDir = join(parentManager.getSessionArtifactDir()!, "sub-badbadba");
 
 			await expect(
 				internals.createRlmSubagentRuntime(
 					parentState,
-					subagentRuntimeOptions(parentState, {
-						id: "sub-failspawn",
-						sessionDir: join(parentManager.getSessionArtifactDir()!, "sub-failspawn"),
-						onSessionPublished,
-					}),
+					subagentRuntimeOptions(parentState, { id: "sub-badbadba", sessionDir: childDir }),
 				),
-			).rejects.toThrow("spawn ledger unavailable");
-			expect(onSessionPublished).toHaveBeenCalledOnce();
-			expect(internals.sessions.size).toBe(1);
-			await expect(ledger.edges()).resolves.toEqual([]);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
+			).rejects.toThrow("Failed to record RLM subagent spawn for sub-badbadba");
+			// No ghost resident session and no display file claiming a running
+			// child the ledger cannot see.
+			expect(
+				[...internals.sessions.values()].some((state) => state.runtime.metadata.rlmChildId === "sub-badbadba"),
+			).toBe(false);
+			expect(existsSync(join(childDir, "rlm-subagent.json"))).toBe(false);
 
-	it("rolls back a resident child rename when the ledger append fails", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-rename-failure-"));
-		try {
-			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
-			const parentManager = SessionManager.create(tempDir, sessionsDir);
-			parentManager.newSession();
-			const parentFile = parentManager.getSessionFile();
-			if (!parentFile) throw new Error("Missing parent session file");
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
-			const childRuntime = await internals.createRlmSubagentRuntime(
-				parentState,
-				subagentRuntimeOptions(parentState, {
-					id: "sub-failrename",
-					sessionName: "before-rename",
-					sessionDir: join(parentManager.getSessionArtifactDir()!, "sub-failrename"),
-				}),
-			);
-			const childState = [...internals.sessions.values()].find(
-				(state) => state.runtime.session === childRuntime.session,
-			);
-			if (!childState) throw new Error("Missing child state");
-			const ledger = internals.rlmSpawnLedger();
-			vi.spyOn(ledger, "appendRename").mockRejectedValueOnce(new Error("rename ledger unavailable"));
-
-			await expect(internals.setStateSessionName(childState, "after-rename")).rejects.toThrow(
-				"rename ledger unavailable",
-			);
-			expect(childState.runtime.session.sessionName).toBe("before-rename");
-			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ name: "before-rename" })]);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
-	it("rejects deletion before teardown when the ledger tombstone cannot be written", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-delete-failure-"));
-		try {
-			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
-			const parentManager = SessionManager.create(tempDir, sessionsDir);
-			parentManager.newSession();
-			const parentFile = parentManager.getSessionFile();
-			if (!parentFile) throw new Error("Missing parent session file");
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
+			// The same spawn succeeds once the append works again.
+			failingAppend.mockRestore();
+			const retryDir = join(parentManager.getSessionArtifactDir()!, "sub-a11a11a1");
 			await internals.createRlmSubagentRuntime(
 				parentState,
-				subagentRuntimeOptions(parentState, {
-					id: "sub-faildelete",
-					sessionDir: join(parentManager.getSessionArtifactDir()!, "sub-faildelete"),
-				}),
+				subagentRuntimeOptions(parentState, { id: "sub-a11a11a1", sessionDir: retryDir }),
 			);
-			const ledger = internals.rlmSpawnLedger();
-			vi.spyOn(ledger, "appendDelete").mockRejectedValueOnce(new Error("delete ledger unavailable"));
-
-			await expect(internals.recordRlmSubagentDeletion(parentState, "sub-faildelete")).rejects.toThrow(
-				"delete ledger unavailable",
-			);
-			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-faildelete" })]);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
-	it("rolls back a routed active-context saved rename when the ledger write fails", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-routed-rename-failure-"));
-		try {
-			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
-			const parentManager = SessionManager.create(tempDir, sessionsDir);
-			parentManager.newSession();
-			const parentFile = parentManager.getSessionFile();
-			const parentArtifactDir = parentManager.getSessionArtifactDir();
-			if (!parentFile || !parentArtifactDir) throw new Error("Missing parent session paths");
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
-			const child = makeChildSession(tempDir, join(parentArtifactDir, "sub-routed-rename"), parentFile, 1, "before");
-			const ledger = internals.rlmSpawnLedger();
-			await ledger.appendSpawn({
-				childId: "sub-routed-rename",
-				parent: parentFile,
-				child: child.file,
-				depth: 1,
-				name: "before",
-			});
-			vi.spyOn(ledger, "appendRenameByChildPath").mockRejectedValueOnce(
-				new Error("routed rename ledger unavailable"),
-			);
-
-			await expect(
-				internals.handleCommand(
-					{},
-					{
-						type: "rename_saved_session",
-						activeSessionId: parentState.activeSessionId,
-						sessionPath: child.file,
-						name: "after",
-					},
-				),
-			).rejects.toThrow("routed rename ledger unavailable");
-			expect((await readSessionInfo(child.file))?.name).toBe("before");
-			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ name: "before" })]);
-		} finally {
-			rmSync(tempDir, { recursive: true, force: true });
-		}
-	});
-
-	it("rejects a routed active-context saved delete when the ledger tombstone fails", async () => {
-		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-routed-delete-failure-"));
-		try {
-			const { internals, sessionsDir } = makeDaemonFixture(tempDir);
-			const parentManager = SessionManager.create(tempDir, sessionsDir);
-			parentManager.newSession();
-			const parentFile = parentManager.getSessionFile();
-			const parentArtifactDir = parentManager.getSessionArtifactDir();
-			if (!parentFile || !parentArtifactDir) throw new Error("Missing parent session paths");
-			const parentState = await internals.createRuntime({ type: "create", sessionPath: parentFile });
-			const child = makeChildSession(
-				tempDir,
-				join(parentArtifactDir, "sub-routed-delete"),
-				parentFile,
-				1,
-				"delete-me",
-			);
-			const ledger = internals.rlmSpawnLedger();
-			await ledger.appendSpawn({
-				childId: "sub-routed-delete",
-				parent: parentFile,
-				child: child.file,
-				depth: 1,
-				name: "delete-me",
-			});
-			vi.spyOn(ledger, "appendDeleteByChildPath").mockRejectedValueOnce(
-				new Error("routed delete ledger unavailable"),
-			);
-
-			await expect(
-				internals.handleCommand(
-					{},
-					{
-						type: "delete_saved_session",
-						activeSessionId: parentState.activeSessionId,
-						sessionPath: child.file,
-					},
-				),
-			).rejects.toThrow("routed delete ledger unavailable");
-			expect(existsSync(child.file)).toBe(false);
-			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-routed-delete" })]);
+			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ childId: "sub-a11a11a1" })]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -1056,7 +916,7 @@ describe("rlm spawn ledger daemon wiring", () => {
 		}
 	});
 
-	it("publishes the seed via rename fallback on filesystems without hard links", async () => {
+	it("skips seeding on filesystems without hard links instead of racing a clobber", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-seed-nolink-"));
 		try {
 			const sessionsDir = join(tempDir, "sessions");
@@ -1090,15 +950,17 @@ describe("rlm spawn ledger daemon wiring", () => {
 			);
 			linkFailure.code = "ENOTSUP";
 			try {
-				await expect(ledger.family()).resolves.toEqual([
-					expect.objectContaining({ name: "parent", rlmDepth: 0 }),
-					expect.objectContaining({ name: "worker", rlmDepth: 1 }),
-				]);
+				// No-clobber publication is unavailable: the seed is discarded and
+				// pre-ledger history stays flat rather than risking a clobbered
+				// live append.
+				await expect(ledger.family()).resolves.toEqual([expect.objectContaining({ name: "parent", rlmDepth: 0 })]);
 			} finally {
 				linkFailure.code = undefined;
 			}
-			expect(existsSync(rlmLedgerPath(tempDir, sessionsDir))).toBe(true);
-			expect(logged.some((message) => message.includes("falling back to rename"))).toBe(true);
+			expect(existsSync(rlmLedgerPath(tempDir, sessionsDir))).toBe(false);
+			expect(
+				logged.some((message) => message.includes("link publish unavailable (ENOTSUP); skipping seeding")),
+			).toBe(true);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
