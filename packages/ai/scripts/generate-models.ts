@@ -1731,38 +1731,6 @@ async function generateModels() {
 		});
 	}
 
-	// Preserve Gemini 2.0 aliases still used by callers after models.dev removed them.
-	const legacyGoogleModels: Model<"google-generative-ai">[] = [
-		{
-			id: "gemini-2.0-flash",
-			name: "Gemini 2.0 Flash",
-			api: "google-generative-ai",
-			provider: "google",
-			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-			reasoning: false,
-			input: ["text", "image"],
-			cost: { input: 0.1, output: 0.4, cacheRead: 0.025, cacheWrite: 0 },
-			contextWindow: 1048576,
-			maxTokens: 8192,
-		},
-		{
-			id: "gemini-2.0-flash-lite",
-			name: "Gemini 2.0 Flash-Lite",
-			api: "google-generative-ai",
-			provider: "google",
-			baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-			reasoning: false,
-			input: ["text", "image"],
-			cost: { input: 0.075, output: 0.3, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 1048576,
-			maxTokens: 8192,
-		},
-	];
-	for (const model of legacyGoogleModels) {
-		if (!allModels.some((candidate) => candidate.provider === model.provider && candidate.id === model.id)) {
-			allModels.push(model);
-		}
-	}
 
 	// Add missing Gemini 3.1 Flash Lite Preview until models.dev includes it.
 	if (!allModels.some((m) => m.provider === "google" && m.id === "gemini-3.1-flash-lite-preview")) {
