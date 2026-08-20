@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Fixed compromised daemon and session lockfiles terminating their owning processes from asynchronous lock-refresh callbacks.
+- Fixed `prime-agent attach` failing to find live agents owned by another local background service.
+- Fixed long-lived IPython sessions wedging after shell replies accumulated or the shell transport disconnected.
 - Fixed `/usage` hiding healthy AIM account limits when managed providers use different trusted AIM executables.
 - Added a bold red `FAST OFF` status alarm for fast-capable models when Fast mode is disabled.
 - Added provider-scoped credential rebinding when forking a saved session.
