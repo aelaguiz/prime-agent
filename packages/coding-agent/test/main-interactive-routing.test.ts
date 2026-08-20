@@ -207,7 +207,7 @@ describe("daemon-backed interactive session manager routing", () => {
 		).toBe(true);
 	});
 
-	test("ensures daemon is available before probing non-path session selectors", () => {
+	test("ensures daemon is available before probing every explicit resume selector", () => {
 		expect(
 			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: true,
@@ -218,13 +218,6 @@ describe("daemon-backed interactive session manager routing", () => {
 			shouldEnsureDaemonBeforeActiveSessionLookup({
 				useDaemonInteractive: true,
 				resumeSelector: "/tmp/session.jsonl",
-			}),
-		).toBe(false);
-		expect(
-			shouldEnsureDaemonBeforeActiveSessionLookup({
-				useDaemonInteractive: true,
-				resumeSelector: "/tmp/session.jsonl",
-				explicitAttach: true,
 			}),
 		).toBe(true);
 		expect(
@@ -278,14 +271,14 @@ describe("daemon-backed interactive session manager routing", () => {
 	});
 
 	test.each([
-		["active runtime id", "009d27c8400b"],
+		["active runtime id", "abc123def456"],
 		["saved session id", "11111111-2222-7333-8444-55555555b822"],
 		["exact name", "run-it-back"],
 		["id suffix", "b822"],
 	])("resolves an active summary by %s", (_label, selector) => {
 		const activeSummary = makeSessionSummary({
-			id: "009d27c8400b",
-			activeSessionId: "009d27c8400b",
+			id: "abc123def456",
+			activeSessionId: "abc123def456",
 			sessionId: "11111111-2222-7333-8444-55555555b822",
 			sessionName: "run-it-back",
 		});
@@ -328,8 +321,8 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test("finds a saved session on another daemon socket", async () => {
 		const summary = makeSessionSummary({
-			id: "009d27c8400b",
-			activeSessionId: "009d27c8400b",
+			id: "abc123def456",
+			activeSessionId: "abc123def456",
 			sessionId: "11111111-2222-7333-8444-55555555b822",
 		});
 		const lookups: string[] = [];
