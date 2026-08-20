@@ -11498,11 +11498,11 @@ export const MODELS = {
 			cost: {
 				input: 0.27,
 				output: 1,
-				cacheRead: 0,
+				cacheRead: 0.135,
 				cacheWrite: 0,
 			},
 			contextWindow: 163840,
-			maxTokens: 163840,
+			maxTokens: 32768,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v3.2": {
 			id: "deepseek/deepseek-v3.2",
@@ -11553,9 +11553,9 @@ export const MODELS = {
 			thinkingLevelMap: {"minimal":null,"low":null,"medium":null,"high":"high","xhigh":"max","max":null},
 			input: ["text"],
 			cost: {
-				input: 0.0868,
-				output: 0.1736,
-				cacheRead: 0.01736,
+				input: 0.0812,
+				output: 0.1624,
+				cacheRead: 0.016239999999999997,
 				cacheWrite: 0,
 			},
 			contextWindow: 1048576,
@@ -16269,7 +16269,7 @@ export const MODELS = {
 				cacheWrite: 0,
 			},
 			contextWindow: 163840,
-			maxTokens: 163840,
+			maxTokens: 32768,
 		} satisfies Model<"openai-completions">,
 		"deepseek/deepseek-v3.2": {
 			id: "deepseek/deepseek-v3.2",

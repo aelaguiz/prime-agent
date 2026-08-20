@@ -1302,8 +1302,8 @@ export async function main(args: string[], options?: MainOptions) {
 			if (publicCommand.attachAgent) {
 				const location = parsed.daemonSocket
 					? await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector, {
-						discoverSocketPaths: async () => [],
-					})
+							discoverSocketPaths: async () => [],
+						})
 					: await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector);
 				if (location) {
 					daemonSocketPath = location.socketPath;

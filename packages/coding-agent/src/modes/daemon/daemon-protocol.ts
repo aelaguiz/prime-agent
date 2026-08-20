@@ -738,7 +738,6 @@ const SESSION_INPUT_PAUSE_COMMAND = {
 	minSchemaRevision: 19,
 	capability: "session_input_pause",
 } as const;
-} as const;
 
 export const DAEMON_COMMAND_COMPATIBILITY = {
 	ack_result: LEGACY_DAEMON_COMMAND,
