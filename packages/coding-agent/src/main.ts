@@ -1299,21 +1299,14 @@ export async function main(args: string[], options?: MainOptions) {
 	let activeDaemonSessionSummary: SessionSummary | undefined;
 	if (shouldLookupDaemonActiveSession && resumeSelector) {
 		try {
-			if (publicCommand.attachAgent) {
-				const location = parsed.daemonSocket
-					? await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector, {
-							discoverSocketPaths: async () => [],
-						})
-					: await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector);
-				if (location) {
-					daemonSocketPath = location.socketPath;
-					activeDaemonSessionSummary = location.summary;
-				}
-			} else {
-				activeDaemonSessionSummary = await findActiveDaemonSessionSummaryForInteractiveStartup(
-					daemonSocketPath,
-					resumeSelector,
-				);
+			const location = parsed.daemonSocket
+				? await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector, {
+						discoverSocketPaths: async () => [],
+					})
+				: await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector);
+			if (location) {
+				daemonSocketPath = location.socketPath;
+				activeDaemonSessionSummary = location.summary;
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

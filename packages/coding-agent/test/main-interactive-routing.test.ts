@@ -279,14 +279,14 @@ describe("daemon-backed interactive session manager routing", () => {
 
 	test.each([
 		["active runtime id", "009d27c8400b"],
-		["saved session id", "019fe37a-18c7-7493-9d0c-d1c4e174b822"],
+		["saved session id", "11111111-2222-7333-8444-55555555b822"],
 		["exact name", "run-it-back"],
 		["id suffix", "b822"],
 	])("resolves an active summary by %s", (_label, selector) => {
 		const activeSummary = makeSessionSummary({
 			id: "009d27c8400b",
 			activeSessionId: "009d27c8400b",
-			sessionId: "019fe37a-18c7-7493-9d0c-d1c4e174b822",
+			sessionId: "11111111-2222-7333-8444-55555555b822",
 			sessionName: "run-it-back",
 		});
 
@@ -330,12 +330,12 @@ describe("daemon-backed interactive session manager routing", () => {
 		const summary = makeSessionSummary({
 			id: "009d27c8400b",
 			activeSessionId: "009d27c8400b",
-			sessionId: "019fe37a-18c7-7493-9d0c-d1c4e174b822",
+			sessionId: "11111111-2222-7333-8444-55555555b822",
 		});
 		const lookups: string[] = [];
 
 		await expect(
-			findActiveDaemonSessionAcrossDaemons("/tmp/default.sock", "019fe37a-18c7-7493-9d0c-d1c4e174b822", {
+			findActiveDaemonSessionAcrossDaemons("/tmp/default.sock", "11111111-2222-7333-8444-55555555b822", {
 				lookup: async (socketPath) => {
 					lookups.push(socketPath);
 					return socketPath === "/tmp/owner.sock" ? summary : undefined;
