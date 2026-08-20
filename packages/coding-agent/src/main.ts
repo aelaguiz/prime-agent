@@ -20,6 +20,7 @@ import {
 	StaleDaemonError,
 	shutdownDaemonAndWait,
 } from "./cli/daemon-launch.js";
+import { discoverDaemons } from "./cli/daemon-ps.js";
 import {
 	confirmDaemonSessionLoss,
 	type DaemonSessionLossCopy,
@@ -72,6 +73,7 @@ import {
 	MissingSessionCwdError,
 	type SessionCwdIssue,
 } from "./core/session-cwd.js";
+import { matchesSessionIdSuffix } from "./core/session-id.js";
 import { canonicalSessionPath, SessionAlreadyActiveError } from "./core/session-lease.js";
 import { SessionManager } from "./core/session-manager.js";
 import { SettingsManager } from "./core/settings-manager.js";
@@ -892,6 +894,40 @@ function isUnknownActiveSessionError(message: string): boolean {
 	return message.startsWith("Unknown active session:");
 }
 
+export class AmbiguousActiveAgentError extends Error {
+	constructor(selector: string, acrossDaemons = false) {
+		super(`Ambiguous active agent "${selector}"${acrossDaemons ? " across background services" : ""}`);
+		this.name = "AmbiguousActiveAgentError";
+	}
+}
+
+export function selectActiveDaemonSessionSummary(
+	summaries: readonly SessionSummary[],
+	selector: string,
+): SessionSummary | undefined {
+	const active = summaries.filter(
+		(summary): summary is SessionSummary & { activeSessionId: string } => typeof summary.activeSessionId === "string",
+	);
+	const exact = active.filter(
+		(summary) =>
+			summary.activeSessionId === selector ||
+			summary.sessionId === selector ||
+			summary.sessionName === selector ||
+			(looksLikeSessionPath(selector) &&
+				summary.sessionFile !== undefined &&
+				canonicalSessionPath(summary.sessionFile) === canonicalSessionPath(selector)),
+	);
+	const suffix = active.filter(
+		(summary) =>
+			matchesSessionIdSuffix(summary.activeSessionId, selector) ||
+			matchesSessionIdSuffix(summary.sessionId, selector),
+	);
+	const matches = exact.length > 0 ? exact : suffix;
+	if (matches.length === 1) return matches[0];
+	if (matches.length > 1) throw new AmbiguousActiveAgentError(selector);
+	return undefined;
+}
+
 async function findActiveDaemonSessionSummary(
 	socketPath: string,
 	selector: string,
@@ -901,19 +937,87 @@ async function findActiveDaemonSessionSummary(
 
 	try {
 		const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
-		if (!response.success) {
-			if (isUnknownActiveSessionError(response.error)) {
-				return undefined;
+		if (response.success) {
+			if (!isDaemonSessionSummary(response.data)) {
+				throw new Error("Daemon returned an invalid active session summary");
 			}
-			throw new Error(response.error);
+			return response.data;
 		}
-		if (!isDaemonSessionSummary(response.data)) {
-			throw new Error("Daemon returned an invalid active session summary");
-		}
-		return response.data;
+		if (!isUnknownActiveSessionError(response.error)) throw new Error(response.error);
+		return selectActiveDaemonSessionSummary(await listActiveDaemonSessionSummaries(client), selector);
 	} finally {
 		client.close();
 	}
+}
+
+export interface ActiveDaemonSessionLocation {
+	socketPath: string;
+	summary: SessionSummary;
+}
+
+interface ActiveDaemonSessionDiscoveryOptions {
+	lookup?: (socketPath: string, selector: string) => Promise<SessionSummary | undefined>;
+	discoverSocketPaths?: () => Promise<readonly string[]>;
+}
+
+async function discoverActiveDaemonSocketPaths(): Promise<string[]> {
+	return (await discoverDaemons())
+		.filter(
+			(daemon) =>
+				(daemon.status === "current" || daemon.status === "stale") &&
+				(daemon.sessionCount === undefined || daemon.sessionCount > 0),
+		)
+		.map((daemon) => daemon.socketPath);
+}
+
+export async function findActiveDaemonSessionAcrossDaemons(
+	defaultSocketPath: string,
+	selector: string,
+	options: ActiveDaemonSessionDiscoveryOptions = {},
+): Promise<ActiveDaemonSessionLocation | undefined> {
+	const lookup = options.lookup ?? findActiveDaemonSessionSummary;
+	const discoverSocketPaths = options.discoverSocketPaths ?? discoverActiveDaemonSocketPaths;
+	const failures: Array<{ socketPath: string; error: Error }> = [];
+	try {
+		const summary = await lookup(defaultSocketPath, selector);
+		if (summary) return { socketPath: defaultSocketPath, summary };
+	} catch (error) {
+		if (error instanceof AmbiguousActiveAgentError) throw error;
+		failures.push({
+			socketPath: defaultSocketPath,
+			error: error instanceof Error ? error : new Error(String(error)),
+		});
+	}
+
+	const socketPaths = (await discoverSocketPaths()).filter((socketPath) => socketPath !== defaultSocketPath);
+	const results = await Promise.all(
+		socketPaths.map(async (socketPath) => {
+			try {
+				return { socketPath, summary: await lookup(socketPath, selector) };
+			} catch (error) {
+				return { socketPath, error: error instanceof Error ? error : new Error(String(error)) };
+			}
+		}),
+	);
+	const ambiguous = results.find(
+		(result): result is { socketPath: string; error: AmbiguousActiveAgentError } =>
+			"error" in result && result.error instanceof AmbiguousActiveAgentError,
+	);
+	if (ambiguous) throw new AmbiguousActiveAgentError(selector, true);
+	const matches = results.filter(
+		(result): result is ActiveDaemonSessionLocation => "summary" in result && result.summary !== undefined,
+	);
+	if (matches.length === 1) return matches[0];
+	if (matches.length > 1) throw new AmbiguousActiveAgentError(selector, true);
+	failures.push(...results.filter((result): result is { socketPath: string; error: Error } => "error" in result));
+	if (failures.length > 0) {
+		const first = failures[0]!;
+		throw new Error(
+			`Could not query ${failures.length} background service${failures.length === 1 ? "" : "s"}; ` +
+				`${first.socketPath}: ${first.error.message}`,
+		);
+	}
+	return undefined;
 }
 
 function createSessionManagerForActiveDaemonSummary(summary: SessionSummary, fallbackCwd: string): SessionManager {
@@ -1174,7 +1278,7 @@ export async function main(args: string[], options?: MainOptions) {
 		(parsed.sessionDir ? expandTildePath(parsed.sessionDir) : undefined) ??
 		getSessionDirEnvOverride() ??
 		startupSettingsManager.getSessionDir();
-	const daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
+	let daemonSocketPath = parsed.daemonSocket ?? defaultDaemonSocketPath();
 	// Kick off daemon spawn/readiness immediately so it overlaps session-manager
 	// and runtime-services preparation; attach only connects to an existing daemon.
 	let daemonReady = shouldEnsureInteractiveDaemonForStartup(useDaemonClient, publicCommand.attachAgent)
@@ -1195,11 +1299,22 @@ export async function main(args: string[], options?: MainOptions) {
 	let activeDaemonSessionSummary: SessionSummary | undefined;
 	if (shouldLookupDaemonActiveSession && resumeSelector) {
 		try {
-			activeDaemonSessionSummary = await findActiveDaemonSessionSummaryForInteractiveStartup(
-				daemonSocketPath,
-				resumeSelector,
-				{ fallbackOnError: !publicCommand.attachAgent },
-			);
+			if (publicCommand.attachAgent) {
+				const location = parsed.daemonSocket
+					? await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector, {
+						discoverSocketPaths: async () => [],
+					})
+					: await findActiveDaemonSessionAcrossDaemons(daemonSocketPath, resumeSelector);
+				if (location) {
+					daemonSocketPath = location.socketPath;
+					activeDaemonSessionSummary = location.summary;
+				}
+			} else {
+				activeDaemonSessionSummary = await findActiveDaemonSessionSummaryForInteractiveStartup(
+					daemonSocketPath,
+					resumeSelector,
+				);
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			console.error(chalk.red(`Error: Could not look up active agent '${resumeSelector}': ${message}`));

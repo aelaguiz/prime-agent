@@ -5,15 +5,18 @@ import { describe, expect, test } from "vitest";
 import { mergeAgentSessionRuntimeConfig } from "../src/core/agent-session-config.js";
 import type { CreateAgentSessionOptions } from "../src/core/sdk.js";
 import {
+	AmbiguousActiveAgentError,
 	type AppMode,
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
+	findActiveDaemonSessionAcrossDaemons,
 	findActiveDaemonSessionSummaryForInteractiveStartup,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
 	resolveRuntimeSessionOptions,
+	selectActiveDaemonSessionSummary,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
 	shouldEnsureInteractiveDaemonForStartup,
 	shouldOpenAgentsViewForDaemonInteractive,
@@ -272,6 +275,90 @@ describe("daemon-backed interactive session manager routing", () => {
 				}),
 			}),
 		).resolves.toMatchObject({ activeSessionId: "active-1" });
+	});
+
+	test.each([
+		["active runtime id", "009d27c8400b"],
+		["saved session id", "019fe37a-18c7-7493-9d0c-d1c4e174b822"],
+		["exact name", "run-it-back"],
+		["id suffix", "b822"],
+	])("resolves an active summary by %s", (_label, selector) => {
+		const activeSummary = makeSessionSummary({
+			id: "009d27c8400b",
+			activeSessionId: "009d27c8400b",
+			sessionId: "019fe37a-18c7-7493-9d0c-d1c4e174b822",
+			sessionName: "run-it-back",
+		});
+
+		expect(selectActiveDaemonSessionSummary([activeSummary], selector)).toBe(activeSummary);
+	});
+
+	test("rejects an ambiguous active name", () => {
+		const first = makeSessionSummary({
+			id: "active-1",
+			activeSessionId: "active-1",
+			sessionId: "session-1",
+			sessionName: "duplicate",
+		});
+		const second = makeSessionSummary({
+			id: "active-2",
+			activeSessionId: "active-2",
+			sessionId: "session-2",
+			sessionName: "duplicate",
+		});
+
+		expect(() => selectActiveDaemonSessionSummary([first, second], "duplicate")).toThrow(AmbiguousActiveAgentError);
+	});
+
+	test("keeps an explicit attach on the default daemon without inventory discovery", async () => {
+		const summary = makeSessionSummary({ id: "active-1", activeSessionId: "active-1" });
+		let discovered = false;
+
+		await expect(
+			findActiveDaemonSessionAcrossDaemons("/tmp/default.sock", "active-1", {
+				lookup: async () => summary,
+				discoverSocketPaths: async () => {
+					discovered = true;
+					return ["/tmp/other.sock"];
+				},
+			}),
+		).resolves.toEqual({ socketPath: "/tmp/default.sock", summary });
+		expect(discovered).toBe(false);
+	});
+
+	test("finds a saved session on another daemon socket", async () => {
+		const summary = makeSessionSummary({
+			id: "009d27c8400b",
+			activeSessionId: "009d27c8400b",
+			sessionId: "019fe37a-18c7-7493-9d0c-d1c4e174b822",
+		});
+		const lookups: string[] = [];
+
+		await expect(
+			findActiveDaemonSessionAcrossDaemons("/tmp/default.sock", "019fe37a-18c7-7493-9d0c-d1c4e174b822", {
+				lookup: async (socketPath) => {
+					lookups.push(socketPath);
+					return socketPath === "/tmp/owner.sock" ? summary : undefined;
+				},
+				discoverSocketPaths: async () => ["/tmp/default.sock", "/tmp/owner.sock"],
+			}),
+		).resolves.toEqual({ socketPath: "/tmp/owner.sock", summary });
+		expect(lookups).toEqual(["/tmp/default.sock", "/tmp/owner.sock"]);
+	});
+
+	test("rejects a selector owned by multiple daemon sockets", async () => {
+		const first = makeSessionSummary({ id: "active-1", activeSessionId: "active-1" });
+		const second = makeSessionSummary({ id: "active-2", activeSessionId: "active-2" });
+
+		await expect(
+			findActiveDaemonSessionAcrossDaemons("/tmp/default.sock", "duplicate", {
+				lookup: async (socketPath) => {
+					if (socketPath === "/tmp/default.sock") return undefined;
+					return socketPath.endsWith("one.sock") ? first : second;
+				},
+				discoverSocketPaths: async () => ["/tmp/one.sock", "/tmp/two.sock"],
+			}),
+		).rejects.toThrow('Ambiguous active agent "duplicate" across background services');
 	});
 
 	test("uses an ephemeral local session manager for fresh daemon-owned sessions", () => {

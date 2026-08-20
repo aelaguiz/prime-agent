@@ -30,6 +30,7 @@ const PROTOCOL_VERSION = "5.3";
 // seconds of imports before it binds ports and answers the ready probe.
 const PORTS_RESOLVE_TIMEOUT_MS = 30_000;
 const READY_TIMEOUT_MS = 30_000;
+const KERNEL_SHELL_SEND_TIMEOUT_MS = 5000;
 // Loopback PUB/SUB subscription propagation is usually sub-ms, but keep a small guard before first execute.
 const IOPUB_SUBSCRIBE_DELAY_MS = 50;
 const DEFAULT_MAX_OUTPUT_CHARS = 65536;
@@ -50,6 +51,8 @@ const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
 	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
+const KERNEL_SHELL_UNCERTAIN_OUTCOME_MESSAGE =
+	"The cell may or may not have run; restart the IPython kernel before retrying.";
 
 export class KernelBusyAfterInterruptError extends Error {
 	constructor() {
@@ -420,6 +423,10 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function createKernelShellFailureError(message: string): Error {
+	return new Error(`${message}. ${KERNEL_SHELL_UNCERTAIN_OUTCOME_MESSAGE}`);
+}
+
 function createDeferred<T>(): Deferred<T> {
 	let resolve!: (value: T) => void;
 	let reject!: (error: Error) => void;
@@ -602,6 +609,7 @@ export class KernelManager {
 	private shell?: Dealer;
 	private iopub?: Subscriber;
 	private control?: Dealer;
+	private shellPumpPromise?: Promise<void>;
 	private iopubPumpPromise?: Promise<void>;
 	private controlPumpPromise?: Promise<void>;
 	private readonly pendingControlReplies = new Map<string, (message: JupyterMessage) => void>();
@@ -770,7 +778,7 @@ export class KernelManager {
 			throw e;
 		}
 
-		this.shell = new Dealer();
+		this.shell = new Dealer({ immediate: true, sendTimeout: KERNEL_SHELL_SEND_TIMEOUT_MS });
 		this.iopub = new Subscriber();
 		this.control = new Dealer();
 		this.shell.connect(`${conn.transport}://${conn.ip}:${conn.shell_port}`);
@@ -793,6 +801,8 @@ export class KernelManager {
 		}
 
 		this.state = "running";
+		this.shell.events.on("disconnect", this.handleShellDisconnect);
+		this.startShellPump();
 		this.startForkedLivenessMonitor();
 	}
 
@@ -1039,7 +1049,11 @@ export class KernelManager {
 				this.lastCellCode = code;
 			}
 			try {
-				const sendPromise = this.translateSocketClosure(shell.send(encode(msg, conn.key)));
+				const sendPromise = this.translateSocketClosure(shell.send(encode(msg, conn.key))).catch(
+					(error: unknown) => {
+						throw createKernelShellFailureError(`Kernel shell send failed: ${errorMessage(error)}`);
+					},
+				);
 				sendPromise.catch(() => undefined);
 				await Promise.race([sendPromise, result.promise.then(() => undefined)]);
 				if (this.activeExecution === execution && execution.status !== "aborted") {
@@ -1118,6 +1132,37 @@ export class KernelManager {
 				cleanup();
 			},
 		};
+	}
+
+	private readonly handleShellDisconnect = (): void => {
+		if ((this.state as string) === "shutdown") return;
+		this.appendKernelDiagnostic("shell channel disconnected");
+		this.rejectActiveExecution(
+			createKernelShellFailureError("IPython kernel shell channel disconnected during execution"),
+		);
+	};
+
+	private startShellPump(): void {
+		if (this.shellPumpPromise) return;
+		this.shellPumpPromise = this.runShellPump();
+	}
+
+	private async runShellPump(): Promise<void> {
+		const shell = this.shell;
+		if (!shell) return;
+		try {
+			for await (const _frames of shell) {
+				// IOPub owns execution results, but shell replies must be drained to avoid receive backpressure.
+			}
+		} catch (error) {
+			if ((this.state as string) !== "shutdown") {
+				const message = `Kernel shell channel failed: ${errorMessage(error)}`;
+				this.appendKernelDiagnostic(message);
+				this.rejectActiveExecution(createKernelShellFailureError(message));
+			}
+		} finally {
+			if (this.shell === shell) this.shellPumpPromise = undefined;
+		}
 	}
 
 	private startIopubPump(): void {
@@ -1473,6 +1518,7 @@ export class KernelManager {
 			this.forkedLivenessTimer = undefined;
 		}
 		this.rejectActiveExecution(new Error("Kernel has been shut down"));
+		this.shell?.events?.off("disconnect", this.handleShellDisconnect);
 		this.shell?.close();
 		this.iopub?.close();
 		this.control?.close();
@@ -1480,6 +1526,7 @@ export class KernelManager {
 		this.shell = undefined;
 		this.iopub = undefined;
 		this.control = undefined;
+		this.shellPumpPromise = undefined;
 		this.iopubPumpPromise = undefined;
 		this.controlPumpPromise = undefined;
 		try {
