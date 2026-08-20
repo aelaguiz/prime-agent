@@ -5,12 +5,16 @@
 - Added a GPT-5.6 Sol 1M Codex alias that sends requests to GPT-5.6 Sol while declaring a 1M context window.
 - Added xAI SuperGrok / X Premium device-code OAuth and remapped stored subscription models onto the Responses API, including Grok 4.6.
 - Distinguished Anthropic subscription usage exhaustion from transient rate limits and preserved its retry/reset metadata.
+- Added endpoint binding to MCP OAuth credentials: tokens record the URL they were issued for, and refreshes carry the original binding forward without ever inferring one for unbound legacy credentials.
+
+## [0.7.4] - 2026-08-19
 
 ## [0.7.3] - 2026-08-17
 
 - Added provider-derived reasoning levels for OpenRouter and Prime Inference models, including sparse, mandatory, toggle-only, and explicit-off capabilities.
 - Added Qwen 3.8 Max to the featured Prime Inference catalog ([#1247](https://github.com/PrimeIntellect-ai/prime-agent/pull/1247) by [@eliebak](https://github.com/eliebak)).
 - Refreshed generated provider catalogs, removed retired routes, and aligned provider defaults and cross-provider handoff fixtures with models currently served.
+
 ## [0.7.2] - 2026-08-11
 
 ## [0.7.1] - 2026-08-07

@@ -67,7 +67,7 @@ describe("daemon worker command compatibility", () => {
 	});
 
 	it("lets the merged worker accept both capability-gated commands", () => {
-		const worker = hello(17, ["aim_credential_handoff", "queue_message_mutation"]);
+		const worker = hello(21, ["aim_credential_handoff", "queue_message_mutation"]);
 		expect(() => assertDaemonWorkerCommandCompatibility(worker, handoff)).not.toThrow();
 		expect(() => assertDaemonWorkerCommandCompatibility(worker, queueMutation)).not.toThrow();
 	});
