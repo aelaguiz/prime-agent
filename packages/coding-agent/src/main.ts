@@ -902,6 +902,19 @@ export function selectActiveDaemonSessionSummary(
 	return undefined;
 }
 
+export async function resolveActiveDaemonSessionSummary(
+	selector: string,
+	queries: {
+		getState: () => Promise<SessionSummary | undefined>;
+		list: () => Promise<readonly SessionSummary[]>;
+	},
+): Promise<SessionSummary | undefined> {
+	if (looksLikeSessionPath(selector)) {
+		return selectActiveDaemonSessionSummary(await queries.list(), selector);
+	}
+	return (await queries.getState()) ?? selectActiveDaemonSessionSummary(await queries.list(), selector);
+}
+
 async function findActiveDaemonSessionSummary(
 	socketPath: string,
 	selector: string,
@@ -910,15 +923,20 @@ async function findActiveDaemonSessionSummary(
 	await client.connect(250);
 
 	try {
-		const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
-		if (response.success) {
-			if (!isDaemonSessionSummary(response.data)) {
-				throw new Error("Daemon returned an invalid active session summary");
-			}
-			return response.data;
-		}
-		if (!isUnknownActiveSessionError(response.error)) throw new Error(response.error);
-		return selectActiveDaemonSessionSummary(await listActiveDaemonSessionSummaries(client), selector);
+		return await resolveActiveDaemonSessionSummary(selector, {
+			getState: async () => {
+				const response = await client.request({ type: "get_state", activeSessionId: selector }, 3000);
+				if (response.success) {
+					if (!isDaemonSessionSummary(response.data)) {
+						throw new Error("Daemon returned an invalid active session summary");
+					}
+					return response.data;
+				}
+				if (!isUnknownActiveSessionError(response.error)) throw new Error(response.error);
+				return undefined;
+			},
+			list: () => listActiveDaemonSessionSummaries(client),
+		});
 	} finally {
 		client.close();
 	}

@@ -10,10 +10,12 @@ import {
 	type DaemonInteractiveSessionManagerDecision,
 	daemonServerDefaultSessionConfig,
 	findActiveDaemonSessionAcrossDaemons,
+	findActiveDaemonSessionSummaryForInteractiveStartup,
 	findActiveDaemonSessionSummaryForSessionFile,
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
+	resolveActiveDaemonSessionSummary,
 	resolveRuntimeSessionOptions,
 	selectActiveDaemonSessionSummary,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
@@ -225,6 +227,69 @@ describe("daemon-backed interactive session manager routing", () => {
 				resumeSelector: "active-1",
 			}),
 		).toBe(false);
+	});
+
+	test("falls back to local session lookup when daemon active-session probing fails", async () => {
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "saved-session-id", {
+				lookup: async () => {
+					throw new Error("Daemon returned an invalid active session summary");
+				},
+			}),
+		).resolves.toBeUndefined();
+	});
+
+	test("propagates active-session lookup failures for explicit attach", async () => {
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				fallbackOnError: false,
+				lookup: async () => {
+					throw new Error("protocol mismatch");
+				},
+			}),
+		).rejects.toThrow("protocol mismatch");
+	});
+
+	test("uses daemon active-session summary when probing succeeds", async () => {
+		await expect(
+			findActiveDaemonSessionSummaryForInteractiveStartup("/tmp/prime.sock", "active-1", {
+				lookup: async () => ({
+					id: "active-1",
+					activeSessionId: "active-1",
+					lifecycle: "draft",
+					activity: "idle",
+					isSessionActive: false,
+					sessionId: "session-1",
+					cwd: "/tmp/project",
+					isStreaming: false,
+					isCompacting: false,
+					attachedClients: 0,
+					messageCount: 0,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+				}),
+			}),
+		).resolves.toMatchObject({ activeSessionId: "active-1" });
+	});
+
+	test("resolves a session path from the daemon list without entering the get_state timeout lane", async () => {
+		const sessionFile = "/tmp/project/session.jsonl";
+		const activeSummary = makeSessionSummary({
+			id: "active-1",
+			activeSessionId: "active-1",
+			sessionFile,
+		});
+		let getStateCalled = false;
+
+		await expect(
+			resolveActiveDaemonSessionSummary(sessionFile, {
+				getState: async () => {
+					getStateCalled = true;
+					throw new Error("path selectors must not use get_state");
+				},
+				list: async () => [activeSummary],
+			}),
+		).resolves.toBe(activeSummary);
+		expect(getStateCalled).toBe(false);
 	});
 
 	test.each([
