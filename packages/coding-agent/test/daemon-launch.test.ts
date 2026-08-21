@@ -44,6 +44,7 @@ function send(socket: Socket, message: unknown): void {
 async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDaemon> {
 	const dir = mkdtempSync(join(tmpdir(), "pa-launch-"));
 	const socketPath = join(dir, "d.sock");
+	const detectedRuntime = options.buildId === null ? undefined : getDaemonRuntimeIdentity();
 	const server: Server = createServer((socket) => {
 		socket.on("error", () => undefined);
 		send(socket, {
@@ -52,14 +53,14 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 			protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
 			appVersion: options.appVersion ?? VERSION,
 			schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
-			...(options.buildId === null
-				? {}
-				: {
+			...(detectedRuntime
+				? {
 						runtime: {
-							...getDaemonRuntimeIdentity(),
-							buildId: options.buildId ?? getDaemonRuntimeIdentity().buildId,
+							...detectedRuntime,
+							buildId: options.buildId ?? detectedRuntime.buildId,
 						},
-					}),
+					}
+				: {}),
 			clientId: "fake-client",
 			serverCapabilities: options.serverCapabilities ?? [],
 		});
@@ -260,49 +261,58 @@ describe("ensureInteractiveDaemonRunning", () => {
 
 	it.each([
 		["missing", null],
-		["different", "different-runtime-build"],
-	])("never reuses a daemon with a %s runtime build identity", async (_label, buildId) => {
+		["different source", "source-v1:different-runtime-build"],
+		["different bundle", "bundle-v1:different-runtime-build"],
+	])("reuses a wire-compatible daemon with a %s runtime build identity", async (_label, buildId) => {
 		const daemon = await startFakeDaemon({ buildId });
 		cleanups.push(daemon.close);
 
-		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "stale" });
+		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "current" });
 	});
 
-	it("does not classify or replace a daemon when local runtime identity fails", async () => {
+	it("does not fingerprint local source when the daemon wire contract matches", async () => {
 		const commands: string[] = [];
-		const daemon = await startFakeDaemon({ onCommand: (command) => commands.push(command.type) });
+		const daemon = await startFakeDaemon({
+			buildId: "source-v1:daemon-build",
+			onCommand: (command) => commands.push(command.type),
+		});
 		cleanups.push(daemon.close);
 		const identity = vi.spyOn(daemonRuntimeIdentity, "getDaemonRuntimeIdentity").mockImplementation(() => {
 			throw new Error("local identity unavailable");
 		});
 		try {
-			await expect(probeDaemonVersion(daemon.socketPath)).rejects.toThrow("local identity unavailable");
+			await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "current" });
+			expect(identity).not.toHaveBeenCalled();
 			expect(commands).toEqual([]);
 		} finally {
 			identity.mockRestore();
 		}
 	});
 
-	it("does not replace a build-mismatched daemon with busy private client sessions", async () => {
+	it.each([
+		["source", "source-v1:busy-old-runtime-build"],
+		["bundle", "bundle-v1:busy-old-runtime-build"],
+	])("keeps a busy wire-compatible daemon running across a %s build mismatch", async (_label, buildId) => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
 			protocolVersion: DAEMON_PROTOCOL_VERSION,
 			appVersion: VERSION,
 			schemaId: DAEMON_SCHEMA_ID,
-			buildId: "busy-old-runtime-build",
+			buildId,
 			busyClientOwnedSessionCount: 1,
 			onCommand: (command) => commands.push(command.type),
 		});
 		cleanups.push(daemon.close);
 
-		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("incompatible");
-		expect(commands).toContain("list");
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).resolves.toBeUndefined();
+		expect(commands).not.toContain("list");
 		expect(commands).not.toContain("shutdown");
 	});
 
-	it("shuts down an idle build-mismatched daemon before starting its successor", async () => {
+	it("shuts down an idle version-mismatched daemon before starting its successor", async () => {
 		const commands: string[] = [];
 		const stale = await startFakeDaemon({
+			appVersion: "0.0.0-stale",
 			buildId: "idle-old-runtime-build",
 			sessions: [],
 			onCommand: (command) => commands.push(command.type),

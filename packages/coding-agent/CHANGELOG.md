@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Changed clients to reuse wire-compatible daemons instead of restarting resident sessions for build fingerprint differences.
 - Added durable per-process crash, signal, restart, and kernel lifecycle logs with privacy-reduced diagnostic reports.
 - Fixed Python kernel setup rejecting the managed Python it installed when uv was configured to use only system interpreters.
 - Fixed compromised daemon and session lockfiles terminating their owning processes from asynchronous lock-refresh callbacks.

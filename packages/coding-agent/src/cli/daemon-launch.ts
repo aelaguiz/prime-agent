@@ -67,11 +67,8 @@ type DaemonVersionProbe =
 	| { status: "current"; hello: DaemonHello }
 	| { status: "stale"; hello?: DaemonHello };
 
-/** Connect to a running daemon and check whether its wire contract and runtime build match this client. */
+/** Connect to a running daemon and check whether its wire contract and app version match this client. */
 export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
-	// Local identity errors must fail before a resident daemon is classified or
-	// replaced. The catch below is only for remote connection/hello failures.
-	const clientRuntime = getDaemonRuntimeIdentity();
 	let client: DaemonClient | undefined;
 	for (const timeoutMs of [250, 2000]) {
 		const candidate = new DaemonClient(socketPath);
@@ -91,13 +88,12 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 		const current =
 			hello.protocol.version === DAEMON_PROTOCOL_VERSION &&
 			hello.schemaId === DAEMON_SCHEMA_ID &&
-			hello.appVersion === VERSION &&
-			hello.runtime?.buildId === clientRuntime.buildId;
+			hello.appVersion === VERSION;
 		if (!current) {
 			logDaemonLaunch(
 				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
 					`/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"} vs client ` +
-					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}/build ${clientRuntime.buildId}`,
+					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}`,
 			);
 		}
 		if (current) {
