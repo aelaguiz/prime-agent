@@ -103,6 +103,18 @@ describe("daemon runtime identity", () => {
 		expect(computeBundleBuildId(secondExecutable)).not.toBe(executableBaseline);
 	});
 
+	it("uses the entrypoint's embedded closure identity instead of retained chunks", () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-embedded-bundle-identity-"));
+		cleanups.push(root);
+		const embedded = `bundle-v1:${"a".repeat(64)}`;
+		writeFileSync(join(root, "cli.js"), `// prime-agent-bundle-build-id: ${embedded}\nexport {};\n`);
+		writeFileSync(join(root, "retained-old-chunk.js"), "export const old = 1;\n");
+
+		expect(computeBundleBuildId(root)).toBe(embedded);
+		writeFileSync(join(root, "retained-old-chunk.js"), "export const old = 2;\n");
+		expect(computeBundleBuildId(root)).toBe(embedded);
+	});
+
 	it("resolves an installed entrypoint symlink to its actual bundle closure", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-installed-identity-"));
 		cleanups.push(root);

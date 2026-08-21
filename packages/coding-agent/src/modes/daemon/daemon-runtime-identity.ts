@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isBunBinary } from "../../config.js";
 import type { DaemonRuntimeIdentity } from "./daemon-protocol.js";
+
+declare const __PI_BUILD_ID__: string | undefined;
 
 export const PRIME_AGENT_LAUNCHER_PATH_ENV = "PRIME_AGENT_LAUNCHER_PATH";
 
@@ -90,6 +92,24 @@ function collectBundleJavaScriptFiles(root: string, directory = root, files: str
 	return files;
 }
 
+function readEmbeddedBundleBuildId(bundleRoot: string): string | undefined {
+	const entrypoint = join(bundleRoot, "cli.js");
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(entrypoint, "r");
+		const buffer = Buffer.alloc(4096);
+		const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+		return buffer
+			.subarray(0, bytesRead)
+			.toString("utf8")
+			.match(/^\/\/ prime-agent-bundle-build-id: (bundle-v1:[a-f0-9]{64})$/m)?.[1];
+	} catch {
+		return undefined;
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+	}
+}
+
 /** Fingerprint an executable JavaScript bundle closure or a compiled single-file binary. */
 export function computeBundleBuildId(bundlePath: string): string {
 	const root = resolve(bundlePath);
@@ -100,6 +120,8 @@ export function computeBundleBuildId(bundlePath: string): string {
 			hash.update(readFileSync(root));
 			return `bundle-v1:${hash.digest("hex")}`;
 		}
+		const embeddedBuildId = readEmbeddedBundleBuildId(root);
+		if (embeddedBuildId) return embeddedBuildId;
 		const files = collectBundleJavaScriptFiles(root).sort();
 		if (files.length === 0) {
 			throw new Error("bundle contains no JavaScript files");
@@ -142,9 +164,15 @@ let cachedRuntimeBuildId: string | undefined;
 
 function getRuntimeBuildId(): string {
 	const entrypoint = process.argv[1];
-	cachedRuntimeBuildId ??= isBunBinary
-		? computeBundleBuildId(realpathSync(process.execPath))
-		: computeRuntimeBuildId(entrypoint ?? RUNTIME_MODULE_PATH);
+	const injectedBuildId =
+		typeof __PI_BUILD_ID__ === "string" && /^bundle-v1:[a-f0-9]{64}$/.test(__PI_BUILD_ID__)
+			? __PI_BUILD_ID__
+			: undefined;
+	cachedRuntimeBuildId ??=
+		injectedBuildId ??
+		(isBunBinary
+			? computeBundleBuildId(realpathSync(process.execPath))
+			: computeRuntimeBuildId(entrypoint ?? RUNTIME_MODULE_PATH));
 	return cachedRuntimeBuildId;
 }
 

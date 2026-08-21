@@ -153,9 +153,9 @@ export class DaemonWorkerClient {
 		this.socket = undefined;
 	}
 
-	private async requestWire(command: DaemonWorkerWireCommandBody, timeoutMs: number): Promise<DaemonResponse> {
+	private requestWire(command: DaemonWorkerWireCommandBody, timeoutMs: number): Promise<DaemonResponse> {
 		if (!this.channel || !this.socket || this.socket.destroyed) {
-			throw new Error("Daemon worker client is not connected");
+			return Promise.reject(new Error("Daemon worker client is not connected"));
 		}
 		const id = `worker_${++this.requestId}`;
 		const fullCommand = { ...command, id } as DaemonWorkerWireCommand;
@@ -166,19 +166,19 @@ export class DaemonWorkerClient {
 			}, timeoutMs);
 			this.pending.set(id, { resolve, reject, timeout });
 		});
-		try {
-			await this.channel.send(
+		void this.channel
+			.send(
 				{ kind: "command", requestId: id, commandType: command.type },
 				Buffer.from(serializeJsonLine(fullCommand)),
-			);
-		} catch (error) {
-			const pending = this.pending.get(id);
-			if (pending) {
-				clearTimeout(pending.timeout);
-				this.pending.delete(id);
-				pending.reject(error instanceof Error ? error : new Error(String(error)));
-			}
-		}
+			)
+			.catch((error: unknown) => {
+				const pending = this.pending.get(id);
+				if (pending) {
+					clearTimeout(pending.timeout);
+					this.pending.delete(id);
+					pending.reject(error instanceof Error ? error : new Error(String(error)));
+				}
+			});
 		return response;
 	}
 

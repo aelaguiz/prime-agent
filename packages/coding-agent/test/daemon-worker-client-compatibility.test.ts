@@ -66,6 +66,28 @@ describe("daemon worker command compatibility", () => {
 		expect(requestWire).not.toHaveBeenCalled();
 	});
 
+	it("returns a timed request before a backpressured send settles", async () => {
+		let releaseSend: (() => void) | undefined;
+		const send = vi.fn(
+			() =>
+				new Promise<void>((resolve) => {
+					releaseSend = resolve;
+				}),
+		);
+		const client = new DaemonWorkerClient("/tmp/worker.sock");
+		Object.assign(client, {
+			hello: hello(21, ["aim_credential_handoff", "queue_message_mutation"]),
+			channel: { send },
+			socket: { destroyed: false },
+		});
+
+		const request = client.request({ type: "list" }, 10);
+		await expect(request).rejects.toThrow("Timed out waiting for daemon worker response to list");
+		expect(send).toHaveBeenCalledOnce();
+		expect(releaseSend).toBeTypeOf("function");
+		releaseSend?.();
+	});
+
 	it("lets the merged worker accept both capability-gated commands", () => {
 		const worker = hello(21, ["aim_credential_handoff", "queue_message_mutation"]);
 		expect(() => assertDaemonWorkerCommandCompatibility(worker, handoff)).not.toThrow();

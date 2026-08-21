@@ -7,8 +7,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -137,6 +137,7 @@ import { DaemonClient } from "./daemon-client.js";
 import { filterClientEnv, withClientEnv } from "./daemon-client-env.js";
 import { deserializeDaemonError, serializeDaemonError } from "./daemon-errors.js";
 import { bindActiveSessionState } from "./daemon-extension-binding.js";
+import { tryAcquireDaemonLaunchLease } from "./daemon-launch-lease.js";
 import {
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
@@ -808,52 +809,12 @@ export class AgentDaemon {
 			return;
 		}
 		this.supervisorLaunchInProgress = true;
-		const key = createHash("sha256").update(supervisorSocketPath).digest("hex").slice(0, 12);
-		const lockDirectory = join(dirname(supervisorSocketPath), `.supervisor-launch-${key}.lock`);
-		let ownsLock = false;
+		let launchLease: ReturnType<typeof tryAcquireDaemonLaunchLease>;
 		let recoveryChildProcessInstanceId: string | undefined;
 		let recoveryChildPid: number | undefined;
 		try {
-			for (let attempt = 0; attempt < 3 && !ownsLock; attempt++) {
-				const token = randomUUID();
-				const candidateDirectory = `${lockDirectory}.candidate-${process.pid}-${token}`;
-				mkdirSync(candidateDirectory, { mode: 0o700 });
-				writeFileSync(join(candidateDirectory, "pid"), `${process.pid}\n`, {
-					mode: 0o600,
-				});
-				try {
-					renameSync(candidateDirectory, lockDirectory);
-					ownsLock = true;
-					break;
-				} catch (error) {
-					rmSync(candidateDirectory, { recursive: true, force: true });
-					const code = (error as NodeJS.ErrnoException).code;
-					if (code !== "EEXIST" && code !== "ENOTEMPTY") {
-						throw error;
-					}
-					let ownerPid: number | undefined;
-					try {
-						ownerPid = Number(readFileSync(join(lockDirectory, "pid"), "utf8").trim());
-					} catch {
-						// An invalid owner is reclaimed atomically below.
-					}
-					if (ownerPid && this.isProcessAlive(ownerPid)) {
-						return;
-					}
-					const staleDirectory = `${lockDirectory}.stale-${process.pid}-${token}`;
-					try {
-						renameSync(lockDirectory, staleDirectory);
-						rmSync(staleDirectory, { recursive: true, force: true });
-					} catch (reclaimError) {
-						if ((reclaimError as NodeJS.ErrnoException).code !== "ENOENT") {
-							throw reclaimError;
-						}
-					}
-				}
-			}
-			if (!ownsLock) {
-				return;
-			}
+			launchLease = tryAcquireDaemonLaunchLease(supervisorSocketPath);
+			if (!launchLease) return;
 			if (await this.canConnectToSupervisor(supervisorSocketPath)) {
 				return;
 			}
@@ -975,19 +936,8 @@ export class AgentDaemon {
 			}
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);
 		} finally {
-			if (ownsLock) {
-				rmSync(lockDirectory, { recursive: true, force: true });
-			}
+			launchLease?.release();
 			this.supervisorLaunchInProgress = false;
-		}
-	}
-
-	private isProcessAlive(pid: number): boolean {
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as NodeJS.ErrnoException).code === "EPERM";
 		}
 	}
 

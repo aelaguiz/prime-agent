@@ -13,6 +13,7 @@ import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
 import { prepareProcessLifecycleLaunch, recordProcessLifecycle } from "../core/process-lifecycle.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
+import { tryAcquireDaemonLaunchLease } from "../modes/daemon/daemon-launch-lease.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
@@ -28,8 +29,8 @@ import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } fro
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "./subprocess-launch.js";
 
 const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
-const DAEMON_STARTUP_LOG_TAIL_BYTES = 4 * 1024;
 const DAEMON_STARTUP_EXIT_GRACE_MS = 2_000;
+const DAEMON_STARTUP_LOG_TAIL_BYTES = 4 * 1024;
 
 export function isDaemonSessionSummary(value: unknown): value is SessionSummary {
 	if (!value || typeof value !== "object") {
@@ -65,7 +66,8 @@ async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promis
 type DaemonVersionProbe =
 	| { status: "absent" }
 	| { status: "current"; hello: DaemonHello }
-	| { status: "stale"; hello?: DaemonHello };
+	| { status: "stale"; hello: DaemonHello }
+	| { status: "unavailable"; error: Error };
 
 /** Connect to a running daemon and check whether its wire contract and app version match this client. */
 export async function probeDaemonVersion(socketPath: string): Promise<DaemonVersionProbe> {
@@ -100,10 +102,10 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 			return { status: "current", hello };
 		}
 		return { status: "stale", hello };
-	} catch {
-		// Connected but no recognizable greeting: assume a stale daemon.
-		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; treating as stale`);
-		return { status: "stale" };
+	} catch (error) {
+		const handshakeError = error instanceof Error ? error : new Error(String(error));
+		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; leaving it untouched`);
+		return { status: "unavailable", error: handshakeError };
 	} finally {
 		client.close();
 	}
@@ -145,6 +147,21 @@ async function queryActiveDaemonSessions(
 		throw new Error("Daemon returned an invalid client-owned session count");
 	}
 	return { sessions, busyClientOwnedSessionCount: busyClientOwnedSessionCount ?? 0 };
+}
+
+/** Thrown when a reachable daemon never completes its handshake. */
+export class DaemonHandshakeUnavailableError extends Error {
+	constructor(
+		readonly socketPath: string,
+		cause?: Error,
+	) {
+		super(
+			`A Prime Agent daemon is reachable but did not become ready. ${cause?.message ?? "The daemon handshake timed out."} ` +
+				`Socket: ${socketPath}. Daemon log: ${getDaemonLogPath(socketPath)}.`,
+			{ cause },
+		);
+		this.name = "DaemonHandshakeUnavailableError";
+	}
 }
 
 /** Thrown when a stale-version daemon can't be replaced. The message is user-facing. */
@@ -339,10 +356,19 @@ async function shutdownStaleDaemonIfNotBusy(socketPath: string): Promise<boolean
 	return shutdownDaemonAndWait(socketPath);
 }
 
-async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
-	const probe = await probeDaemonVersion(socketPath);
-	if (probe.status === "current") {
-		return;
+async function ensureDaemonRunningAsLeader(
+	socketPath: string,
+	spawnCwd: string | undefined,
+	deadline: number,
+): Promise<void> {
+	let probe = await probeDaemonVersion(socketPath);
+	while (probe.status === "unavailable" && Date.now() < deadline) {
+		await delay(100);
+		probe = await probeDaemonVersion(socketPath);
+	}
+	if (probe.status === "current") return;
+	if (probe.status === "unavailable") {
+		throw new DaemonHandshakeUnavailableError(socketPath, probe.error);
 	}
 	if (probe.status === "stale") {
 		const stopped = await shutdownStaleDaemonIfNotBusy(socketPath);
@@ -462,10 +488,8 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 		);
 	};
 
-	// A child exit is not immediately fatal: it may have lost the socket to a
-	// concurrent launcher whose daemon is still booting. Keep probing for a
-	// short grace window before attributing the failure to the exit.
-	const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
+	// A child exit is not immediately fatal: it may have lost the socket to an
+	// older launcher that does not participate in the shared launch lease.
 	let exitDeadline: number | undefined;
 	while (Date.now() < Math.min(deadline, exitDeadline ?? Number.POSITIVE_INFINITY)) {
 		const started = await probeDaemonVersion(socketPath);
@@ -479,9 +503,7 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 			});
 			return;
 		}
-		if (childFailure) {
-			exitDeadline ??= Date.now() + DAEMON_STARTUP_EXIT_GRACE_MS;
-		}
+		if (childFailure) exitDeadline ??= Date.now() + DAEMON_STARTUP_EXIT_GRACE_MS;
 		await delay(25);
 	}
 
@@ -496,6 +518,34 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	throw new Error(
 		`Timed out waiting for daemon to start on ${socketPath}.${readDaemonLogTail(socketPath, logOffset)}`,
 	);
+}
+
+async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
+	const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
+	let lastProbe = await probeDaemonVersion(socketPath);
+	if (lastProbe.status === "current") return;
+
+	while (Date.now() < deadline) {
+		const lease = tryAcquireDaemonLaunchLease(socketPath);
+		if (lease) {
+			try {
+				return await ensureDaemonRunningAsLeader(socketPath, spawnCwd, deadline);
+			} finally {
+				lease.release();
+			}
+		}
+		await delay(250);
+		lastProbe = await probeDaemonVersion(socketPath);
+		if (lastProbe.status === "current") return;
+	}
+
+	if (lastProbe.status === "unavailable") {
+		throw new DaemonHandshakeUnavailableError(socketPath, lastProbe.error);
+	}
+	if (lastProbe.status === "stale") {
+		throw new StaleDaemonError(socketPath, lastProbe.hello);
+	}
+	throw new Error(`Timed out waiting for the elected Prime Agent daemon launcher on ${socketPath}.`);
 }
 
 function currentDaemonLogSize(socketPath: string): number {

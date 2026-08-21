@@ -228,7 +228,7 @@ The credential protocol is exactly `aimgr-credential-v1`. Persisted descriptors 
 
 ```text
 CLI/runtime build identity
-  -> daemon launch compatibility gate (protocol + schema + app version + build)
+  -> daemon launch compatibility gate (protocol + schema ID + app version; build is diagnostic)
   -> supervisor owns worker registrations and root-tree routing
   -> workers own AgentSession runtimes and kernels
   -> JSONL session journals remain durable truth
@@ -327,7 +327,7 @@ Keep AIM command minimum schema 15 **plus** required `aim_credential_handoff`; k
 Compose, do not choose between, these invariants:
 
 - missing worker runtime identity fails before authentication;
-- exact runtime identity protects CLI/daemon reuse; rolling worker adoption may tolerate a different build ID only where the existing design explicitly permits it;
+- protocol, schema ID, and app version protect CLI/daemon reuse; exact runtime identity remains diagnostic, and rolling worker adoption accepts wire-compatible build differences;
 - identity rejection never kills or relaunches a live worker;
 - upstream stop tombstones, stop counters, background finalizers, PID/start-generation checks, root-kill ownership, and `stopping`/`recovering` reporting remain authoritative;
 - stale worker registration reclaim runs during resume before declaring a session blocked;
@@ -410,7 +410,7 @@ Every row is a blocking acceptance requirement. “Preserved” means exercised 
 
 ### 5.6 Daemon/kernel invariants
 
-- [ ] Exact source/bundle build identity and launcher identity prevent unsafe stale-daemon reuse while preserving intentional rolling-worker adoption.
+- [ ] Protocol version, schema ID, app version, and command capabilities govern daemon admission; source/bundle build and launcher identities remain diagnostic while intentional rolling-worker adoption stays wire-safe.
 - [ ] Queue edit/preservation, restored resume, truthful stopping/recovering states, stale-registration reclaim, root-kill ownership, and durable RLM ledger all pass together with AIM handoff.
 - [ ] Daemon reap remains tombstone/canonical-path/dead-worker safe; snapshot transfer IDs remain unique/idempotent.
 - [ ] Null assistant content renders without a crash.
@@ -435,7 +435,7 @@ The implementer must mark each row reviewed against the final merge diff. This i
 | Live model rebind | `agent-session.ts`, in-process connection, daemon mode, interactive mode | managed provider changes | Catalog refresh before state refresh |
 | Hidden handoff CLI | `public-command.ts`, `daemon-command.ts`, protocol/mode/supervisor | `prime.js` resume/rotate | Private JSON bridge |
 | Daemon schema/capability | protocol, client, worker protocol, supervisor forwarding | installed old clients/workers | Revision 17 + capability gates |
-| Runtime identity | `daemon-runtime-identity.ts`, launch, supervisor, shell launcher | AIM configured launcher/wrappers | Exact bundle/client fence |
+| Runtime identity | `daemon-runtime-identity.ts`, launch, supervisor, shell launcher | AIM configured launcher/wrappers | Closure-scoped diagnostic build identity; wire contract fences reuse |
 | Worker recovery | supervisor, child-process utilities, ps/orphan journal | AIM exact-session resume | Upstream lifecycle authority |
 | RLM mutation | `rlm-ledger.ts`, daemon mode/supervisor, ACP APIs | agent/extension consumers | Supervisor ledger authority |
 | Queue/resume | agent session, daemon mode, interactive mode, public CLI | AIM resume path | Upstream UX + pinned auth |
@@ -1015,7 +1015,7 @@ Never delete the prior artifact in the same transaction that activates the candi
 | Anthropic terminal exhaustion regresses into multi-day SDK wait | Medium | High | AIM-only `maxRetries:0` tests + controlled under-5-second canary |
 | Peer-sync patch weakens required ordering | High if raw-applied | High | Preserve upstream awaits; coalescing + publication-order regression |
 | Dirty generated catalog contaminates merge | High | Medium | Clean worktree, generator-only regeneration, provenance review |
-| New `0.7.2` client collides with old custom `0.7.2` | Medium | High | Exact build ID and launcher identity; no version-only compatibility |
+| New `0.7.2` client collides with old custom `0.7.2` | Medium | High | Protocol + schema ID + app-version admission and command capability gates; build/launcher identity in diagnostics |
 | Busy-host install strands sessions | Medium | Critical | Per-host inventory/go; update coordinator; exact resume; retained rollback |
 | AIM routine/extension consumer breaks silently | Medium | Medium | Targeted AIM extension/routine compatibility tests and Mac Studio canary |
 | Redis outage is mistaken for provider exhaustion | Low | High | Prime never queries Redis; helper bounded/fail-closed; structured signatures |
@@ -1033,7 +1033,7 @@ Never delete the prior artifact in the same transaction that activates the candi
 | Upstream ref | Pin `97b994c3d` | Moving `upstream/main` makes proof non-repeatable |
 | Fork source | `00efe79dc` three-commit lineage | Divergent older `origin/main` can reintroduce obsolete broker/xAI behavior |
 | Daemon schema | Compose into rev 17 with both caps | Choosing fork rev 15 or upstream rev 16 deletes behavior |
-| Compatibility | Capability + minimum revision + exact build identity | Version-only or schema-number-only checks are ambiguous |
+| Compatibility | Protocol + schema ID + app version, with per-command capability/minimum-revision gates; build identity is diagnostic | Version-only checks are ambiguous; exact build matching needlessly replaces wire-compatible live daemons |
 | xAI AIM gap | Close end to end, including manual rotate | Partial Prime allowlist or misleading AIM help leaves a broken contract |
 | xAI catalog | One subscription transform for native/AIM | Duplicate model table or generated-file hand patch will drift |
 | Automatic failover | Codex-only existing one shot | Claude/Grok auto-rotation is unproven scope expansion |

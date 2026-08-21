@@ -914,6 +914,40 @@ describe("DaemonClient", () => {
 		await expect(response).resolves.toMatchObject({ id: firstEnvelope.id, success: true });
 		client.close();
 	});
+
+	it("keeps reconnecting when a reachable replacement delays its hello", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const firstConnect = client.connect();
+		const firstSocket = netMock.sockets[0]!;
+		firstSocket.emit("connect");
+		await firstConnect;
+		emitHello(firstSocket);
+
+		const statuses: string[] = [];
+		const recoverDaemon = vi.fn(async () => undefined);
+		client.enableAutoReconnect({
+			recoverDaemon,
+			onStatus: (status) => statuses.push(status.status),
+		});
+		firstSocket.emit("close");
+		await vi.advanceTimersByTimeAsync(0);
+
+		const noHelloSocket = netMock.sockets[1]!;
+		noHelloSocket.emit("connect");
+		await vi.advanceTimersByTimeAsync(3_100);
+		await vi.advanceTimersByTimeAsync(100);
+
+		const readySocket = netMock.sockets[2]!;
+		readySocket.emit("connect");
+		await vi.advanceTimersByTimeAsync(0);
+		emitHello(readySocket);
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(statuses).toEqual(["reconnecting", "connected"]);
+		expect(recoverDaemon).toHaveBeenCalledTimes(2);
+		client.close();
+	});
 });
 
 async function captureRejection(promise: Promise<void>): Promise<Error> {

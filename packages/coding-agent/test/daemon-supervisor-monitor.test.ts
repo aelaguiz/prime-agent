@@ -3581,6 +3581,49 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
 	});
 
+	it("routes startup worker connections through the bounded adoption semaphore", async () => {
+		const run = vi.fn(async () => {
+			throw new Error("startup connection was gated");
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			startupWorkerConnectionSemaphore: { run },
+		}) as {
+			connectWorker(worker: { descriptor: { socketPath: string } }, timeoutMs: number): Promise<unknown>;
+		};
+
+		await expect(supervisor.connectWorker({ descriptor: { socketPath: "/tmp/worker.sock" } }, 100)).rejects.toThrow(
+			"startup connection was gated",
+		);
+		expect(run).toHaveBeenCalledOnce();
+	});
+
+	it("reports a known descriptor as recovering instead of an unknown session", async () => {
+		const activeSessionId = "recovering-root-active";
+		const worker = {
+			descriptor: {
+				workerId: "recovering-worker",
+				rootActiveSessionId: activeSessionId,
+				rootSessionId: "recovering-root-session",
+				lifecycle: "recovering",
+				pid: 1234,
+				createCommand: { type: "create", config: {} },
+			},
+			summaries: new Map(),
+		};
+		const client = { id: "client-1" };
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			protocolClientIds: new WeakMap(),
+			refreshWorkerSummaries: vi.fn(async () => undefined),
+		}) as {
+			findWorkerForClient(findClient: typeof client, selector: string): Promise<unknown>;
+		};
+
+		await expect(supervisor.findWorkerForClient(client, activeSessionId)).rejects.toThrow(
+			"Session worker is recovering",
+		);
+	});
+
 	it("does not reveal an owned session's telemetry policy to another client", async () => {
 		const activeSessionId = "private-owned-active";
 		const worker = {

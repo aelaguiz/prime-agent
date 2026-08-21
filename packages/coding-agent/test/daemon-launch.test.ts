@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -12,6 +12,11 @@ import {
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
 import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
+import {
+	daemonLaunchLeaseDirectory,
+	isDaemonLaunchLeaseContentionError,
+	tryAcquireDaemonLaunchLease,
+} from "../src/modes/daemon/daemon-launch-lease.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import * as daemonRuntimeIdentity from "../src/modes/daemon/daemon-runtime-identity.js";
 import { getDaemonRuntimeIdentity } from "../src/modes/daemon/daemon-runtime-identity.js";
@@ -29,6 +34,7 @@ interface FakeDaemonOptions {
 	schemaId?: string;
 	buildId?: string | null;
 	serverCapabilities?: string[];
+	sendHello?: boolean;
 	onCommand?: (command: { type: string }) => void;
 }
 
@@ -47,23 +53,25 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 	const detectedRuntime = options.buildId === null ? undefined : getDaemonRuntimeIdentity();
 	const server: Server = createServer((socket) => {
 		socket.on("error", () => undefined);
-		send(socket, {
-			type: "daemon_hello",
-			socketPath,
-			protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
-			appVersion: options.appVersion ?? VERSION,
-			schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
-			...(detectedRuntime
-				? {
-						runtime: {
-							...detectedRuntime,
-							buildId: options.buildId ?? detectedRuntime.buildId,
-						},
-					}
-				: {}),
-			clientId: "fake-client",
-			serverCapabilities: options.serverCapabilities ?? [],
-		});
+		if (options.sendHello !== false) {
+			send(socket, {
+				type: "daemon_hello",
+				socketPath,
+				protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
+				appVersion: options.appVersion ?? VERSION,
+				schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
+				...(detectedRuntime
+					? {
+							runtime: {
+								...detectedRuntime,
+								buildId: options.buildId ?? detectedRuntime.buildId,
+							},
+						}
+					: {}),
+				clientId: "fake-client",
+				serverCapabilities: options.serverCapabilities ?? [],
+			});
+		}
 		let buffer = "";
 		socket.on("data", (chunk) => {
 			buffer += chunk.toString();
@@ -268,6 +276,82 @@ describe("ensureInteractiveDaemonRunning", () => {
 		cleanups.push(daemon.close);
 
 		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "current" });
+	});
+
+	it("keeps a reachable no-hello endpoint out of the stale-daemon path", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			sendHello: false,
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+
+		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "unavailable" });
+		expect(commands).toEqual([]);
+	});
+
+	it("serializes daemon launch leadership for one socket", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-lease-"));
+		const socketPath = join(dir, "d.sock");
+		try {
+			const leader = tryAcquireDaemonLaunchLease(socketPath);
+			expect(leader).toBeDefined();
+			expect(tryAcquireDaemonLaunchLease(socketPath)).toBeUndefined();
+			leader?.release();
+			const successor = tryAcquireDaemonLaunchLease(socketPath);
+			expect(successor).toBeDefined();
+			successor?.release();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("treats Windows access-denied rename as contention only for a valid matching lease", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-contention-"));
+		const socketPath = join(dir, "d.sock");
+		try {
+			const leader = tryAcquireDaemonLaunchLease(socketPath);
+			expect(leader).toBeDefined();
+			const leaseDirectory = daemonLaunchLeaseDirectory(socketPath);
+			const accessDenied = Object.assign(new Error("access denied"), { code: "EACCES" });
+			const operationNotPermitted = Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+			expect(isDaemonLaunchLeaseContentionError(accessDenied, leaseDirectory, socketPath)).toBe(true);
+			expect(isDaemonLaunchLeaseContentionError(operationNotPermitted, leaseDirectory, socketPath)).toBe(true);
+			expect(isDaemonLaunchLeaseContentionError(accessDenied, leaseDirectory, `${socketPath}.other`)).toBe(false);
+			expect(isDaemonLaunchLeaseContentionError(accessDenied, join(dir, "missing.lock"), socketPath)).toBe(false);
+			expect(
+				isDaemonLaunchLeaseContentionError(
+					Object.assign(new Error("I/O error"), { code: "EIO" }),
+					leaseDirectory,
+					socketPath,
+				),
+			).toBe(false);
+			leader?.release();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("allows lease reclamation when directory release is blocked", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-release-"));
+		const socketPath = join(dir, "d.sock");
+		try {
+			const leader = tryAcquireDaemonLaunchLease(socketPath);
+			expect(leader).toBeDefined();
+			const leaseDirectory = daemonLaunchLeaseDirectory(socketPath);
+			const record = JSON.parse(readFileSync(join(leaseDirectory, "lease.json"), "utf8")) as { token: string };
+			const blockedRelease = `${leaseDirectory}.released-${process.pid}-${record.token}`;
+			mkdirSync(blockedRelease, { recursive: true });
+			writeFileSync(join(blockedRelease, "occupied"), "occupied\n");
+
+			leader?.release();
+			expect(readFileSync(join(leaseDirectory, "released"), "utf8").trim()).toBe(record.token);
+			const successor = tryAcquireDaemonLaunchLease(socketPath);
+			expect(successor).toBeDefined();
+			successor?.release();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("does not fingerprint local source when the daemon wire contract matches", async () => {

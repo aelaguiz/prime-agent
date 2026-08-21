@@ -56,6 +56,7 @@ import { canonicalSessionPath, getProcessStartId, SessionAlreadyActiveError } fr
 import { getSessionArtifactPathForFile, readSessionInfo, type SessionInfo } from "../../core/session-manager.js";
 import { SettingsManager } from "../../core/settings-manager.js";
 import { isProcessAlive, processIdExists, signalProcessGroupOrProcess } from "../../utils/child-process.js";
+import { Semaphore } from "../../utils/semaphore.js";
 import type { AgentConnectionHeartbeat } from "../agent-connection/types.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../rpc/jsonl.js";
 import type { PrivateFrame } from "../session-worker/private-framing.js";
@@ -144,6 +145,8 @@ type DaemonCommandBody = DistributiveOmit<DaemonCommand, "id">;
 
 const structuredLog = getLogger("coding-agent.daemon-supervisor");
 const WORKER_CONNECT_TIMEOUT_MS = 30_000;
+// Bound only startup connection/authentication pressure; each worker keeps its existing recovery policy.
+const STARTUP_WORKER_CONNECTION_CONCURRENCY = 8;
 const WORKER_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 const INPUT_PAUSE_CLEANUP_TIMEOUT_MS = 5_000;
 const UPDATE_RESTART_MUTATION_DRAIN_TIMEOUT_MS = 80_000;
@@ -654,6 +657,7 @@ export class DaemonSupervisor {
 	private readonly detachingInputPauseSessions = new WeakMap<DaemonSocketClient, Set<string>>();
 	private readonly protocolClientIds = new WeakMap<DaemonSocketClient, string>();
 	private readonly workers = new Map<string, ResidentWorker>();
+	private startupWorkerConnectionSemaphore?: Semaphore;
 	private workerStopCounts?: Map<ResidentWorker, number>;
 	private readonly openingWorkers = new Map<string, Promise<ResidentWorker>>();
 	/** Public admission ids are scoped to the socket that registered them. */
@@ -754,18 +758,23 @@ export class DaemonSupervisor {
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
-			await Promise.all(
-				workersToAdopt.map(async (worker) => {
-					try {
-						await this.adoptOrRecoverWorker(worker);
-					} catch (error) {
-						if (!adoptionFailed) {
-							adoptionFailed = true;
-							adoptionFailure = error;
+			this.startupWorkerConnectionSemaphore = new Semaphore(STARTUP_WORKER_CONNECTION_CONCURRENCY);
+			try {
+				await Promise.all(
+					workersToAdopt.map(async (worker) => {
+						try {
+							await this.adoptOrRecoverWorker(worker);
+						} catch (error) {
+							if (!adoptionFailed) {
+								adoptionFailed = true;
+								adoptionFailure = error;
+							}
 						}
-					}
-				}),
-			);
+					}),
+				);
+			} finally {
+				this.startupWorkerConnectionSemaphore = undefined;
+			}
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
@@ -2790,36 +2799,39 @@ export class DaemonSupervisor {
 	}
 
 	private async connectWorker(worker: ResidentWorker, timeoutMs: number): Promise<DaemonWorkerClient> {
-		const deadline = Date.now() + timeoutMs;
-		let lastError: unknown;
-		while (Date.now() < deadline) {
-			await this.assertRecoveryAllowed();
-			const client = new DaemonWorkerClient(worker.descriptor.socketPath);
-			try {
-				await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
-				const hello = await client.waitForHello(1000);
-				assertDaemonWorkerRuntimeIdentity(hello.runtime);
-				await client.authenticateWorker(
-					worker.descriptor.authenticationToken,
-					this.supervisorAuthenticationClaim(),
-					1000,
-				);
+		const connect = async (): Promise<DaemonWorkerClient> => {
+			const deadline = Date.now() + timeoutMs;
+			let lastError: unknown;
+			while (Date.now() < deadline) {
 				await this.assertRecoveryAllowed();
-				client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
-				client.onClose((error) => void this.handleWorkerClose(worker, client, error));
-				worker.client?.close();
-				worker.client = client;
-				return client;
-			} catch (error) {
-				lastError = error;
-				client.close();
-				if (isSupervisorRecoveryCancelled(error) || error instanceof DaemonWorkerRuntimeIdentityError) {
-					throw error;
+				const client = new DaemonWorkerClient(worker.descriptor.socketPath);
+				try {
+					await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
+					const hello = await client.waitForHello(1000);
+					assertDaemonWorkerRuntimeIdentity(hello.runtime);
+					await client.authenticateWorker(
+						worker.descriptor.authenticationToken,
+						this.supervisorAuthenticationClaim(),
+						1000,
+					);
+					await this.assertRecoveryAllowed();
+					client.onFrame((frame) => this.handleWorkerFrame(worker, frame));
+					client.onClose((error) => void this.handleWorkerClose(worker, client, error));
+					worker.client?.close();
+					worker.client = client;
+					return client;
+				} catch (error) {
+					lastError = error;
+					client.close();
+					if (isSupervisorRecoveryCancelled(error) || error instanceof DaemonWorkerRuntimeIdentityError) {
+						throw error;
+					}
+					await delay(25);
 				}
-				await delay(25);
 			}
-		}
-		throw new Error(`Timed out connecting to daemon session worker: ${String(lastError)}`);
+			throw new Error(`Timed out connecting to daemon session worker: ${String(lastError)}`);
+		};
+		return this.startupWorkerConnectionSemaphore ? this.startupWorkerConnectionSemaphore.run(connect) : connect();
 	}
 
 	private async subscribeWorker(worker: ResidentWorker, activeSessionId: string): Promise<void> {
@@ -3931,6 +3943,23 @@ export class DaemonSupervisor {
 			return matches[0]!;
 		}
 		if (matches.length > 1) {
+			throw new Error(`Ambiguous active session "${selector}"`);
+		}
+		const knownWorkers = [...this.workers.values()].filter((worker) => {
+			if (includeWorker && !includeWorker(worker)) return false;
+			const rootActiveSessionId = worker.descriptor.rootActiveSessionId;
+			const rootSessionId = worker.descriptor.rootSessionId;
+			return (
+				rootActiveSessionId === selector ||
+				rootSessionId === selector ||
+				matchesSessionIdSuffix(rootActiveSessionId, selector) ||
+				(rootSessionId !== undefined && matchesSessionIdSuffix(rootSessionId, selector))
+			);
+		});
+		if (knownWorkers.length === 1) {
+			throw new Error(`Session worker is ${this.effectiveWorkerState(knownWorkers[0]!)}`);
+		}
+		if (knownWorkers.length > 1) {
 			throw new Error(`Ambiguous active session "${selector}"`);
 		}
 		throw new Error(`Unknown active session: ${selector}`);
