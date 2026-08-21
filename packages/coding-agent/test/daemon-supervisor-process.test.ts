@@ -110,6 +110,29 @@ function spawnSupervisor(
 	return child;
 }
 
+function lifecycleProcessRole(record: Record<string, unknown>): unknown {
+	return record.context && typeof record.context === "object"
+		? (record.context as Record<string, unknown>).role
+		: undefined;
+}
+
+function readProcessLifecycleRecords(agentDir: string): Array<Record<string, unknown>> {
+	const directory = join(agentDir, "logs", "processes");
+	try {
+		return readdirSync(directory)
+			.filter((name) => name.endsWith(".jsonl"))
+			.flatMap((name) =>
+				readFileSync(join(directory, name), "utf8")
+					.trim()
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line) as Record<string, unknown>),
+			);
+	} catch {
+		return [];
+	}
+}
+
 function readDaemonLogs(agentDir: string): string {
 	const logsDir = join(agentDir, "logs");
 	try {
@@ -796,6 +819,27 @@ describe("daemon supervisor resident workers", () => {
 		const listed = await client.request({ type: "list" });
 		expect(listed.success).toBe(true);
 		expect(requireSessionList(listed.success ? listed.data : undefined)).toEqual([]);
+		await waitForCondition(
+			() => readProcessLifecycleRecords(agentDir).some((record) => record.event === "daemon_worker_spawn_error"),
+			"Worker spawn error was not persisted",
+		);
+		const lifecycle = readProcessLifecycleRecords(agentDir);
+		const spawnError = lifecycle.find((record) => record.event === "daemon_worker_spawn_error");
+		const childProcessInstanceId = (spawnError?.details as { childProcessInstanceId?: string } | undefined)
+			?.childProcessInstanceId;
+		expect(childProcessInstanceId).toEqual(expect.any(String));
+		expect(lifecycle).toContainEqual(
+			expect.objectContaining({
+				event: "daemon_worker_launch_result",
+				details: expect.objectContaining({ childProcessInstanceId, status: "spawn_error" }),
+			}),
+		);
+		expect(lifecycle).not.toContainEqual(
+			expect.objectContaining({
+				event: "daemon_worker_launch",
+				details: expect.objectContaining({ childProcessInstanceId, phase: "spawned" }),
+			}),
+		);
 
 		await client.request({ type: "shutdown" });
 		client.close();
@@ -1158,6 +1202,59 @@ describe("daemon supervisor resident workers", () => {
 		expect(
 			new Set(requireSessionList(adopted.success ? adopted.data : undefined).map((summary) => summary.workerPid)),
 		).toEqual(new Set(pids));
+		await waitForCondition(
+			() =>
+				readProcessLifecycleRecords(agentDir).filter(
+					(record) => record.event === "process_start" && lifecycleProcessRole(record) === "daemon-supervisor",
+				).length >= 2,
+			"Replacement supervisor lifecycle start was not persisted",
+		);
+		const lifecycle = readProcessLifecycleRecords(agentDir);
+		const supervisorStarts = lifecycle
+			.filter((record) => record.event === "process_start" && lifecycleProcessRole(record) === "daemon-supervisor")
+			.sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)));
+		const firstStart = supervisorStarts[0];
+		const replacementStart = supervisorStarts.find(
+			(record) => record.processInstanceId !== firstStart?.processInstanceId,
+		);
+		const workerStarts = lifecycle.filter(
+			(record) => record.event === "process_start" && lifecycleProcessRole(record) === "daemon-worker",
+		);
+		const recoveryOwner = workerStarts.find(
+			(record) => record.processInstanceId === replacementStart?.parentProcessInstanceId,
+		);
+		expect(recoveryOwner?.parentProcessInstanceId).toBe(firstStart?.processInstanceId);
+		expect(lifecycle).toContainEqual(
+			expect.objectContaining({
+				event: "daemon_supervisor_recovery_attempt",
+				processInstanceId: recoveryOwner?.processInstanceId,
+				details: expect.objectContaining({ childProcessInstanceId: replacementStart?.processInstanceId }),
+			}),
+		);
+		expect(lifecycle).toContainEqual(
+			expect.objectContaining({
+				event: "daemon_supervisor_recovery_result",
+				processInstanceId: recoveryOwner?.processInstanceId,
+				details: expect.objectContaining({
+					childProcessInstanceId: replacementStart?.processInstanceId,
+					status: "ready",
+				}),
+			}),
+		);
+		expect(lifecycle).toContainEqual(
+			expect.objectContaining({
+				event: "process_completed",
+				processInstanceId: firstStart?.processInstanceId,
+			}),
+		);
+		expect(workerStarts).toHaveLength(2);
+		expect(
+			lifecycle.filter(
+				(record) =>
+					record.event === "daemon_worker_recovery_result" &&
+					(record.details as { status?: string } | undefined)?.status === "adopted",
+			),
+		).toHaveLength(2);
 		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();
 		await waitForSocketGone(socketPath);
@@ -1484,6 +1581,41 @@ describe("daemon supervisor resident workers", () => {
 		const recovered = requireSummary(reopened.data);
 		if (!recovered.workerPid) throw new Error("Recovered worker did not expose its pid");
 		workerPids.add(recovered.workerPid);
+		const lifecycleAfterRecovery = readProcessLifecycleRecords(agentDir);
+		const killedWorkerClose = lifecycleAfterRecovery.find(
+			(record) =>
+				record.event === "daemon_worker_connection_close" &&
+				(record.details as { childPid?: number } | undefined)?.childPid === createdSummary.workerPid,
+		);
+		expect(killedWorkerClose).toEqual(
+			expect.objectContaining({
+				details: expect.objectContaining({ intentional: false }),
+			}),
+		);
+		const killedWorkerDetails = killedWorkerClose?.details as
+			| { childProcessInstanceId?: string; workerId?: string }
+			| undefined;
+		const replacementWorkerLaunch = lifecycleAfterRecovery.find(
+			(record) =>
+				record.event === "daemon_worker_launch" &&
+				(record.details as { childPid?: number; phase?: string } | undefined)?.childPid === recovered.workerPid &&
+				(record.details as { phase?: string } | undefined)?.phase === "spawned",
+		);
+		const replacementWorkerDetails = replacementWorkerLaunch?.details as
+			| { childProcessInstanceId?: string; workerId?: string }
+			| undefined;
+		expect(replacementWorkerDetails?.workerId).toEqual(expect.any(String));
+		expect(replacementWorkerDetails?.childProcessInstanceId).not.toBe(killedWorkerDetails?.childProcessInstanceId);
+		expect(lifecycleAfterRecovery).toContainEqual(
+			expect.objectContaining({
+				event: "daemon_worker_launch_result",
+				details: expect.objectContaining({
+					childProcessInstanceId: replacementWorkerDetails?.childProcessInstanceId,
+					sessionId: createdSummary.sessionId,
+					status: "ready",
+				}),
+			}),
+		);
 		const recoveredConnection = await DaemonAgentConnection.attach(
 			client,
 			recovered.activeSessionId ?? recovered.id,

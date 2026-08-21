@@ -1,12 +1,17 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { v4 as uuid } from "uuid";
 import { Dealer, Subscriber } from "zeromq";
+import {
+	createObservedProcessInstanceId,
+	recordProcessLifecycle,
+	withoutProcessLifecycleEnvironment,
+} from "../process-lifecycle.js";
 import { ensureKernelPython, type KernelBootstrapProgressHandler, type KernelPythonSkill } from "./bootstrap.js";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "./fork-server.js";
 import {
@@ -49,6 +54,7 @@ const KERNEL_ABORT_GRACE_MS = 1000;
 const KERNEL_BUSY_REUSE_WAIT_MS = 5000;
 const KERNEL_BUSY_INTERRUPT_INTERVAL_MS = 500;
 const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS = 256;
+const KERNEL_STDERR_TAIL_MAX_BYTES = 32 * 1024;
 const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE =
 	"IPython kernel is still running the previously interrupted cell. Wait and try again, or kill the IPython kernel to start fresh.";
 const KERNEL_SHELL_UNCERTAIN_OUTCOME_MESSAGE =
@@ -423,6 +429,28 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function boundedUtf8Tail(value: string, maxBytes: number): string {
+	const bytes = Buffer.from(value);
+	if (bytes.length <= maxBytes) return value;
+	let start = bytes.length - maxBytes;
+	while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start += 1;
+	return bytes.subarray(start).toString("utf8");
+}
+
+function lifecycleError(error: unknown): { name: string; message: string; code?: string | number } {
+	if (!(error instanceof Error)) return { name: typeof error, message: String(error) };
+	const code = (error as NodeJS.ErrnoException).code;
+	return { name: error.name, message: error.message, ...(code !== undefined ? { code } : {}) };
+}
+
+function signalNameFromNumber(signalNumber: number | null): NodeJS.Signals | null {
+	if (signalNumber === null) return null;
+	for (const [name, value] of Object.entries(osConstants.signals)) {
+		if (value === signalNumber) return name as NodeJS.Signals;
+	}
+	return null;
+}
+
 function createKernelShellFailureError(message: string): Error {
 	return new Error(`${message}. ${KERNEL_SHELL_UNCERTAIN_OUTCOME_MESSAGE}`);
 }
@@ -591,6 +619,13 @@ function installSignalHandlersOnce(): void {
 	});
 }
 
+interface KernelProcessObservation {
+	details: Record<string, unknown>;
+	expected: boolean;
+	recorded: boolean;
+	stderrTail: string;
+}
+
 export class KernelManager {
 	private readonly options: Pick<
 		KernelManagerOptions,
@@ -604,8 +639,19 @@ export class KernelManager {
 	// Set instead of `kernel` when the kernel was forked from the forkserver: it is
 	// not a direct child, so it has no ChildProcess handle and is killed by pid.
 	private kernelPid?: number;
+	private kernelForkedExitPath?: string;
+	private kernelProcessPid?: number;
+	private kernelInstanceId?: string;
+	private kernelChildProcessInstanceId?: string;
+	private kernelLogicalChildInstanceId?: string;
+	private kernelLaunchMode?: "direct" | "forked";
+	private kernelLaunchStartedAt?: number;
+	private kernelExit?: { code: number | null; signal: NodeJS.Signals | null };
+	private kernelObservation?: KernelProcessObservation;
+	private nextLaunchTrigger: "kernel-start" | "kernel-restart" = "kernel-start";
 	/** Polls a forked kernel's pid for death (no "exit" event on a non-child). */
 	private forkedLivenessTimer?: ReturnType<typeof globalThis.setInterval>;
+	private forkedDeathObservationInFlight = false;
 	private shell?: Dealer;
 	private iopub?: Subscriber;
 	private control?: Dealer;
@@ -650,7 +696,81 @@ export class KernelManager {
 	}
 
 	private appendKernelDiagnostic(message: string): void {
-		this.kernelStderr += `[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`;
+		this.kernelStderr = boundedUtf8Tail(
+			`${this.kernelStderr}[kernel] ${message.endsWith("\n") ? message : `${message}\n`}`,
+			KERNEL_STDERR_TAIL_MAX_BYTES,
+		);
+	}
+
+	private kernelLifecycleDetails(
+		details: Record<string, unknown> = {},
+		includeStderrTail = false,
+	): Record<string, unknown> {
+		const stderrTail = includeStderrTail ? boundedUtf8Tail(this.kernelStderr, KERNEL_STDERR_TAIL_MAX_BYTES) : "";
+		return {
+			sessionId: this.options.sessionId ?? this.session,
+			...(this.kernelInstanceId ? { kernelInstanceId: this.kernelInstanceId } : {}),
+			...(this.kernelLaunchMode ? { launchMode: this.kernelLaunchMode } : {}),
+			...(this.kernelProcessPid !== undefined ? { pid: this.kernelProcessPid } : {}),
+			...(this.kernelChildProcessInstanceId
+				? { childProcessInstanceId: this.kernelChildProcessInstanceId, childLifecycleSelfLogged: false }
+				: {}),
+			...(this.kernelLogicalChildInstanceId
+				? { logicalChildInstanceId: this.kernelLogicalChildInstanceId, childLifecycleSelfLogged: false }
+				: {}),
+			...details,
+			...(stderrTail ? { stderrTail } : {}),
+		};
+	}
+
+	private beginKernelProcessObservation(): KernelProcessObservation {
+		const observation: KernelProcessObservation = {
+			details: this.kernelLifecycleDetails(),
+			expected: false,
+			recorded: false,
+			stderrTail: "",
+		};
+		this.kernelObservation = observation;
+		return observation;
+	}
+
+	private markKernelExitExpected(): void {
+		if (this.kernelObservation) this.kernelObservation.expected = true;
+	}
+
+	private recordKernelProcessExit(
+		code: number | null,
+		signal: NodeJS.Signals | null,
+		observationSource: string,
+		observation = this.kernelObservation,
+	): void {
+		if (!observation || observation.recorded) return;
+		observation.recorded = true;
+		if (this.kernelObservation === observation) this.kernelExit = { code, signal };
+		recordProcessLifecycle("kernel_process_exit", {
+			...observation.details,
+			expected: observation.expected,
+			code,
+			signal,
+			observation: observationSource,
+			...(!observation.expected && observation.stderrTail ? { stderrTail: observation.stderrTail } : {}),
+		});
+	}
+
+	private recordKernelStartFailure(error: unknown): void {
+		recordProcessLifecycle(
+			"kernel_start_failed",
+			this.kernelLifecycleDetails(
+				{
+					error: lifecycleError(error),
+					code: this.kernelExit?.code,
+					signal: this.kernelExit?.signal,
+					durationMs:
+						this.kernelLaunchStartedAt === undefined ? undefined : Date.now() - this.kernelLaunchStartedAt,
+				},
+				true,
+			),
+		);
 	}
 
 	async start(options: KernelStartOptions = {}): Promise<void> {
@@ -659,6 +779,7 @@ export class KernelManager {
 		}
 		if (!this.startPromise) {
 			this.startPromise = this.doStart({ onBootstrapProgress: options.onBootstrapProgress }).catch((error) => {
+				this.recordKernelStartFailure(error);
 				this.startPromise = undefined;
 				throw error;
 			});
@@ -669,6 +790,17 @@ export class KernelManager {
 	private async doStart(startOptions: KernelStartOptions): Promise<void> {
 		if (this.state !== "idle") return;
 		this.state = "starting";
+		const launchTrigger = this.nextLaunchTrigger;
+		this.nextLaunchTrigger = "kernel-start";
+		this.kernelInstanceId = uuid();
+		this.kernelChildProcessInstanceId = undefined;
+		this.kernelLogicalChildInstanceId = undefined;
+		this.kernelLaunchMode = undefined;
+		this.kernelForkedExitPath = undefined;
+		this.kernelProcessPid = undefined;
+		this.kernelExit = undefined;
+		this.kernelObservation = undefined;
+		this.kernelLaunchStartedAt = Date.now();
 		installSignalHandlersOnce();
 		// Tracked from the moment startup begins so session cleanup and signal
 		// handlers can dispose a kernel that is still booting.
@@ -702,19 +834,31 @@ export class KernelManager {
 		let forked = false;
 		if (isForkServerEnabled()) {
 			try {
+				const logicalChildInstanceId = createObservedProcessInstanceId();
+				const forkedExitPath = `${connection.path}.exit.json`;
 				this.kernelPid = await forkKernel(python, {
 					connectionPath: connection.path,
+					exitPath: forkedExitPath,
 					cwd: this.options.cwd,
 					// Match the direct-spawn env exactly: merge the current host env with
 					// the per-kernel overrides, applied fresh in the child (the template's
 					// inherited env snapshot may be stale by fork time).
-					env: this.options.env ? { ...process.env, ...this.options.env } : { ...process.env },
+					env: withoutProcessLifecycleEnvironment(
+						this.options.env ? { ...process.env, ...this.options.env } : process.env,
+					),
 				});
 				forked = true;
+				this.kernelLaunchMode = "forked";
+				this.kernelForkedExitPath = forkedExitPath;
+				this.kernelLogicalChildInstanceId = logicalChildInstanceId;
+				this.kernelProcessPid = this.kernelPid;
+				this.beginKernelProcessObservation();
+				recordProcessLifecycle("kernel_process_start", this.kernelLifecycleDetails({ trigger: launchTrigger }));
 			} catch (err) {
 				if (!(err instanceof ForkServerUnavailable)) throw err;
 				this.appendKernelDiagnostic(`forkserver unavailable, spawning directly: ${err.message}`);
 				this.kernelPid = undefined;
+				this.kernelForkedExitPath = undefined;
 				// A fork request that times out or loses its pid reply may still have
 				// forked a child that binds the ports in this connection file. Mint a
 				// fresh connection for the direct spawn so a possible orphan can never
@@ -731,20 +875,31 @@ export class KernelManager {
 		}
 
 		if (!forked) {
+			this.kernelLaunchMode = "direct";
+			this.kernelForkedExitPath = undefined;
+			this.kernelChildProcessInstanceId = createObservedProcessInstanceId();
 			const kernel = spawn(
 				python,
 				["-m", "ipykernel_launcher", "--HistoryManager.enabled=False", "-f", connection.path],
 				{
 					cwd: this.options.cwd,
-					env: this.options.env ? { ...process.env, ...this.options.env } : process.env,
+					env: withoutProcessLifecycleEnvironment(
+						this.options.env ? { ...process.env, ...this.options.env } : process.env,
+					),
 					stdio: ["ignore", "pipe", "pipe"],
 				},
 			);
 			this.kernel = kernel;
+			this.kernelProcessPid = kernel.pid;
+			const observation = this.beginKernelProcessObservation();
+			kernel.once("spawn", () => {
+				recordProcessLifecycle("kernel_process_start", this.kernelLifecycleDetails({ trigger: launchTrigger }));
+			});
 
 			kernel.stderr?.on("data", (buf: Buffer) => {
 				const s = buf.toString();
-				this.kernelStderr += s;
+				observation.stderrTail = boundedUtf8Tail(`${observation.stderrTail}${s}`, KERNEL_STDERR_TAIL_MAX_BYTES);
+				if (this.kernelObservation === observation) this.kernelStderr = observation.stderrTail;
 			});
 
 			kernel.on("error", (err) => {
@@ -756,10 +911,11 @@ export class KernelManager {
 			});
 
 			kernel.on("exit", (code, signal) => {
-				if (this.kernel !== kernel) return;
-				if (this.state !== "shutdown") {
+				if (!observation.expected && this.kernelObservation === observation) {
 					this.appendKernelDiagnostic(`unexpected exit code=${code} signal=${signal}`);
 				}
+				this.recordKernelProcessExit(code, signal, "child-process-exit", observation);
+				if (this.kernel !== kernel) return;
 				this.state = "shutdown";
 				liveKernels.delete(this);
 				this.cleanupResources();
@@ -804,6 +960,12 @@ export class KernelManager {
 		this.shell.events.on("disconnect", this.handleShellDisconnect);
 		this.startShellPump();
 		this.startForkedLivenessMonitor();
+		recordProcessLifecycle(
+			"kernel_process_ready",
+			this.kernelLifecycleDetails({
+				durationMs: Date.now() - (this.kernelLaunchStartedAt ?? Date.now()),
+			}),
+		);
 	}
 
 	// A forked kernel isn't a direct child, so no "exit" fires when it dies. Poll its
@@ -812,12 +974,21 @@ export class KernelManager {
 	private startForkedLivenessMonitor(): void {
 		if (this.kernelPid === undefined) return;
 		this.forkedLivenessTimer = globalThis.setInterval(() => {
-			if (this.state !== "running") return;
-			if (!this.forkedKernelDied()) return;
-			this.appendKernelDiagnostic("forked kernel exited unexpectedly");
-			this.state = "shutdown";
-			liveKernels.delete(this);
-			this.cleanupResources();
+			if (this.state !== "running" || !this.forkedKernelDied() || this.forkedDeathObservationInFlight) return;
+			const observation = this.kernelObservation;
+			this.forkedDeathObservationInFlight = true;
+			void (async () => {
+				try {
+					this.appendKernelDiagnostic("forked kernel exited unexpectedly");
+					await this.recordForkedKernelExit("forked-pid-missing", observation);
+					if (this.kernelObservation !== observation) return;
+					this.state = "shutdown";
+					liveKernels.delete(this);
+					this.cleanupResources();
+				} finally {
+					this.forkedDeathObservationInFlight = false;
+				}
+			})();
 		}, FORKED_LIVENESS_POLL_MS);
 		this.forkedLivenessTimer.unref?.();
 	}
@@ -836,10 +1007,43 @@ export class KernelManager {
 		}
 	}
 
+	private async readForkedKernelExitStatus(): Promise<{
+		code: number | null;
+		signal: NodeJS.Signals | null;
+	}> {
+		const path = this.kernelForkedExitPath;
+		if (!path) return { code: null, signal: null };
+		for (let attempt = 0; attempt < 10; attempt++) {
+			try {
+				const parsed = JSON.parse(readFileSync(path, "utf8")) as {
+					code?: unknown;
+					signal?: unknown;
+				};
+				return {
+					code: typeof parsed.code === "number" ? parsed.code : null,
+					signal: signalNameFromNumber(typeof parsed.signal === "number" ? parsed.signal : null),
+				};
+			} catch {
+				await sleep(10);
+			}
+		}
+		return { code: null, signal: null };
+	}
+
+	private async recordForkedKernelExit(
+		observationSource: string,
+		observation = this.kernelObservation,
+	): Promise<void> {
+		const status = await this.readForkedKernelExitStatus();
+		this.recordKernelProcessExit(status.code, status.signal, observationSource, observation);
+	}
+
 	private async waitForResolvedConnection(connectionPath: string): Promise<ConnectionInfo> {
 		const startedAt = Date.now();
 		while (Date.now() - startedAt < PORTS_RESOLVE_TIMEOUT_MS) {
-			if ((this.state as string) === "shutdown" || this.forkedKernelDied()) {
+			const forkedDied = this.forkedKernelDied();
+			if ((this.state as string) === "shutdown" || forkedDied) {
+				if (forkedDied) await this.recordForkedKernelExit("forked-pid-missing-during-startup");
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(`Kernel exited before resolving ports. stderr:\n${tail || "(empty)"}`);
 			}
@@ -868,7 +1072,9 @@ export class KernelManager {
 
 		const startedAt = Date.now();
 		while (Date.now() - startedAt < READY_TIMEOUT_MS) {
-			if ((this.state as string) === "shutdown" || this.forkedKernelDied()) {
+			const forkedDied = this.forkedKernelDied();
+			if ((this.state as string) === "shutdown" || forkedDied) {
+				if (forkedDied) await this.recordForkedKernelExit("forked-pid-missing-during-startup");
 				const tail = this.kernelStderr.slice(-1024);
 				throw new Error(`Kernel exited during startup. stderr:\n${tail || "(empty)"}`);
 			}
@@ -1566,6 +1772,9 @@ export class KernelManager {
 		while (this.kernelPid === pid && !this.forkedKernelDied()) {
 			await sleep(25);
 		}
+		if (this.kernelPid === pid && this.forkedKernelDied()) {
+			await this.recordForkedKernelExit("forked-pid-missing");
+		}
 	}
 
 	private async waitForHostRequestsToSettle(tasks: Promise<void>[], timeoutMs: number): Promise<void> {
@@ -1594,6 +1803,11 @@ export class KernelManager {
 			this.cleanupResources();
 			return;
 		}
+		this.markKernelExitExpected();
+		recordProcessLifecycle(
+			"kernel_shutdown",
+			this.kernelLifecycleDetails({ expected: true, trigger: "shutdown", snapshot: opts.snapshot === true }),
+		);
 		// Best-effort final flush (bounded) before teardown — used by signal handlers
 		// so a SIGINT/SIGTERM exit doesn't lose work the debounced snapshot hasn't saved.
 		if (opts.snapshot) {
@@ -1637,6 +1851,12 @@ export class KernelManager {
 	}
 
 	async restart(): Promise<void> {
+		const restartAttemptId = uuid();
+		const previousKernelInstanceId = this.kernelInstanceId;
+		recordProcessLifecycle(
+			"kernel_restart",
+			this.kernelLifecycleDetails({ phase: "requested", restartAttemptId, previousKernelInstanceId }),
+		);
 		const prev = this.executionQueue;
 		let resolveNext: () => void = () => {};
 		this.executionQueue = new Promise<void>((r) => {
@@ -1648,15 +1868,41 @@ export class KernelManager {
 			await this.shutdown();
 			this.state = "idle";
 			this.kernelStderr = "";
+			this.nextLaunchTrigger = "kernel-restart";
 			await this.start();
+			recordProcessLifecycle(
+				"kernel_restart",
+				this.kernelLifecycleDetails({ phase: "completed", restartAttemptId, previousKernelInstanceId }),
+			);
+		} catch (error) {
+			recordProcessLifecycle(
+				"kernel_restart",
+				this.kernelLifecycleDetails({
+					phase: "failed",
+					restartAttemptId,
+					previousKernelInstanceId,
+					errorName: error instanceof Error ? error.name : typeof error,
+				}),
+			);
+			throw error;
 		} finally {
 			resolveNext();
 		}
 	}
 
 	async kill(): Promise<void> {
+		this.markKernelExitExpected();
+		recordProcessLifecycle("kernel_kill", this.kernelLifecycleDetails({ expected: true, signal: "SIGKILL" }));
 		this.state = "shutdown";
 		liveKernels.delete(this);
+		if (this.kernelPid !== undefined) {
+			try {
+				process.kill(this.kernelPid, "SIGKILL");
+			} catch {
+				// The forked kernel has already exited.
+			}
+			await Promise.race([this.waitForKernelExit(), sleep(1000)]);
+		}
 		this.cleanupResources("SIGKILL");
 	}
 
@@ -1784,6 +2030,13 @@ export class KernelManager {
 	/** Graceful cleanup. Waits briefly for in-flight host request handlers before closing sockets. */
 	dispose(): Promise<void> {
 		return (async () => {
+			if (this.state !== "shutdown" && this.kernelInstanceId) {
+				this.markKernelExitExpected();
+				recordProcessLifecycle(
+					"kernel_shutdown",
+					this.kernelLifecycleDetails({ expected: true, trigger: "dispose", snapshot: true }),
+				);
+			}
 			// Final namespace flush while the kernel is still live (session end / reload).
 			await this.flushSnapshotForDispose();
 			this.state = "shutdown";
@@ -1795,6 +2048,14 @@ export class KernelManager {
 					await this.waitForHostRequestsToSettle(inFlightHostRequests, HOST_REQUEST_DISPOSE_TIMEOUT_MS);
 				}
 			} finally {
+				if (this.kernelPid !== undefined) {
+					try {
+						process.kill(this.kernelPid, "SIGTERM");
+					} catch {
+						// The forked kernel has already exited.
+					}
+					await Promise.race([this.waitForKernelExit(), sleep(1000)]);
+				}
 				this.cleanupResources();
 			}
 		})();
@@ -1802,6 +2063,13 @@ export class KernelManager {
 
 	/** Synchronous best-effort cleanup. Safe to call from `process.on('exit')`. */
 	disposeSync(): void {
+		if (this.state !== "shutdown" && this.kernelInstanceId) {
+			this.markKernelExitExpected();
+			recordProcessLifecycle(
+				"kernel_shutdown",
+				this.kernelLifecycleDetails({ expected: true, trigger: "dispose-sync", snapshot: false }),
+			);
+		}
 		this.state = "shutdown";
 		liveKernels.delete(this);
 		// TODO: replace this best-effort hard-exit path if Node exposes an awaitable process-exit cleanup hook.

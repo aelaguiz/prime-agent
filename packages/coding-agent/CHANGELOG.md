@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added durable per-process crash, signal, restart, and kernel lifecycle logs with privacy-reduced diagnostic reports.
+- Fixed Python kernel setup rejecting the managed Python it installed when uv was configured to use only system interpreters.
 - Fixed compromised daemon and session lockfiles terminating their owning processes from asynchronous lock-refresh callbacks.
 - Fixed `prime-agent attach` failing to find live agents owned by another local background service.
 - Fixed long-lived IPython sessions wedging after shell replies accumulated or the shell transport disconnected.

@@ -10,6 +10,9 @@ const supported = assertNodeVersion({
 });
 
 if (supported) {
+	const { installProcessLifecycle, markProcessLifecycleCompleted } = await import("./core/process-lifecycle.js");
+	installProcessLifecycle();
 	const { runCli } = await import("./cli-main.js");
 	await runCli();
+	markProcessLifecycleCompleted();
 }

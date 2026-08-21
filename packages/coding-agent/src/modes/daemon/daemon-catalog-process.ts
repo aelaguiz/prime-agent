@@ -1,6 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec } from "../../cli/subprocess-launch.js";
+import {
+	markProcessLifecycleCompleted,
+	prepareProcessLifecycleLaunch,
+	recordProcessLifecycle,
+} from "../../core/process-lifecycle.js";
 import type { DeleteSessionFileResult } from "../../core/session-file-actions.js";
 import { deleteSessionFile } from "../../core/session-file-actions.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../../core/session-manager.js";
@@ -108,7 +113,10 @@ export function isDaemonCatalogProcess(environment: NodeJS.ProcessEnv = process.
 }
 
 export async function runDaemonCatalogProcess(): Promise<never> {
-	process.on("disconnect", () => process.exit(0));
+	process.on("disconnect", () => {
+		markProcessLifecycleCompleted({ role: "daemon-catalog", reason: "parent-disconnect" });
+		process.exit(0);
+	});
 	process.on("message", (value: unknown) => {
 		if (!isCatalogRequest(value)) {
 			return;
@@ -217,7 +225,10 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 				return;
 			case "shutdown":
 				sendCatalogMessage({ type: "response", id: request.id, success: true });
-				setImmediate(() => process.exit(0));
+				setImmediate(() => {
+					markProcessLifecycleCompleted({ role: "daemon-catalog", reason: "shutdown-request" });
+					process.exit(0);
+				});
 				return;
 		}
 	} catch (error) {
@@ -232,7 +243,9 @@ async function handleCatalogRequest(request: CatalogRequest): Promise<void> {
 
 export class DaemonCatalogClient {
 	private child?: ChildProcess;
+	private stoppingChild?: ChildProcess;
 	private starting?: Promise<void>;
+	private recoveryRequired = false;
 	private readonly pending = new Map<
 		string,
 		{
@@ -243,7 +256,10 @@ export class DaemonCatalogClient {
 		}
 	>();
 
-	constructor(private readonly onDiagnostic: (message: string) => void) {}
+	constructor(
+		private readonly onDiagnostic: (message: string) => void,
+		private readonly supervisorSocketPath?: string,
+	) {}
 
 	async start(): Promise<void> {
 		if (this.child?.connected) {
@@ -313,6 +329,7 @@ export class DaemonCatalogClient {
 		if (!child) {
 			return;
 		}
+		this.stoppingChild = child;
 		await this.request({ type: "request", id: randomUUID(), command: "shutdown" }).catch(() => undefined);
 		child.disconnect();
 		this.child = undefined;
@@ -320,20 +337,107 @@ export class DaemonCatalogClient {
 
 	private async spawnCatalog(): Promise<void> {
 		const launch = createCliSubprocessLaunchSpec(["--version"]);
-		const child = spawn(launch.command, launch.args, {
-			cwd: process.cwd(),
-			env: createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" }),
-			stdio: ["ignore", "ignore", "ignore", "ipc"],
+		const recoveryAttempt = this.recoveryRequired;
+		const trigger = recoveryAttempt ? "daemon_catalog_recovery" : "daemon_catalog_start";
+		const catalogEnvironment = createCliSubprocessEnv({ ...process.env, [DAEMON_CATALOG_ROLE_ENV]: "1" });
+		const preparedLaunch = prepareProcessLifecycleLaunch(catalogEnvironment, {
+			role: "daemon-catalog",
+			trigger,
+			context: { supervisorSocketPath: this.supervisorSocketPath },
+		});
+		if (recoveryAttempt) {
+			recordProcessLifecycle("daemon_catalog_recovery_attempt", {
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				trigger,
+				supervisorSocketPath: this.supervisorSocketPath,
+			});
+		}
+		recordProcessLifecycle("daemon_catalog_launch", {
+			phase: "attempt",
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			trigger,
+			supervisorSocketPath: this.supervisorSocketPath,
+		});
+		let child: ChildProcess;
+		try {
+			child = spawn(launch.command, launch.args, {
+				cwd: process.cwd(),
+				env: preparedLaunch.environment,
+				stdio: ["ignore", "ignore", "ignore", "ipc"],
+			});
+		} catch (error) {
+			recordProcessLifecycle("daemon_catalog_spawn_error", {
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				trigger,
+				supervisorSocketPath: this.supervisorSocketPath,
+				errorMessage: error instanceof Error ? error.message : String(error),
+				...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+			});
+			if (recoveryAttempt) {
+				recordProcessLifecycle("daemon_catalog_recovery_result", {
+					status: "spawn_error",
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					trigger,
+					supervisorSocketPath: this.supervisorSocketPath,
+				});
+			}
+			throw error;
+		}
+		child.once("spawn", () => {
+			recordProcessLifecycle("daemon_catalog_launch", {
+				phase: "spawned",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				supervisorSocketPath: this.supervisorSocketPath,
+			});
 		});
 		this.child = child;
 		child.on("message", (value: unknown) => this.handleMessage(value));
-		child.on("error", (error) => this.handleClose(child, error));
-		child.on("exit", (code, signal) =>
-			this.handleClose(child, new Error(`Daemon catalog exited (${signal ?? code ?? "unknown"})`)),
-		);
+		child.on("error", (error) => {
+			recordProcessLifecycle("daemon_catalog_spawn_error", {
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				supervisorSocketPath: this.supervisorSocketPath,
+				errorMessage: error.message,
+				...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+			});
+			this.handleClose(child, error);
+		});
+		child.on("exit", (code, signal) => {
+			const expected = this.stoppingChild === child;
+			recordProcessLifecycle("daemon_catalog_exit", {
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				supervisorSocketPath: this.supervisorSocketPath,
+				expected,
+				code,
+				signal,
+			});
+			this.handleClose(child, new Error(`Daemon catalog exited (${signal ?? code ?? "unknown"})`), expected);
+			if (expected) this.stoppingChild = undefined;
+		});
 		await new Promise<void>((resolveReady, rejectReady) => {
 			const timeout = setTimeout(() => {
 				cleanup();
+				recordProcessLifecycle("daemon_catalog_launch_result", {
+					status: "timeout",
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					childPid: child.pid,
+					trigger,
+					supervisorSocketPath: this.supervisorSocketPath,
+				});
+				if (recoveryAttempt) {
+					recordProcessLifecycle("daemon_catalog_recovery_result", {
+						status: "timeout",
+						childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+						childPid: child.pid,
+						trigger,
+						supervisorSocketPath: this.supervisorSocketPath,
+					});
+				}
 				const error = new Error("Timed out starting daemon catalog");
 				this.handleClose(child, error);
 				if (child.connected) {
@@ -350,11 +454,37 @@ export class DaemonCatalogClient {
 			const onMessage = (value: unknown) => {
 				if (isCatalogOutbound(value) && value.type === "ready") {
 					cleanup();
+					recordProcessLifecycle("daemon_catalog_launch_result", {
+						status: "ready",
+						childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+						childPid: child.pid,
+						trigger,
+						supervisorSocketPath: this.supervisorSocketPath,
+					});
+					if (recoveryAttempt) {
+						recordProcessLifecycle("daemon_catalog_recovery_result", {
+							status: "ready",
+							childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+							childPid: child.pid,
+							trigger,
+							supervisorSocketPath: this.supervisorSocketPath,
+						});
+					}
+					this.recoveryRequired = false;
 					resolveReady();
 				}
 			};
 			const onError = (error: Error) => {
 				cleanup();
+				if (recoveryAttempt) {
+					recordProcessLifecycle("daemon_catalog_recovery_result", {
+						status: "spawn_error",
+						childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+						childPid: child.pid,
+						trigger,
+						supervisorSocketPath: this.supervisorSocketPath,
+					});
+				}
 				rejectReady(error);
 			};
 			child.on("message", onMessage);
@@ -424,11 +554,18 @@ export class DaemonCatalogClient {
 		}
 	}
 
-	private handleClose(child: ChildProcess, error: Error): void {
+	private handleClose(child: ChildProcess, error: Error, expected = this.stoppingChild === child): void {
 		if (this.child !== child) {
 			return;
 		}
 		this.child = undefined;
+		this.recoveryRequired = !expected;
+		recordProcessLifecycle("daemon_catalog_close", {
+			childPid: child.pid,
+			supervisorSocketPath: this.supervisorSocketPath,
+			expected,
+			errorMessage: error.message,
+		});
 		this.onDiagnostic(error.message);
 		for (const [id, pending] of this.pending) {
 			clearTimeout(pending.timeout);

@@ -731,7 +731,7 @@ async function bootstrapVenv(
 	const runtimeIdentity = await resolveRuntimeIdentity();
 
 	await run(uv, ["python", "install", PYTHON_VERSION]);
-	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed"]);
+	await run(uv, ["venv", venv, "--python", PYTHON_VERSION, "--seed", "--managed-python"]);
 	await run(uv, [
 		"pip",
 		"install",

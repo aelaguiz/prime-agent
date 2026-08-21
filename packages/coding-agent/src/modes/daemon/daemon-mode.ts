@@ -89,6 +89,12 @@ import {
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import {
+	markProcessLifecycleCompleted,
+	prepareProcessLifecycleLaunch,
+	recordProcessLifecycle,
+	setProcessLifecycleContext,
+} from "../../core/process-lifecycle.js";
 import { PromptAdmissionCancelledError, waitForPromptAdmission } from "../../core/prompt-admission.js";
 import type { CreateRlmSubagentRuntimeOptions, SubagentRuntimeHost } from "../../core/rlm-runtime.js";
 import {
@@ -448,6 +454,10 @@ class BoundSessionUnavailableError extends Error {}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
 	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
+	setProcessLifecycleContext({
+		socketPath,
+		activeSessionId: options.worker?.restoreActiveSessionId,
+	});
 	const daemon = new AgentDaemon(socketPath, options);
 	await daemon.start();
 	return new Promise(() => {});
@@ -801,6 +811,8 @@ export class AgentDaemon {
 		const key = createHash("sha256").update(supervisorSocketPath).digest("hex").slice(0, 12);
 		const lockDirectory = join(dirname(supervisorSocketPath), `.supervisor-launch-${key}.lock`);
 		let ownsLock = false;
+		let recoveryChildProcessInstanceId: string | undefined;
+		let recoveryChildPid: number | undefined;
 		try {
 			for (let attempt = 0; attempt < 3 && !ownsLock; attempt++) {
 				const token = randomUUID();
@@ -858,22 +870,109 @@ export class AgentDaemon {
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
-			const child = spawn(launch.command, launch.args, {
-				cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
-				detached: true,
-				env: environment,
-				stdio: "ignore",
+			const trigger = "worker_supervisor_recovery";
+			const preparedLaunch = prepareProcessLifecycleLaunch(environment, {
+				role: "daemon-supervisor",
+				trigger,
+				context: { socketPath: supervisorSocketPath },
+			});
+			recoveryChildProcessInstanceId = preparedLaunch.childProcessInstanceId;
+			recordProcessLifecycle("daemon_supervisor_recovery_attempt", {
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				trigger,
+				socketPath: supervisorSocketPath,
+			});
+			recordProcessLifecycle("daemon_supervisor_launch", {
+				phase: "attempt",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				trigger,
+				socketPath: supervisorSocketPath,
+			});
+			let child: ReturnType<typeof spawn>;
+			try {
+				child = spawn(launch.command, launch.args, {
+					cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
+					detached: true,
+					env: preparedLaunch.environment,
+					stdio: "ignore",
+				});
+			} catch (error) {
+				recordProcessLifecycle("daemon_supervisor_spawn_error", {
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					trigger,
+					socketPath: supervisorSocketPath,
+					errorMessage: error instanceof Error ? error.message : String(error),
+					...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+				});
+				throw error;
+			}
+			recoveryChildPid = child.pid;
+			child.once("spawn", () => {
+				recordProcessLifecycle("daemon_supervisor_launch", {
+					phase: "spawned",
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					childPid: child.pid,
+					trigger,
+					socketPath: supervisorSocketPath,
+				});
+			});
+			child.once("error", (error) => {
+				recordProcessLifecycle("daemon_supervisor_spawn_error", {
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					childPid: child.pid,
+					trigger,
+					socketPath: supervisorSocketPath,
+					errorMessage: error.message,
+					...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+				});
+				// Preserve the prior unhandled child-process error behavior after recording it.
+				throw error;
+			});
+			child.once("exit", (code, signal) => {
+				recordProcessLifecycle("daemon_supervisor_exit", {
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					childPid: child.pid,
+					trigger,
+					socketPath: supervisorSocketPath,
+					expected: false,
+					reason: "recovery-exit",
+					code,
+					signal,
+				});
 			});
 			child.unref();
 			const deadline = Date.now() + 10_000;
 			while (!this.shuttingDown && Date.now() < deadline) {
 				if (await this.canConnectToSupervisor(supervisorSocketPath)) {
+					recordProcessLifecycle("daemon_supervisor_recovery_result", {
+						status: "ready",
+						childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+						childPid: child.pid,
+						trigger,
+						socketPath: supervisorSocketPath,
+					});
 					this.log(`launched replacement supervisor on ${supervisorSocketPath}`);
 					return;
 				}
 				await delay(50);
 			}
+			recordProcessLifecycle("daemon_supervisor_recovery_result", {
+				status: this.shuttingDown ? "cancelled" : "timeout",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath: supervisorSocketPath,
+			});
 		} catch (error) {
+			if (recoveryChildProcessInstanceId) {
+				recordProcessLifecycle("daemon_supervisor_recovery_result", {
+					status: "failed",
+					childProcessInstanceId: recoveryChildProcessInstanceId,
+					childPid: recoveryChildPid,
+					socketPath: supervisorSocketPath,
+					errorMessage: error instanceof Error ? error.message : String(error),
+				});
+			}
 			this.log(`failed to launch replacement supervisor: ${String(error)}`);
 		} finally {
 			if (ownsLock) {
@@ -1428,6 +1527,12 @@ export class AgentDaemon {
 			clientEnv,
 		};
 		this.sessions.set(state.activeSessionId, state);
+		if (this.options.worker && runtime.metadata.kind === "top-level") {
+			setProcessLifecycleContext({
+				activeSessionId: state.activeSessionId,
+				sessionId: runtime.session.sessionId,
+			});
+		}
 		this.bindingSessions.add(state.activeSessionId);
 		let completeBinding!: () => void;
 		const bindingCompletion = new Promise<void>((resolveBinding) => {
@@ -7033,6 +7138,7 @@ export class AgentDaemon {
 			this.server.close(() => resolveClose());
 		});
 		this.cleanupSocketPath();
+		markProcessLifecycleCompleted({ role: "daemon-worker", exitCode, reason: closingReason });
 		process.exit(exitCode);
 	}
 }

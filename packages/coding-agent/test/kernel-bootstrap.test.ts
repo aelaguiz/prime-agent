@@ -183,7 +183,7 @@ describe("kernel bootstrap", () => {
 
 		const log = readFileSync(logPath, "utf8");
 		expect(log).toContain("python install 3.11");
-		expect(log).toContain(`venv ${venv} --python 3.11 --seed`);
+		expect(log).toContain(`venv ${venv} --python 3.11 --seed --managed-python`);
 		expect(log).toContain("pip install --python");
 		expect(log).toContain("ipykernel");
 		expect(log).toContain("prime-agent-runtime");

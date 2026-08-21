@@ -8,10 +8,11 @@
 // `python -c <this> <control-socket-path>`.
 //
 // Protocol (newline-delimited JSON over the unix socket, forkserver is the client):
-//   -> { "id": <n>, "connectionPath": "<abs path>" }   spawn request from Node
+//   -> { "id": <n>, "connectionPath": "<abs path>", "exitPath": "<abs path>" }
 //   <- { "type": "ready" }                             once, after imports finish
 //   <- { "id": <n>, "pid": <pid> }                     fork succeeded
 //   <- { "id": <n>, "error": "<message>" }             fork failed
+// The forkserver atomically writes each reaped child's pid/code/signal to exitPath.
 export const FORK_SERVER_SCRIPT = String.raw`
 import gc
 import json
@@ -21,15 +22,42 @@ import socket
 import sys
 
 
+_child_exit_paths = {}
+
+
+def _write_exit_status(pid, status):
+    path = _child_exit_paths.pop(pid, None)
+    if not path:
+        return
+    payload = {"pid": pid, "code": None, "signal": None}
+    if os.WIFEXITED(status):
+        payload["code"] = os.WEXITSTATUS(status)
+    elif os.WIFSIGNALED(status):
+        payload["signal"] = os.WTERMSIG(status)
+    temp_path = "%s.%s.tmp" % (path, pid)
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.write("\n")
+            handle.flush()
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
 def _reap_children(*_args):
     # Reap every exited child so disposed kernels never linger as zombies. Wired to
     # SIGCHLD so reaping happens on child exit, not only when the next request wakes
     # the accept loop. Safe under PEP 475: the interrupted socket read auto-retries.
     try:
         while True:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            pid, status = os.waitpid(-1, os.WNOHANG)
             if pid == 0:
                 break
+            _write_exit_status(pid, status)
     except ChildProcessError:
         pass
 
@@ -110,17 +138,21 @@ def _serve(control_path):
             continue
         req_id = req.get("id")
         connection_path = req.get("connectionPath")
+        exit_path = req.get("exitPath")
         cwd = req.get("cwd")
         env = req.get("env")
 
+        old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})
         try:
             pid = os.fork()
         except OSError as exc:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
             f.write(json.dumps({"id": req_id, "error": str(exc)}).encode() + b"\n")
             f.flush()
             continue
 
         if pid == 0:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
             # Child: shed every inherited fd tied to the control channel, then run.
             try:
                 sock.close()
@@ -139,6 +171,9 @@ def _serve(control_path):
             os._exit(0)
 
         # Parent: stay pristine (no loop/threads/ZMQ ever) so the next fork is clean.
+        if exit_path:
+            _child_exit_paths[pid] = exit_path
+        signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
         f.write(json.dumps({"id": req_id, "pid": pid}).encode() + b"\n")
         f.flush()
 

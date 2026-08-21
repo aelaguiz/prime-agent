@@ -1143,7 +1143,7 @@ export async function main(args: string[], options?: MainOptions) {
 	if (isDaemonWorkerProcess()) {
 		waitForDaemonWorkerStartupGate();
 	}
-	installFileLogSink();
+	installFileLogSink({ version: VERSION });
 	if (isDaemonCatalogProcess()) {
 		await runDaemonCatalogProcess();
 		return;

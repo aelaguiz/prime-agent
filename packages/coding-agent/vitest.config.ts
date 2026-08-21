@@ -12,6 +12,7 @@ export default defineConfig({
 		globals: true,
 		environment: "node",
 		testTimeout: 30000,
+		globalSetup: ["./test/global-setup.ts"],
 		tags: [
 			{
 				name: "process-stress",

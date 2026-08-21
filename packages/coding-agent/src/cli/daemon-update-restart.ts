@@ -5,6 +5,11 @@ import { resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { ENV_AGENT_DIR, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
+import {
+	prepareProcessLifecycleLaunch,
+	recordProcessLifecycle,
+	setProcessLifecycleContext,
+} from "../core/process-lifecycle.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
@@ -444,6 +449,10 @@ export class DaemonUpdateRestartCoordinatorAlreadyRunningError extends Error {
 export async function acquireDaemonUpdateRestartCoordinator(
 	options: AcquireDaemonUpdateRestartCoordinatorOptions,
 ): Promise<DaemonUpdateRestartCoordinatorLease> {
+	setProcessLifecycleContext({
+		socketPath: options.socketPath,
+		updateRestartRequestId: options.requestId,
+	});
 	const registryDir = options.registryDir ?? defaultCoordinatorRegistryDir();
 	const path = coordinatorRecordPath(registryDir, options.socketPath);
 	const token = randomUUID();
@@ -547,18 +556,81 @@ export async function launchDaemonUpdateRestartCoordinator(
 		statusPath,
 		...(originActiveSessionId ? [DAEMON_UPDATE_RESTART_ORIGIN_FLAG, originActiveSessionId] : []),
 	]);
-	const child = spawn(launch.command, launch.args, {
-		cwd: options.cwd ?? process.cwd(),
-		detached: true,
-		env: coordinatorEnvironment(agentDir),
-		stdio: "ignore",
+	const trigger = "daemon_update_restart";
+	const preparedLaunch = prepareProcessLifecycleLaunch(coordinatorEnvironment(agentDir), {
+		role: "update-restart-coordinator",
+		trigger,
+		context: {
+			socketPath,
+			updateRestartRequestId: requestId,
+			originActiveSessionId,
+		},
+	});
+	recordProcessLifecycle("daemon_update_restart_coordinator_launch", {
+		phase: "attempt",
+		childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+		trigger,
+		socketPath,
+		updateRestartRequestId: requestId,
+		originActiveSessionId,
+	});
+	let child: ReturnType<typeof spawn>;
+	try {
+		child = spawn(launch.command, launch.args, {
+			cwd: options.cwd ?? process.cwd(),
+			detached: true,
+			env: preparedLaunch.environment,
+			stdio: "ignore",
+		});
+	} catch (error) {
+		recordProcessLifecycle("daemon_update_restart_coordinator_spawn_error", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			trigger,
+			socketPath,
+			updateRestartRequestId: requestId,
+			errorMessage: error instanceof Error ? error.message : String(error),
+			...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+		});
+		throw error;
+	}
+	child.once("spawn", () => {
+		recordProcessLifecycle("daemon_update_restart_coordinator_launch", {
+			phase: "spawned",
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+			updateRestartRequestId: requestId,
+			originActiveSessionId,
+		});
 	});
 	let launchError: Error | undefined;
 	let exitDescription: string | undefined;
 	child.once("error", (error) => {
+		recordProcessLifecycle("daemon_update_restart_coordinator_spawn_error", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+			updateRestartRequestId: requestId,
+			errorMessage: error.message,
+			...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+		});
 		launchError = error;
 	});
 	child.once("exit", (code, signal) => {
+		const expected = code === 0 && signal === null;
+		recordProcessLifecycle("daemon_update_restart_coordinator_exit", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+			updateRestartRequestId: requestId,
+			expected,
+			reason: expected ? "completed" : "unexpected",
+			code,
+			signal,
+		});
 		exitDescription = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
 	});
 	child.unref();
@@ -579,22 +651,72 @@ export async function launchDaemonUpdateRestartCoordinator(
 			lastLivenessAt = Date.now();
 		}
 		if (status && TERMINAL_PHASES.has(status.phase)) {
+			recordProcessLifecycle("daemon_update_restart_coordinator_result", {
+				status: status.phase,
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath,
+				updateRestartRequestId: requestId,
+				counts: status.counts,
+			});
 			return status;
 		}
 		if (launchError) {
+			recordProcessLifecycle("daemon_update_restart_coordinator_result", {
+				status: "spawn_error",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath,
+				updateRestartRequestId: requestId,
+			});
 			throw launchError;
 		}
 		if (exitDescription) {
 			const terminalStatus = readTerminalDaemonUpdateRestartStatus(statusPath);
 			if (terminalStatus) {
+				recordProcessLifecycle("daemon_update_restart_coordinator_result", {
+					status: terminalStatus.phase,
+					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+					childPid: child.pid,
+					trigger,
+					socketPath,
+					updateRestartRequestId: requestId,
+					counts: terminalStatus.counts,
+				});
 				return terminalStatus;
 			}
+			recordProcessLifecycle("daemon_update_restart_coordinator_result", {
+				status: "exited_without_status",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath,
+				updateRestartRequestId: requestId,
+			});
 			throw new Error(`Daemon update restart coordinator exited with ${exitDescription}`);
 		}
 		if (Date.now() - lastLivenessAt >= COORDINATOR_LIVENESS_TIMEOUT_MS) {
+			recordProcessLifecycle("daemon_update_restart_coordinator_result", {
+				status: "liveness_timeout",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath,
+				updateRestartRequestId: requestId,
+			});
 			throw new Error(`Daemon update restart coordinator stopped reporting liveness on ${socketPath}`);
 		}
 		if (Date.now() - lastProgressAt >= progressTimeoutMs) {
+			recordProcessLifecycle("daemon_update_restart_coordinator_result", {
+				status: "progress_timeout",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath,
+				updateRestartRequestId: requestId,
+			});
 			throw new Error(`Timed out waiting for daemon update restart progress on ${socketPath}`);
 		}
 		await delay(50);

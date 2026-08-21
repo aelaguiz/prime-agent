@@ -10,6 +10,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
 import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
+import { prepareProcessLifecycleLaunch, recordProcessLifecycle } from "../core/process-lifecycle.js";
 import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
@@ -369,23 +370,74 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 
 	const logOffset = currentDaemonLogSize(socketPath);
 	const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
-	const child = spawn(launch.command, launch.args, {
-		cwd: spawnCwd ?? process.cwd(),
-		detached: true,
-		env,
-		// A pipe would tie the daemon's stderr to this short-lived CLI
-		// (EPIPE once it exits); crash details come from the daemon log,
-		// which the supervisor writes to before rethrowing startup errors.
-		stdio: "ignore",
+	const trigger = "ensure_daemon_running";
+	const preparedLaunch = prepareProcessLifecycleLaunch(env, {
+		role: "daemon-supervisor",
+		trigger,
+		context: { socketPath },
+	});
+	recordProcessLifecycle("daemon_supervisor_launch", {
+		phase: "attempt",
+		childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+		trigger,
+		socketPath,
+	});
+	let child: ReturnType<typeof spawn>;
+	try {
+		child = spawn(launch.command, launch.args, {
+			cwd: spawnCwd ?? process.cwd(),
+			detached: true,
+			env: preparedLaunch.environment,
+			// A pipe would tie the daemon's stderr to this short-lived CLI
+			// (EPIPE once it exits); crash details come from the daemon log,
+			// which the supervisor writes to before rethrowing startup errors.
+			stdio: "ignore",
+		});
+	} catch (error) {
+		recordProcessLifecycle("daemon_supervisor_spawn_error", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			trigger,
+			socketPath,
+			errorMessage: error instanceof Error ? error.message : String(error),
+			...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+		});
+		throw error;
+	}
+	child.once("spawn", () => {
+		recordProcessLifecycle("daemon_supervisor_launch", {
+			phase: "spawned",
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+		});
 	});
 	let childFailure:
 		| { type: "error"; error: Error }
 		| { type: "exit"; code: number | null; signal: NodeJS.Signals | null }
 		| undefined;
 	child.once("error", (error) => {
+		recordProcessLifecycle("daemon_supervisor_spawn_error", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+			errorMessage: error.message,
+			...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+		});
 		childFailure ??= { type: "error", error };
 	});
 	child.once("exit", (code, signal) => {
+		recordProcessLifecycle("daemon_supervisor_exit", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+			expected: false,
+			reason: "startup-exit",
+			code,
+			signal,
+		});
 		childFailure ??= { type: "exit", code, signal };
 	});
 	child.unref();
@@ -395,6 +447,16 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 			return;
 		}
 		const logTail = readDaemonLogTail(socketPath, logOffset);
+		recordProcessLifecycle("daemon_supervisor_launch_result", {
+			status: childFailure.type === "error" ? "spawn_error" : "early_exit",
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath,
+			...(childFailure.type === "error"
+				? { errorMessage: childFailure.error.message }
+				: { code: childFailure.code, signal: childFailure.signal }),
+		});
 		if (childFailure.type === "error") {
 			throw new Error(`Failed to spawn Prime Agent daemon: ${childFailure.error.message}.${logTail}`);
 		}
@@ -412,6 +474,13 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	while (Date.now() < Math.min(deadline, exitDeadline ?? Number.POSITIVE_INFINITY)) {
 		const started = await probeDaemonVersion(socketPath);
 		if (started.status === "current") {
+			recordProcessLifecycle("daemon_supervisor_launch_result", {
+				status: "ready",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath,
+			});
 			return;
 		}
 		if (childFailure) {
@@ -421,6 +490,13 @@ async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promi
 	}
 
 	throwIfFailed();
+	recordProcessLifecycle("daemon_supervisor_launch_result", {
+		status: "timeout",
+		childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+		childPid: child.pid,
+		trigger,
+		socketPath,
+	});
 	throw new Error(
 		`Timed out waiting for daemon to start on ${socketPath}.${readDaemonLogTail(socketPath, logOffset)}`,
 	);

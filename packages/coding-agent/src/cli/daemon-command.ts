@@ -8,6 +8,7 @@ import { expandTildePath } from "../config.js";
 import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
+import { prepareProcessLifecycleLaunch, recordProcessLifecycle } from "../core/process-lifecycle.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
@@ -695,23 +696,94 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 		parsed.socketPath,
 		...sessionArgs.daemonArgs.filter((arg) => arg !== "--background" && arg !== "-d"),
 	];
-	const child = spawn(process.execPath, daemonArgs, {
-		cwd: sessionArgs.config?.cwd ?? process.cwd(),
-		detached: true,
-		env: process.env,
-		stdio: "ignore",
+	const trigger = "daemon_command_start";
+	const preparedLaunch = prepareProcessLifecycleLaunch(process.env, {
+		role: "daemon-supervisor",
+		trigger,
+		context: { socketPath: parsed.socketPath },
+	});
+	recordProcessLifecycle("daemon_supervisor_launch", {
+		phase: "attempt",
+		childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+		trigger,
+		socketPath: parsed.socketPath,
+	});
+	let child: ReturnType<typeof spawn>;
+	try {
+		child = spawn(process.execPath, daemonArgs, {
+			cwd: sessionArgs.config?.cwd ?? process.cwd(),
+			detached: true,
+			env: preparedLaunch.environment,
+			stdio: "ignore",
+		});
+	} catch (error) {
+		recordProcessLifecycle("daemon_supervisor_spawn_error", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			trigger,
+			socketPath: parsed.socketPath,
+			errorMessage: error instanceof Error ? error.message : String(error),
+			...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+		});
+		throw error;
+	}
+	child.once("spawn", () => {
+		recordProcessLifecycle("daemon_supervisor_launch", {
+			phase: "spawned",
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath: parsed.socketPath,
+		});
+	});
+	child.once("error", (error) => {
+		recordProcessLifecycle("daemon_supervisor_spawn_error", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath: parsed.socketPath,
+			errorMessage: error.message,
+			...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+		});
+		// Preserve the prior unhandled child-process error behavior after recording it.
+		throw error;
+	});
+	child.once("exit", (code, signal) => {
+		recordProcessLifecycle("daemon_supervisor_exit", {
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			childPid: child.pid,
+			trigger,
+			socketPath: parsed.socketPath,
+			expected: false,
+			reason: "startup-exit",
+			code,
+			signal,
+		});
 	});
 	child.unref();
 
 	const deadline = Date.now() + 10000;
 	while (Date.now() < deadline) {
 		if (await canConnectToDaemon(parsed.socketPath, 250)) {
+			recordProcessLifecycle("daemon_supervisor_launch_result", {
+				status: "ready",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				socketPath: parsed.socketPath,
+			});
 			console.log(`Daemon started on ${parsed.socketPath} (pid ${child.pid})`);
 			return;
 		}
 		await delay(25);
 	}
 
+	recordProcessLifecycle("daemon_supervisor_launch_result", {
+		status: "timeout",
+		childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+		childPid: child.pid,
+		trigger,
+		socketPath: parsed.socketPath,
+	});
 	throw new Error(`Timed out waiting for daemon to start on ${parsed.socketPath}`);
 }
 

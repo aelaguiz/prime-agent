@@ -545,6 +545,20 @@ export function getClientErrorLogPath(): string {
 	return join(getLogsDir(), "client-errors.log");
 }
 
+/** Single-writer lifecycle logs, one JSONL file per process instance. */
+export function getProcessLogsDir(): string {
+	return join(getLogsDir(), "processes");
+}
+
+export function getProcessLifecycleLogPath(processInstanceId: string): string {
+	return join(getProcessLogsDir(), `${processInstanceId}.jsonl`);
+}
+
+/** Privacy-reduced Node diagnostic reports referenced by fatal lifecycle events. */
+export function getCrashReportsDir(): string {
+	return join(getLogsDir(), "crash-reports");
+}
+
 export function getAgentTracesLogPath(): string {
 	return join(getLogsDir(), "agent-traces.log");
 }

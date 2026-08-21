@@ -52,7 +52,17 @@ Do not resolve packaged assets directly from `__dirname`.
 
 ## Debugging
 
-The hidden `/debug` command writes `~/.prime/agent/prime-agent-debug.log` with rendered TUI lines, their visible widths, and the current agent messages. Daemon, worker, client, and provider diagnostic logs live under `~/.prime/agent/logs/`.
+The hidden `/debug` command writes `~/.prime/agent/prime-agent-debug.log` with rendered TUI lines, their visible widths, and the current agent messages.
+
+Runtime diagnostics live under `~/.prime/agent/logs/`:
+
+- `processes/<processInstanceId>.jsonl` records one process's start, heartbeat, signals, fatal failures, exit, and Prime-owned child/restart events. Join files by `processInstanceId`, `parentProcessInstanceId`, and child process instance IDs.
+- `crash-reports/` contains privacy-reduced Node diagnostic reports referenced by catchable JavaScript fatal events. Reports use an allowlisted runtime/resource projection; environment variables, command arguments, error messages, and user text are omitted. Prompt-free daemon-worker, catalog, and update-coordinator roles also enable Node native-fatal reports with environment exclusion. Supervisors, clients, and owned workers do not because their argv can contain user text or credentials.
+- Persisted error and Python stderr text is projected to byte/line counts. JavaScript stacks retain only validated project, dependency, or `node:` frame locations. Raw stderr remains available only to the current in-memory startup error path.
+- Async forked-kernel shutdown/kill/dispose waits boundedly for the fork-server wait-status file before cleanup. Synchronous host-exit cleanup can only persist shutdown intent because it cannot await the Python reaper.
+- `agent.jsonl`, per-socket daemon logs, and `client-errors.log` retain the existing agent/provider, daemon, and client launch context.
+
+Search all process timelines with `rg 'daemon_worker_close|kernel_process_exit|uncaught_exception' ~/.prime/agent/logs/processes`. A process killed by `SIGKILL`, host loss, or a native failure cannot write its own final event; use its last heartbeat and the parent-observed child exit instead. Process logs older than 14 days are removed best-effort, each active process log rotates at 5 MiB, and the newest 20 crash reports are retained.
 
 Useful service commands:
 

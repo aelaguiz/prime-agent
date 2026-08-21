@@ -11,6 +11,11 @@ import {
 	ORPHAN_PROCESS_JOURNAL_ENV,
 	readActiveOrphanProcesses,
 } from "../core/orphan-process-journal.js";
+import {
+	prepareProcessLifecycleLaunch,
+	recordProcessLifecycle,
+	setProcessLifecycleContext,
+} from "../core/process-lifecycle.js";
 import { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../modes/rpc/jsonl.js";
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
@@ -142,6 +147,10 @@ export function installOwnedSessionRecoveryTracking(runtime: AgentSessionRuntime
 	let unsubscribeSession: (() => void) | undefined;
 	const bind = (session: AgentSession) => {
 		unsubscribeSession?.();
+		setProcessLifecycleContext({
+			ownedWorkerProfile: profile,
+			sessionId: session.sessionId,
+		});
 		writeOwnedRecoveryDescriptor(path, profile, session);
 		let lastSessionFile = session.sessionFile;
 		unsubscribeSession = session.subscribe((event) => {
@@ -337,25 +346,65 @@ export async function runOwnedSessionWorkerFrontend(
 		});
 	}
 
-	const spawnWorker = (workerArgs: readonly string[]): ChildProcess => {
+	const spawnWorker = (
+		workerArgs: readonly string[],
+		trigger: string,
+		recoveryAttemptNumber?: number,
+	): { child: ChildProcess; childProcessInstanceId: string } => {
 		const launch = createOwnedWorkerLaunchSpec(workerArgs);
 		const bridgeStdin = profile === "rpc" || process.stdin.isTTY !== true;
 		const stdio: StdioOptions = interactive
 			? ["inherit", "inherit", "inherit", "ipc"]
 			: [bridgeStdin ? "pipe" : "inherit", "pipe", "pipe", "ipc"];
-		const child = spawn(launch.command, launch.args, {
-			cwd: process.cwd(),
-			detached: process.platform !== "win32",
-			env: {
-				...process.env,
-				[OWNED_WORKER_ENV]: "1",
-				[OWNED_RECOVERY_DESCRIPTOR_ENV]: recoveryDescriptorPath,
-				[OWNED_PROFILE_ENV]: profile,
-				[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
-				[SESSION_LEASES_ENABLED_ENV]: "1",
-				[SESSION_LEASE_OWNER_ID_ENV]: `owned-${randomUUID()}`,
-			},
-			stdio,
+		const workerEnvironment = {
+			...process.env,
+			[OWNED_WORKER_ENV]: "1",
+			[OWNED_RECOVERY_DESCRIPTOR_ENV]: recoveryDescriptorPath,
+			[OWNED_PROFILE_ENV]: profile,
+			[ORPHAN_PROCESS_JOURNAL_ENV]: orphanProcessJournalPath,
+			[SESSION_LEASES_ENABLED_ENV]: "1",
+			[SESSION_LEASE_OWNER_ID_ENV]: `owned-${randomUUID()}`,
+		};
+		const preparedLaunch = prepareProcessLifecycleLaunch(workerEnvironment, {
+			role: "owned-session-worker",
+			trigger,
+			context: { ownedWorkerProfile: profile, recoveryAttempt: recoveryAttemptNumber },
+		});
+		recordProcessLifecycle("owned_session_worker_launch", {
+			phase: "attempt",
+			childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+			trigger,
+			ownedWorkerProfile: profile,
+			recoveryAttempt: recoveryAttemptNumber,
+		});
+		let child: ChildProcess;
+		try {
+			child = spawn(launch.command, launch.args, {
+				cwd: process.cwd(),
+				detached: process.platform !== "win32",
+				env: preparedLaunch.environment,
+				stdio,
+			});
+		} catch (error) {
+			recordProcessLifecycle("owned_session_worker_spawn_error", {
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				trigger,
+				ownedWorkerProfile: profile,
+				recoveryAttempt: recoveryAttemptNumber,
+				errorMessage: error instanceof Error ? error.message : String(error),
+				...((error as NodeJS.ErrnoException).code ? { errorCode: (error as NodeJS.ErrnoException).code } : {}),
+			});
+			throw error;
+		}
+		child.once("spawn", () => {
+			recordProcessLifecycle("owned_session_worker_launch", {
+				phase: "spawned",
+				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
+				childPid: child.pid,
+				trigger,
+				ownedWorkerProfile: profile,
+				recoveryAttempt: recoveryAttemptNumber,
+			});
 		});
 		currentChild = child;
 		if (!interactive) {
@@ -390,7 +439,7 @@ export async function runOwnedSessionWorkerFrontend(
 				childOutput.pipe(process.stdout, { end: false });
 			}
 		}
-		return child;
+		return { child, childProcessInstanceId: preparedLaunch.childProcessInstanceId };
 	};
 
 	const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
@@ -412,16 +461,81 @@ export async function runOwnedSessionWorkerFrontend(
 	try {
 		let workerArgs = [...args];
 		let recoveryAttempt = 0;
+		let pendingRecoveryAttempt: number | undefined;
 		while (true) {
 			if (terminating) {
 				return exitCodeForSignal(terminationSignal ?? null);
 			}
 			const workerStartedAt = Date.now();
-			const child = spawnWorker(workerArgs);
+			const trigger = pendingRecoveryAttempt === undefined ? "owned_frontend_start" : "rpc_recovery";
+			const spawned = spawnWorker(workerArgs, trigger, pendingRecoveryAttempt);
+			const { child, childProcessInstanceId } = spawned;
+			const launchedRecoveryAttempt = pendingRecoveryAttempt;
+			pendingRecoveryAttempt = undefined;
+			if (launchedRecoveryAttempt !== undefined) {
+				child.once("spawn", () => {
+					recordProcessLifecycle("owned_session_worker_recovery_result", {
+						status: "spawned",
+						attempt: launchedRecoveryAttempt,
+						childProcessInstanceId,
+						childPid: child.pid,
+						ownedWorkerProfile: profile,
+					});
+				});
+			}
 			const workerPid = child.pid;
-			const exit = await new Promise<{ code: number; signal: NodeJS.Signals | null }>((resolveExit, reject) => {
-				child.once("error", reject);
-				child.once("close", (code, signal) => resolveExit({ code: code ?? exitCodeForSignal(signal), signal }));
+			const exit = await new Promise<{
+				code: number;
+				signal: NodeJS.Signals | null;
+				rpcCrashed: boolean;
+			}>((resolveExit, reject) => {
+				child.once("error", (error) => {
+					recordProcessLifecycle("owned_session_worker_spawn_error", {
+						childProcessInstanceId,
+						childPid: child.pid,
+						trigger,
+						ownedWorkerProfile: profile,
+						recoveryAttempt: launchedRecoveryAttempt,
+						errorMessage: error.message,
+						...((error as NodeJS.ErrnoException).code
+							? { errorCode: (error as NodeJS.ErrnoException).code }
+							: {}),
+					});
+					if (launchedRecoveryAttempt !== undefined) {
+						recordProcessLifecycle("owned_session_worker_recovery_result", {
+							status: "spawn_error",
+							attempt: launchedRecoveryAttempt,
+							childProcessInstanceId,
+							childPid: child.pid,
+							ownedWorkerProfile: profile,
+						});
+					}
+					reject(error);
+				});
+				child.once("close", (code, signal) => {
+					const normalizedCode = code ?? exitCodeForSignal(signal);
+					const pendingRpcCrash = profile === "rpc" && pendingRpcCommands.size > 0;
+					const unexpected = !terminating && (normalizedCode !== 0 || signal !== null || pendingRpcCrash);
+					const rpcCrashed = profile === "rpc" && unexpected;
+					recordProcessLifecycle("owned_session_worker_close", {
+						childProcessInstanceId,
+						childPid: child.pid,
+						trigger,
+						ownedWorkerProfile: profile,
+						recoveryAttempt: launchedRecoveryAttempt,
+						expected: !unexpected,
+						reason: terminating
+							? "frontend-termination"
+							: pendingRpcCrash
+								? "pending-rpc-commands"
+								: unexpected
+									? "unexpected"
+									: "completed",
+						code,
+						signal,
+					});
+					resolveExit({ code: normalizedCode, signal, rpcCrashed });
+				});
 			});
 			currentChild = undefined;
 			currentRpcInput = undefined;
@@ -438,10 +552,7 @@ export async function runOwnedSessionWorkerFrontend(
 				child.disconnect();
 			}
 			reapWorkerResources(workerPid);
-			const rpcCrashed =
-				profile === "rpc" &&
-				!terminating &&
-				(exit.code !== 0 || exit.signal !== null || pendingRpcCommands.size > 0);
+			const { rpcCrashed } = exit;
 			const workerExitCode = rpcCrashed && exit.code === 0 ? 1 : exit.code;
 			if (Date.now() - workerStartedAt >= 60_000) {
 				recoveryAttempt = 0;
@@ -451,17 +562,48 @@ export async function runOwnedSessionWorkerFrontend(
 			}
 			const shouldRecover = rpcCrashed && !stdinEnded && recoveryAttempt < 3;
 			if (!shouldRecover) {
+				if (rpcCrashed) {
+					recordProcessLifecycle("owned_session_worker_recovery_result", {
+						status: stdinEnded ? "stdin_ended" : "exhausted",
+						attempts: recoveryAttempt,
+						childProcessInstanceId,
+						childPid: workerPid,
+						ownedWorkerProfile: profile,
+					});
+				}
 				return terminationSignal ? exitCodeForSignal(terminationSignal) : workerExitCode;
 			}
 			const descriptor = readOwnedRecoveryDescriptor(recoveryDescriptorPath);
 			if (!descriptor?.sessionFile) {
+				recordProcessLifecycle("owned_session_worker_recovery_result", {
+					status: "missing_session",
+					attempts: recoveryAttempt,
+					childProcessInstanceId,
+					childPid: workerPid,
+					ownedWorkerProfile: profile,
+				});
 				return terminationSignal ? exitCodeForSignal(terminationSignal) : workerExitCode;
 			}
 			workerArgs = createRpcRecoveryArgs(args, descriptor.sessionFile);
 			const retryDelay = [250, 1000, 5000][recoveryAttempt] ?? 5000;
 			recoveryAttempt++;
+			pendingRecoveryAttempt = recoveryAttempt;
+			recordProcessLifecycle("owned_session_worker_recovery_attempt", {
+				attempt: recoveryAttempt,
+				delayMs: retryDelay,
+				previousChildProcessInstanceId: childProcessInstanceId,
+				previousChildPid: workerPid,
+				ownedWorkerProfile: profile,
+				sessionId: descriptor.sessionId,
+			});
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, retryDelay));
 			if (terminating) {
+				recordProcessLifecycle("owned_session_worker_recovery_result", {
+					status: "cancelled",
+					attempt: recoveryAttempt,
+					ownedWorkerProfile: profile,
+					sessionId: descriptor.sessionId,
+				});
 				return exitCodeForSignal(terminationSignal ?? null);
 			}
 		}

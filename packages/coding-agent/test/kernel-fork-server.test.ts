@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { ForkServerUnavailable, forkKernel, isForkServerEnabled } from "../src/core/kernel/fork-server.js";
 import { FORK_SERVER_SCRIPT } from "../src/core/kernel/fork-server-script.js";
@@ -44,6 +45,20 @@ describe("fork-server gating", () => {
 				}),
 			).rejects.toBeInstanceOf(ForkServerUnavailable);
 		}
+	});
+
+	it("keeps the embedded reaper status protocol syntactically valid", () => {
+		const result = spawnSync(
+			"python3",
+			["-c", `compile(${JSON.stringify(FORK_SERVER_SCRIPT)}, "fork-server", "exec")`],
+			{
+				encoding: "utf8",
+			},
+		);
+		expect(result.status, result.stderr).toBe(0);
+		expect(FORK_SERVER_SCRIPT).toContain('exit_path = req.get("exitPath")');
+		expect(FORK_SERVER_SCRIPT).toContain("os.WTERMSIG(status)");
+		expect(FORK_SERVER_SCRIPT).toContain("os.replace(temp_path, path)");
 	});
 
 	it("disables shared IPython history in forked kernel children", () => {

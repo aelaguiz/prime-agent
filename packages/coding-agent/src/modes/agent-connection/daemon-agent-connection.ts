@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, ServiceTier, Transport } from "@earendil-works/pi-ai";
-import { appendRotatingLog, getAgentLogPath, getDaemonLogPath } from "../../config.js";
+import { appendRotatingLog, getAgentLogPath, getDaemonLogPath, getProcessLogsDir } from "../../config.js";
 import type { AgentSessionMessageReceipt, AgentSessionMessageSafetyStatus } from "../../core/agent-messages.js";
 import type { AgentSessionEvent } from "../../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
@@ -1728,6 +1728,7 @@ export class DaemonAgentConnection implements AgentConnection {
 			details.push(`Session file: ${this.attachedSessionFile}.`);
 		}
 		details.push(`Diagnostic log: ${this.daemonLogPath ?? getAgentLogPath()}.`);
+		details.push(`Process lifecycle logs: ${getProcessLogsDir()}.`);
 		return details.join(" ");
 	}
 

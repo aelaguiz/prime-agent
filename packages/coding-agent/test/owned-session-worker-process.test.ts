@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -58,6 +58,23 @@ function spawnFrontend(
 	});
 	children.add(child);
 	return child;
+}
+
+function readLifecycleRecords(agentDir: string): Array<Record<string, unknown>> {
+	const directory = join(agentDir, "logs", "processes");
+	try {
+		return readdirSync(directory)
+			.filter((name) => name.endsWith(".jsonl"))
+			.flatMap((name) =>
+				readFileSync(join(directory, name), "utf8")
+					.trim()
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line) as Record<string, unknown>),
+			);
+	} catch {
+		return [];
+	}
 }
 
 async function waitForWorkerPid(path: string): Promise<number> {
@@ -222,7 +239,9 @@ describe("owned session worker processes", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
 		tempDirs.push(root);
 		const pidPath = join(root, "worker.pid");
+		const agentDir = join(root, "agent");
 		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
+			PRIME_AGENT_CODING_AGENT_DIR: agentDir,
 			PRIME_AGENT_TEST_CRASH_ON_ACK: "1",
 		});
 		let stdout = "";
@@ -240,6 +259,29 @@ describe("owned session worker processes", () => {
 		expect(stdout).toBe(
 			`${JSON.stringify({ id: "request-1", type: "response", command: "get_state", success: true })}\n`,
 		);
+		const lifecycle = readLifecycleRecords(agentDir);
+		const crashed = lifecycle.find(
+			(record) =>
+				record.event === "owned_session_worker_close" &&
+				(record.details as { childPid?: number } | undefined)?.childPid === workerPid,
+		);
+		expect(crashed).toEqual(
+			expect.objectContaining({
+				details: expect.objectContaining({ code: 1, expected: false, reason: "unexpected" }),
+			}),
+		);
+		const crashedDetails = crashed?.details as { childProcessInstanceId?: string } | undefined;
+		const recovered = lifecycle.find(
+			(record) =>
+				record.event === "owned_session_worker_recovery_result" &&
+				(record.details as { childPid?: number; status?: string } | undefined)?.childPid === replacementPid,
+		);
+		expect(recovered).toEqual(
+			expect.objectContaining({ details: expect.objectContaining({ attempt: 1, status: "spawned" }) }),
+		);
+		const recoveredDetails = recovered?.details as { childProcessInstanceId?: string } | undefined;
+		expect(recoveredDetails?.childProcessInstanceId).toEqual(expect.any(String));
+		expect(recoveredDetails?.childProcessInstanceId).not.toBe(crashedDetails?.childProcessInstanceId);
 		await waitForProcessGone(workerPid);
 		await waitForProcessGone(replacementPid);
 	});
@@ -277,7 +319,9 @@ describe("owned session worker processes", () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-owned-worker-test-"));
 		tempDirs.push(root);
 		const pidPath = join(root, "worker.pid");
+		const agentDir = join(root, "agent");
 		const frontend = spawnFrontend(["--mode", "rpc"], pidPath, false, {
+			PRIME_AGENT_CODING_AGENT_DIR: agentDir,
 			PRIME_AGENT_TEST_EXIT_ZERO_ON_COMMAND: "get_state",
 		});
 		let stdout = "";
@@ -298,6 +342,17 @@ describe("owned session worker processes", () => {
 				success: false,
 				error: "The isolated session worker stopped during this command; its result is uncertain and was not replayed",
 			})}\n`,
+		);
+		expect(readLifecycleRecords(agentDir)).toContainEqual(
+			expect.objectContaining({
+				event: "owned_session_worker_close",
+				details: expect.objectContaining({
+					childPid: workerPid,
+					code: 0,
+					expected: false,
+					reason: "pending-rpc-commands",
+				}),
+			}),
 		);
 		await waitForProcessGone(workerPid);
 	});
