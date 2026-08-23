@@ -7,15 +7,17 @@ reviewers: []
 related:
   - https://github.com/aelaguiz/prime-agent/actions/runs/32657250978
   - https://github.com/aelaguiz/prime-agent/actions/runs/32657250958
+  - https://github.com/aelaguiz/prime-agent/actions/runs/32659113077
+  - https://github.com/aelaguiz/prime-agent/actions/runs/32659113044
 ---
 
 <!-- bugs:block:tldr -->
 ## TL;DR
 
-- **Symptom:** Every push to fork `main` finishes with red `CI` and `Release Prime Agent` workflows even though build/check, the kernel shard, and all non-coding-agent package tests pass.
-- **Impact:** The fork has no trustworthy green integration signal after the v0.8.0 merge and cannot produce its configured release artifacts.
-- **Most likely cause:** Five snapshot-bearing test runtime constructors predate the fork's `runtime.services.authStorage` credential projection; two other test doubles omit newly required session/model fields; one deliberate best-effort catch lacks the explanatory comment enforced by CI. Separately, an upstream release workflow sets production/beta publishing flags in the fork even though only the canonical upstream repository owns its R2 release channel.
-- **Next action:** Commit and push the locally verified repair, then monitor the fork's Linux `CI` and `Release Prime Agent` workflows and respond only to newly evidenced failures.
+- **Symptom:** The first repair makes the fork release workflow and nine of eleven CI jobs green, but two loaded Linux process tests still fail after their behavior assertions: one on an `ENOTEMPTY` teardown race and one on a fixed 10-second child-exit deadline.
+- **Impact:** The fork still lacks a completely green integration signal after the v0.8.0 merge even though all original ACP, fixture-contract, check, and release-ownership failures are fixed.
+- **Most likely cause:** Detached recovery processes can flush their last lifecycle record after the daemon socket and workers have closed, while the deliberately blocked real CLI process can take more than the ordinary fixture deadline to compile in a loaded shard.
+- **Next action:** Verify bounded process cleanup and the targeted extended loader deadline locally, rerun exact shard 1 plus repository checks, then push and monitor both workflows through completion.
 - **Status:** Verifying.
 <!-- /bugs:block:tldr -->
 
@@ -44,6 +46,10 @@ Fork commit `8685f1d024fd06bf14777e902d9a123d5aa3082c` builds and type-checks su
 - `test/no-silent-catch.test.ts` reproduces independently. The catch is intentionally best-effort and its surrounding prose says the next state event reconciles the snapshot, but the required explanation is outside rather than inside the catch body.
 - `test/process-lifecycle-process.test.ts` passes all 13 tests alone in 1.50 seconds. No process-lifecycle change is justified unless the repaired shard reproduces the timeout.
 - The fork currently defines no Actions variables or secret names for the inherited R2 workflow. The checked-in workflow is byte-equivalent to upstream's publishing workflow and the fork's recent release runs have no successful publication path.
+- Replacement release run `32659113044` passes on exact repair head `40c6099e`: build/check succeeds and fork-owned pack/upload/publish steps are correctly skipped.
+- Replacement CI run `32659113077` clears every original ACP and stale-double failure. Nine of eleven constituent jobs pass, including coding-agent shards 2 and 3; only process smoke and coding-agent shard 1 remain red.
+- Process-smoke behavior passes, including snapshot streaming and same-worker adoption, before `afterEach` fails removing `/tmp/prime-daemon-supervisor-test-*/agent` with `ENOTEMPTY`. That is the same detached lifecycle-writer cleanup race reproduced locally in ENG-4600 after all behavior assertions pass.
+- Coding-agent shard 1 passes 1,482 tests (26 skipped); only `captures an actual CLI failure before cli-main loads` reaches its fixed 10-second `waitForExit()` deadline. The full file passes locally in roughly 1.5 seconds, identifying CI shard load rather than a changed lifecycle result.
 
 ## Investigation
 
@@ -55,16 +61,16 @@ The failure set is concentrated in coding-agent test contracts and one release o
 2. **Confirmed — two additional stale test doubles:** The in-process session double omits `rebindModelsFromRegistry()` and the startup connection-model fixture omits `id`.
 3. **Confirmed — locally enforced explanatory-comment violation:** The empty catch is intentional but its safety rationale is not inside the catch body as the invariant requires.
 4. **Confirmed — fork release ownership mismatch:** The inherited upstream workflow asserts publish intent without the upstream repository's R2 configuration.
-5. **Unconfirmed secondary symptom — process fixture timeout:** The file passes alone; failed ACP tests do not reach cleanup, so the timeout will be re-evaluated only after the deterministic failures are repaired.
+5. **Confirmed — bounded process-harness assumptions are too narrow under load:** The replacement Linux run exposes an OS-level directory removal race after successful daemon assertions and a deliberately blocked real-process fixture exceeding its ordinary 10-second deadline.
 
 ## Scope and Simplicity Contract
 
 - **Human-authorized corrected behavior:** Make the fork's current `main` GitHub CI workflows pass, push the necessary fixes to `origin/main`, and continue through replacement runs until they pass.
 - **Smallest sufficient fix:** Supply the existing harness auth storage in the five partial runtime fixtures; add the current catalog-rebind method and required model ID to their direct test doubles; put the existing best-effort rationale inside the empty catch; and make upstream publication intent conditional on the canonical upstream repository while retaining fork build/check validation.
 - **Initial minimal convergence closure:** The shared runtime fixture contract spans ACP mode, ACP features, ACP RLM, canonical-cwd, and update-restart tests and must move together because they all call the same snapshot owner. The two independent direct fixtures, one catch body, and release-context/publish-job gates are the only additional owners. No production daemon/session protocol or behavior changes.
-- **Scope sign-off:** Signed off before implementation on 2026-08-23. The process timeout receives no patch unless it persists after deterministic failures and cleanup paths are restored.
+- **Scope sign-off:** Signed off before implementation on 2026-08-23. The replacement run confirms the deferred process timeout and teardown race, authorizing only bounded harness cleanup and a test-specific loader deadline; production lifecycle behavior remains out of scope.
 - **Enough proof:** Every previously failing focused test passes locally; `npm run check` passes with full output; a pushed exact head receives successful `CI` and `Release Prime Agent` conclusions on the fork.
-- **Do not build:** No test disabling, reduced matrix coverage, blanket retries, swallowed errors, compatibility fallbacks, dependency downgrade, daemon behavior expansion, or unrelated upstream cleanup.
+- **Do not build:** No test disabling, reduced matrix coverage, behavioral-operation retries, swallowed errors, compatibility fallbacks, dependency downgrade, daemon behavior expansion, or unrelated upstream cleanup.
 - **Accepted residual risk:** Platform-only behavior not exercised by the focused local macOS runs remains owned by the complete Linux GitHub matrix.
 <!-- /bugs:block:analysis -->
 
@@ -77,6 +83,7 @@ The failure set is concentrated in coding-agent test contracts and one release o
 4. Keep fork release build/check active, but set publication intent only for `PrimeIntellect-ai/prime-agent` and skip the publication job when neither channel is selected.
 5. Run every modified/failing test file, then all three exact CI shards and the required repository check.
 6. Commit only owned files, push `main`, and monitor both fork workflows through completion; repeat only for newly evidenced in-scope failures.
+7. Give detached fixture writers a bounded teardown window and extend only the deliberately loader-blocked real-process case to 20 seconds, then repeat its focused tests and exact shard 1.
 <!-- /bugs:block:fix_plan -->
 
 <!-- bugs:block:implementation -->
@@ -90,4 +97,8 @@ The failure set is concentrated in coding-agent test contracts and one release o
 - Exact coding-agent shard 2 passes with 1,782 tests (14 skipped); shard 3 passes with 1,272 tests (16 skipped).
 - Exact shard 1 clears all original failures and passes 1,483 tests (25 skipped), then encounters an unrelated Darwin-only `ENOTEMPTY` cleanup race in ENG-4600 after its behavior assertions complete. The isolated rerun reproduces only that teardown race; the same regression passed on the prior Linux Actions run, so the authoritative replacement Linux matrix remains the scoped proof rather than expanding this fix into supervisor cleanup behavior.
 - Repository-wide `npm run check` passes with no formatter changes, including TypeScript, installer rendering, and browser smoke checks. The release workflow also parses as YAML; local `actionlint` reports only inherited workflow/tool-version findings, not the new repository gate.
+- Pushed repair commit `40c6099e` makes replacement release run `32659113044` green and clears every original coding-agent failure in replacement CI run `32659113077`.
+- The replacement CI run narrows the remaining failures to post-assertion `ENOTEMPTY` cleanup in process smoke and a 10-second real-process loader deadline in shard 1. The follow-up keeps all behavior assertions intact while adding bounded filesystem retries and extending only that intentionally blocked loader case.
+- Follow-up focused verification passes: process lifecycle 13/13, process smoke 10/10 applicable tests (8 platform/tag skips), and ENG-4600 supervisor singleton 15/15, including the teardown path that previously reproduced `ENOTEMPTY` locally.
+- Exact coding-agent shard 1 now passes 114 files with 1,484 tests passed and 25 skipped. Repository-wide `npm run check` also passes again with no formatter changes.
 <!-- /bugs:block:implementation -->

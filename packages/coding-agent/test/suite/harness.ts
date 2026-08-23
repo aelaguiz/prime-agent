@@ -231,8 +231,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {
 				// Spawned fixture processes may still be flushing their final registry
-				// writes; retry briefly instead of failing the suite on ENOTEMPTY.
-				rmSync(tempDir, { recursive: true, force: true, maxRetries: 40, retryDelay: 50 });
+				// writes; retry within a bounded window instead of failing on ENOTEMPTY.
+				rmSync(tempDir, { recursive: true, force: true, maxRetries: 200, retryDelay: 50 });
 			}
 		},
 	};
