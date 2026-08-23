@@ -1,18 +1,18 @@
 # Prime Agent Upstream 0.8.0 Integration Implementation Log
 
 Plan: <code>docs/aelaguiz/PRIME_AGENT_UPSTREAM_0_8_0_INTEGRATION_PLAN_2026-08-22.md</code>
-Audit log: none yet; create the matching plan-audit ledger for Phase 4 findings/verdict
+Audit log: <code>docs/aelaguiz/PRIME_AGENT_UPSTREAM_0_8_0_INTEGRATION_PLAN_2026-08-22_PLAN_AUDIT.md</code>
 Active scope: whole approved plan through local deterministic proof, isolated AIM-managed Claude/Codex canaries, draft PR, and CI; stop before merge approval
 Scope contract anchor: plan Sections 1, 6-9, and the 2026-08-23 execution-boundary/canary approval
 Scope status: approved
 Last updated: 2026-08-23
-Current checkpoint: the pinned upstream tree is semantically composed in the uncommitted two-parent merge on <code>integrate/upstream-0.8.0-20260822</code>; all deterministic local checks are green; next freeze the merge commit, then run isolated source/TUI and AIM Claude/Codex canaries
+Current checkpoint: the pinned upstream tree is frozen in verified two-parent merge <code>666a754eed008312a1c8995662ac68a27e2bb1ce</code> on <code>integrate/upstream-0.8.0-20260822</code>; all deterministic local checks, isolated source/TUI smoke, real isolated AIM Codex/Claude canaries, and the separate implementation audit are green; the Phase-5 refresh confirmed <code>origin/main</code> and <code>upstream/main</code> are still exactly frozen pins; next commit documentation receipts, open the draft PR, and require full Linux CI
 
 ## Resume Snapshot
 
-- Current state: exact fork/upstream/AIMGR pins remain frozen; all six predicted conflicts are resolved; all 24 overlapping paths are audited; released 0.8.0 changelogs are upstream-identical; generated models are reproducible; the post-repair TypeScript/Python matrix and root check are green; the merge is intentionally still uncommitted while this log is finalized.
-- Next useful move: explicitly stage reviewed paths, inspect the complete staged merge, create the two-parent merge commit, and record its identity before isolated runtime canaries.
-- Do not redo unless stale: frozen refs, dependency bootstrap, six conflict resolutions, 24-path audit, model generation, local deterministic matrix, root check.
+- Current state: exact fork/upstream/AIMGR pins remain frozen; all six predicted conflicts are resolved; all 24 overlapping paths are audited; released 0.8.0 changelogs are upstream-identical; generated models are reproducible; the post-repair TypeScript/Python matrix and root/commit-hook checks are green; the merge has the exact planned fork and upstream parents; the source smoke, exact Codex/Claude markers, cleanup verification, and read-only implementation audit all passed.
+- Next useful move: refresh <code>origin/main</code> and <code>upstream/main</code>, reconcile only if either moved, commit the documentation/audit receipts, push without force, open a draft PR, and wait for every required CI job.
+- Do not redo unless stale: frozen refs, dependency bootstrap, six conflict resolutions, 24-path audit, model generation, local deterministic matrix, root check, source smoke, AIM canaries, and implementation audit. Rerun affected proof if source or a frozen remote head changes.
 - Known blockers: none.
 - Native children used or useful next: none; repository/session policy does not authorize subagent fanout for this run.
 - Pre/post-dispatch repository-state check: not applicable; no children.
@@ -23,14 +23,15 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 | --- | --- | --- | --- | --- | --- | --- |
 | Freeze exact fork/upstream/AIMGR inputs | Sections 2-3, Phase 0 | authorized | complete | Git refs below | fetch/rev-list receipts | direct |
 | Baseline fork contracts | Phase 0 | authorized | complete | existing fork tests | 955 passed; 9 reproduced baseline failures in three files | direct |
-| Two-parent upstream merge | Phase 1 | authorized | composed, commit pending | six conflicts/24 overlaps | no unmerged paths or conflict markers | direct |
+| Two-parent upstream merge | Phase 1 | authorized | complete | <code>666a754e</code>; six conflicts/24 overlaps | exact two parents; no unmerged paths or conflict markers | direct |
 | Protocol 7/schema 23 union | Section 6.1 | authorized | complete | daemon protocol and connections | digest/schema/capability tests | direct |
 | Kernel/forkserver composition | Sections 6.2-6.4 | authorized | complete | kernel owner/forkserver | focused, adjacent, heavy, and Python runtime tests | direct |
 | Generated model/catalog union | Section 6.5 | authorized | complete | model generator/output | two identical generation hashes plus model/provider tests | direct |
 | UI/changelog/version composition | Sections 6.6 and 8 | authorized | complete | summary tile/fragments/manifests | UI tests, upstream-identical released changelogs, version inspection | direct |
 | Focused local proof and check | Phases 2-3 | authorized | complete | package tests/root check | all selected post-repair tests green; <code>npm run check</code> green | direct |
-| AIM Claude/Codex canaries | Phase 3, 2026-08-23 approval | authorized | pending | AIM descriptor/helper to merged source | pending | direct |
-| Implementation audit, draft PR, CI | Phases 4-6 | authorized | pending | audit/PR/checks | pending | direct |
+| AIM Claude/Codex canaries | Phase 3, 2026-08-23 approval | authorized | complete | isolated AIM descriptor/helper to merged source | exact <code>AIM_CODEX_OK</code> and <code>AIM_CLAUDE_OK</code>, exit 0, cleanup verified | direct |
+| Separate implementation audit | Phase 4 | authorized | complete | matching plan-audit ledger | PASS, no implementation finding | direct |
+| Draft PR and CI | Phases 5-6 | authorized | pending | PR/checks | remote refresh required first | direct |
 | Merge into origin/main | Phase 7 | later human approval required | blocked by approval gate | PR merge | green receipts required | explicit Amir approval |
 
 ## Code Read Ledger
@@ -93,7 +94,7 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 
 | Proof | Scope covered | Result/context | Fresh until | Rerun trigger |
 | --- | --- | --- | --- | --- |
-| Fork/upstream refresh | ancestry/inventory | fork <code>7e7bb45</code>; upstream <code>e319a66</code>; base <code>bb61ca2</code>; 42/16 | next fetch | remote update |
+| Fork/upstream refresh | ancestry/inventory | refreshed again before PR: origin <code>7e7bb45</code>; upstream <code>e319a66</code>; base <code>bb61ca2</code>; both frozen comparisons 0/0 | next fetch | remote update |
 | AIMGR refresh | canary integration owner | fast-forwarded cleanly to <code>82dbab6888a0e2ac9c37bece538c86696c80d14b</code> | AIMGR update | remote/local change |
 | Dependency bootstrap | whole workspace | npm 11.10.1 <code>ci</code> passed; lock SHA-256 unchanged at <code>bc551f046cf328665bda542e017a66f44dda84b315468b3fa31d6bbcf5e10abb</code> | lock or Node change | dependency/lock change |
 | Frozen-fork baseline | selected fork contracts | 955 passed; 9 failures reproduced before merge (4 model-registry, 3 interactive replacement, 2 process stack fixtures) | source merge | completed comparison |
@@ -116,6 +117,12 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 | Python runtime canonical CI command | MCP runtime | <code>uv run python -m unittest discover -s test</code>; 98 passed | Python runtime change | runtime source/test change |
 | Static tree checks | conflict/whitespace/generated release state | no unmerged paths, conflict markers, or diff-check errors; released changelogs upstream-identical | tree change | any edit |
 | Root repository check | formatting, TypeScript, installer, browser smoke | <code>npx npm@11.10.1 run check</code> passed; Biome checked 964 files with no fixes | tree change | any edit |
+| Isolated source smoke | merged launcher, CLI, TUI, unique daemon boundary | <code>--help</code> passed; 80x24 TUI rendered; exact tmux/socket/process/root removed | source/launcher change | source or launcher change |
+| Isolated AIM target status | external-descriptor boundary | isolated AIM home and Prime target; <code>pathConflict: false</code>; Redis coordination available; both descriptors record-ready and non-secret | AIMGR/Prime auth change | auth integration change |
+| AIM-managed Codex canary | end-to-end external helper through merged source | <code>openai-codex/gpt-5.6-sol</code>; exact <code>AIM_CODEX_OK</code>; exit 0 | auth/provider/source change | affected integration change |
+| AIM-managed Claude canary | end-to-end external helper through merged source | <code>anthropic/claude-fable-5</code>; exact <code>AIM_CLAUDE_OK</code>; exit 0 | auth/provider/source change | affected integration change |
+| Canary cleanup | temporary descriptors, daemon sockets, private temp config | both descriptors uninstalled; auth keys empty; exact daemons shut down; <code>/tmp/prime-agent-aim-canary.YqV0pc</code> removed; no reauth/logout/rotation | not reusable | rerun canary only if required |
+| Separate implementation audit | plan-to-code completeness and side doors | PASS at <code>666a754e</code>; no implementation finding; five non-code observations recorded | high-risk source/tree change | repeat audit after such a change |
 
 ## Continuous Review Ledger
 
@@ -126,6 +133,8 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 | Replacement-session fixture lacked registry rebinding and aborted provider refresh | frozen baseline | resolved | <code>interactive-mode-status.test.ts</code> | Added the production-shaped no-op rebind method to the fake; exact 173-test file and 277-test UI group green. |
 | Crash sanitizer recognized only a literal <code>/prime-agent/</code> checkout name | frozen baseline | resolved | <code>process-lifecycle.ts</code> | Normalize separators and anchor privacy-safe projection at <code>/packages/coding-agent/</code>; exact 13-test lifecycle file and final 32-test group green. |
 | Saved plan used non-existent Python module path <code>test.test_mcp</code> | command execution | resolved as plan-command drift | implementation record | Repository CI is authoritative: <code>uv run python -m unittest discover -s test</code>; all 98 runtime tests passed. |
+| Saved source-smoke cleanup put launcher flags before <code>shutdown</code> | smoke execution | resolved as plan-command drift | canonical plan Phase 3 | The public form was not an exact-socket daemon command. Cleanup used the source daemon client for the unique socket; one already-unlinked verified supervisor received targeted <code>SIGTERM</code>. The plan now documents the exact-socket helper and forbids global cleanup. |
+| Environment-only Prime target isolation conflicted with AIM's persisted target owner | first canary preflight | resolved as isolation-procedure drift | canonical plan Phase 3 | The accidental default-target descriptors were immediately uninstalled and status returned to absent. Successful canaries used a separate AIM <code>--home</code>, private non-secret config copy, and required <code>pathConflict: false</code>. |
 | Generated catalog differs from both frozen parents | generator review | accepted | merged generator and generated output | Live-source delta is expected and reproducible: versus upstream +112/-75 lines, versus fork +424/-264; two consecutive hashes match. |
 
 ## Side Doors And Deletes
@@ -137,17 +146,18 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 | Fork direct release notes | migrated only for fork-only additions | two direct-child fragments; all released changelogs match upstream | conforming | Section 8 |
 | ACP environment/bearer persistence | none | session-scoped validation/owner cleanup; no recovery/session credential persistence | conforming | Sections 6.1 and 7 |
 | Existing untracked uv bug doc | untouched in primary checkout | SHA-256 <code>7c3673c958717e12b705d0745e992177a081dd6bb9133cfd4351df64010df92c</code> | conforming | Section 2.3 |
-| Live/default AIM/Prime state in canaries | never used | canaries pending; unique temporary paths required | authorized constraint | Phase 3 canaries |
+| Live/default AIM/Prime state in canaries | no lasting mutation; no live session use | first preflight descriptors were removed immediately; successful runs used isolated AIM/Prime homes and unique sockets; default status ended with both providers absent | conforming after recovery | Phase 3 canaries and audit OBS-003/005 |
 
 ## Decision Carry-Through
 
 | Decision | Owner | Plan carry-through | Code carry-through | Status |
 | --- | --- | --- | --- | --- |
-| Two-parent merge; no squash/rebase | Amir/plan | Sections 2 and 13 | exact pinned upstream merge in progress | approved |
+| Two-parent merge; no squash/rebase | Amir/plan | Sections 2 and 13 | <code>666a754e</code> has parents <code>dd379419</code> and <code>e319a66d</code> | complete |
 | Protocol 7/schema 23 union | Amir/plan | Section 6.1 | both capabilities/commands with historical floors | complete |
 | Handle-based kernel control plus fork diagnostics | Amir/plan | Sections 6.2-6.4 | composed handle, watchdog, exit, journal, lifecycle paths | complete |
 | Generator-only model reconciliation | repo policy/plan | Section 6.5 | deterministic generated artifact | complete |
-| Real AIM Claude/Codex canaries | Amir, 2026-08-23 | execution boundary and Phase 3 | pending | approved |
+| Real AIM Claude/Codex canaries | Amir, 2026-08-23 | execution boundary and Phase 3 | both isolated completions returned their exact markers and were cleaned up | complete |
+| Separate read-only audit | plan/Phase 4 | Phase 4 and audit-result block | matching plan-audit ledger reports PASS/no finding at merge tree | complete |
 | Stop before merge for proof approval | repo policy/plan | Phase 7 | no origin/main mutation | active gate |
 
 ## Frozen Inputs
@@ -157,6 +167,8 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 - Merge base: <code>bb61ca21c3e27a5d2af7fab3ab662789a5e478d2</code>
 - AIMGR: <code>82dbab6888a0e2ac9c37bece538c86696c80d14b</code>
 - Plan commit: <code>dd3794195a01f7099d9f5a36f1826db4b4b6b139</code>
+- Merge commit: <code>666a754eed008312a1c8995662ac68a27e2bb1ce</code>
+- Merge tree: <code>ed41e3571ab5ea26ec16f3a415b2608eeb7237ef</code>
 - Node: 22.19.0
 - npm lane: 11.10.1 through <code>npx</code>
 
@@ -190,4 +202,55 @@ Current checkpoint: the pinned upstream tree is semantically composed in the unc
 - Changed: repaired the ACP test harness, Grok 4.6 subscription overlay, replacement-session fake, and worktree-independent privacy-safe crash projection; added exact schema/capability and forkserver exit-file regressions.
 - Proof: all focused, upstream-changed, fork-preservation, kernel-heavy, and Python runtime groups listed above are green; the three frozen-fork failure groups are now green; root check passed with no formatter edits.
 - Review: the failed Python module invocation was plan-command drift, replaced by the repository CI command; no code failure was hidden or waived.
-- Next: explicitly stage and inspect the merge, commit with exact two-parent ancestry, then run isolated source/TUI and AIM-managed Claude/Codex canaries.
+- Next: run isolated source/TUI and AIM-managed Claude/Codex canaries.
+
+### 2026-08-23 - Merge freeze
+
+- Intent: preserve the official upstream ancestry and the reviewed composed tree as one auditable merge boundary.
+- Changed: created merge commit <code>666a754eed008312a1c8995662ac68a27e2bb1ce</code> with tree <code>ed41e3571ab5ea26ec16f3a415b2608eeb7237ef</code>.
+- Proof: parents are exactly plan commit <code>dd3794195a01f7099d9f5a36f1826db4b4b6b139</code> and upstream pin <code>e319a66d7351c75abe7f040d02d9a8d6e25028e9</code>; both frozen lineages are ancestors; the commit hook reran the full repository check and passed with no formatter changes.
+- Review: the merge boundary contains the complete upstream range and all reviewed adaptations without rebasing or squashing away lineage.
+
+### 2026-08-23 - Isolated merged-source smoke
+
+- Intent: prove the merged checkout launches its CLI and TUI without credentials or contact with default Prime state.
+- Isolation: temporary root <code>/tmp/prime-agent-upstream-080.YoSCpO</code>; unique agent/session/supervisor directories, daemon socket, and 80x24 tmux session.
+- Proof: <code>./prime-agent.sh --no-env --daemon-socket ... --help</code> printed the merged CLI surface; the TUI rendered its welcome/login screen; no credential was requested.
+- Deviation: the plan's flags-before-command <code>shutdown</code> invocation was parsed as a normal model run and correctly failed for no API key. It was not a valid exact-socket daemon-control form.
+- Cleanup: exited/killed only the exact temporary tmux session; used the source <code>handleDaemonCommand</code> client to list zero sessions and request shutdown on the exact socket; after a startup/cleanup race left the original supervisor holding an already-unlinked socket, verified PID 54113 with <code>lsof</code>/<code>ps</code> and sent only that PID <code>SIGTERM</code>. No <code>SIGKILL</code> was needed; final <code>lsof</code> and tmux checks were empty and the exact root was removed.
+- Review: source behavior passed. The cleanup command was corrected in the canonical plan as operator-command drift, not hidden as a product/test pass.
+
+### 2026-08-23 - AIM target-isolation correction
+
+- Intent: install non-secret AIM external descriptors only in a temporary Prime target before provider canaries.
+- First preflight: setting only <code>PRIME_AGENT_CODING_AGENT_DIR</code> did not retarget the existing AIM home. AIM deliberately preserved its persisted target owner and reported the default auth path, temporary resolved path, and <code>pathConflict: true</code>.
+- Immediate recovery: ran provider-scoped default-target uninstalls for OpenAI Codex and Anthropic. Both returned removed/updated receipts without backup restoration. Follow-up default <code>aim prime status</code> showed both providers absent and no path conflict. No model completion or provider call occurred in this failed preflight.
+- Corrected isolation: created a temporary AIM home under the canary root, copied only the non-secret AIM configuration with mode 0600, left process <code>HOME</code> unchanged for the live Redis credential-helper authority, and passed <code>--home</code> to every AIM command.
+- Proof: isolated status resolved both auth and target paths into the canary root with <code>pathConflict: false</code>; Redis coordination was available; both provider records were installed, bound, and record-ready; <code>secretsCopiedToTarget</code> was false. Descriptor inspection was limited to non-secret shape/identity fields and showed the external <code>aimgr-credential-v1</code> protocol with no access token or API key field.
+- Review: this is expected AIM ownership behavior. The plan now requires an isolated AIM home and a <code>pathConflict: false</code> precondition.
+
+### 2026-08-23 - Real AIM-managed Codex and Claude canaries
+
+- Intent: prove both provider paths through the merged Prime source and AIM's external helper, with no reauthentication, logout, rotation, or live-session mutation.
+- Codex: ran merged source in bounded print mode with <code>openai-codex/gpt-5.6-sol</code>, minimal thinking, no session/tools/context/skills/extensions/themes, unique daemon/socket/state, and <code>--no-env</code>. Exit status was zero and model output was exactly <code>AIM_CODEX_OK</code> (apart from the launcher banner).
+- Claude: repeated the same isolation with <code>anthropic/claude-fable-5</code>. Exit status was zero and model output was exactly <code>AIM_CLAUDE_OK</code>.
+- Secret boundary: no bearer/refresh value was printed, inspected, copied, or saved into the target. Evidence contains only redacted status, non-secret descriptor shape, model names, exit state, and the fixed markers.
+- Cleanup: uninstalled both descriptors through the isolated AIM home; isolated status showed both absent and auth keys empty; listed zero sessions and shut down both exact canary sockets through the source daemon client; verified no open file remained under the canary root; removed exact root <code>/tmp/prime-agent-aim-canary.YqV0pc</code>, including its private config copy.
+- Review: both end-to-end AIM contracts are proven against the merged source and all temporary processes/state are gone.
+
+### 2026-08-23 - Separate read-only implementation audit
+
+- Intent: independently reconcile the final merge tree with every plan requirement after local proof.
+- Audited: merge <code>666a754eed008312a1c8995662ac68a27e2bb1ce</code>, tree <code>ed41e3571ab5ea26ec16f3a415b2608eeb7237ef</code>, both frozen lineages, six conflicts, 24 semantic overlaps, protocol/kernel/ACP/refinement/provider/model/UI/release call flows, side doors, and existing receipts.
+- Audit discipline: no tests, builds, lint, generator, canary, or CI command ran during the audit; no production/test code was modified; no sub-agent was used because session policy did not authorize delegation.
+- Verdict: PASS with no <code>IMP-*</code> finding. Five observations cover the canonical Python command, exact-socket smoke cleanup, isolated AIM home requirement, known macOS-to-Linux proof gap, and recovered first-canary descriptor preflight.
+- Evidence: <code>docs/aelaguiz/PRIME_AGENT_UPSTREAM_0_8_0_INTEGRATION_PLAN_2026-08-22_PLAN_AUDIT.md</code> and the dated Phase-4 block in the canonical plan.
+- Next: refresh both remotes, commit these documentation receipts, open the draft PR, and require the complete Linux CI matrix. Do not merge without Amir's later explicit approval.
+
+### 2026-08-23 - Phase 5 remote refresh
+
+- Intent: prove the feature branch still represents the latest official upstream and current fork main immediately before publication.
+- Commands: fetched/pruned <code>origin main</code>, then fetched/pruned <code>upstream main</code> through their configured canonical URLs.
+- Proof: <code>origin/main</code> remains <code>7e7bb45cdfaddc1fa051678714147ae1534698d9</code>; <code>upstream/main</code> remains <code>e319a66d7351c75abe7f040d02d9a8d6e25028e9</code>; both frozen-ref comparisons report 0/0 divergence.
+- Review: no new fork or official upstream commit exists to reconcile, so the audited merge and all local proof remain fresh.
+- Next: commit only the canonical plan, implementation log, and audit ledger; push the feature branch without force; open the draft PR.

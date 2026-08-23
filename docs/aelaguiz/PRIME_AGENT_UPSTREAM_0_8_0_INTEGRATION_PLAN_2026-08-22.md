@@ -786,10 +786,13 @@ Platform note: some real forkserver behavior is unavailable or skipped on macOS.
 From <code>prime-agent-runtime</code>:
 
 ~~~sh
-uv run python -m unittest test.test_mcp
+uv run python -m unittest discover -s test
 ~~~
 
-If merged runtime support changes shared MCP primitives beyond <code>test_mcp.py</code>, also run the exact affected runtime files, such as <code>test.test_mcp_base</code>; the full runtime suite remains a CI gate.
+This is the canonical repository/CI command and discovers <code>test_mcp.py</code>
+alongside the runtime's other unit files. If merged runtime support changes a
+shared primitive, retain the full discovery run rather than guessing a Python
+module path from a filename.
 
 ### Failure handling
 
@@ -850,10 +853,18 @@ Cleanup is limited to the exact unique test identities:
 
 ~~~sh
 tmux kill-session -t "$PA_SMOKE_TMUX"
-env PRIME_AGENT_CODING_AGENT_DIR="$PA_SMOKE_ROOT/agent" PRIME_AGENT_SESSION_DIR="$PA_SMOKE_ROOT/sessions" PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR="$PA_SMOKE_ROOT/supervisor" ./prime-agent.sh --no-env --daemon-socket "$PA_SMOKE_SOCKET" shutdown
+env PA_SMOKE_SOCKET="$PA_SMOKE_SOCKET" npx tsx -e 'import { handleDaemonCommand } from "./packages/coding-agent/src/cli/daemon-command.ts"; await handleDaemonCommand(["daemon", "list", "--daemon-socket", process.env.PA_SMOKE_SOCKET, "--json"]); await handleDaemonCommand(["daemon", "shutdown", "--daemon-socket", process.env.PA_SMOKE_SOCKET]);'
 ~~~
 
-Before removing temporary files, verify no process still references <code>PA_SMOKE_ROOT</code>. Use a recoverable or explicit exact-path cleanup operation only; never use a broad variable, glob, workspace root, or home directory.
+The public <code>shutdown</code> command is global, while flags placed before a
+public command belong to the normal agent launcher. Therefore the smoke uses
+the source daemon client's internal exact-socket command rather than either
+public form. Before removing temporary files, verify no process still
+references <code>PA_SMOKE_ROOT</code>. If the socket has already been unlinked
+but one verified smoke supervisor still has it open, resolve that exact PID with
+<code>lsof</code>/<code>ps</code> and send only that PID <code>SIGTERM</code>.
+Use a recoverable or explicit exact-path cleanup operation only; never use a
+broad variable, glob, workspace root, or home directory.
 
 ### Smoke acceptance
 
@@ -868,16 +879,17 @@ Before removing temporary files, verify no process still references <code>PA_SMO
 
 The 2026-08-23 authorization permits exactly one short successful completion per provider after deterministic tests and static checks are green.
 
-1. Create a second unique temporary Prime agent directory, session directory, supervisor registry, and daemon socket. Do not redefine <code>HOME</code>; AIM must continue to read its current Redis configuration and account authority.
-2. Point <code>PRIME_AGENT_CODING_AGENT_DIR</code> at that temporary agent directory and run current AIMGR from <code>/Users/aelaguiz/workspace/aimgr</code>.
-3. Install both temporary descriptors with <code>aim prime use --codex auto --claude fable</code>. Record only the redacted receipt and selected non-secret labels/identity fingerprints.
-4. Run <code>aim prime status</code> against the same temporary agent directory and prove both providers are externally managed with Redis coordination available.
-5. Launch the merged Prime source directly, not a previously installed bundle, in print mode with the temporary paths:
+1. Create a second unique temporary Prime agent directory, session directory, supervisor registry, daemon socket, and AIM home. Do not redefine process <code>HOME</code>; the AIM credential helper must continue to use the current Redis account authority.
+2. Copy only the existing non-secret AIM configuration into the isolated AIM home, preserve it with mode 0600, point <code>PRIME_AGENT_CODING_AGENT_DIR</code> at the temporary Prime agent directory, and run current AIMGR from <code>/Users/aelaguiz/workspace/aimgr</code>. Pass <code>--home "$PA_AIM_HOME"</code> to every AIM command. An environment override alone is not sufficient: AIM intentionally preserves an existing persisted target owner.
+3. Before installation, run <code>aim prime status --json --home "$PA_AIM_HOME"</code> and require its resolved/auth paths to name the temporary target with <code>pathConflict: false</code>. Stop if it resolves the default target.
+4. Install both temporary descriptors with <code>aim prime use --codex auto --claude fable --home "$PA_AIM_HOME"</code>. Record only the redacted receipt and selected non-secret labels/identity fingerprints.
+5. Run <code>aim prime status --json --home "$PA_AIM_HOME"</code> and prove both providers are externally managed, record-ready, non-secret descriptors with Redis coordination available and <code>pathConflict: false</code>.
+6. Launch the merged Prime source directly, not a previously installed bundle, in print mode with the temporary paths:
    - Codex: provider <code>openai-codex</code>, model <code>gpt-5.6-sol</code>, fixed prompt requesting exactly <code>AIM_CODEX_OK</code>.
    - Claude: provider <code>anthropic</code>, model <code>claude-fable-5</code>, fixed prompt requesting exactly <code>AIM_CLAUDE_OK</code>.
-6. Give each process a bounded outer timeout. A successful proof requires exit status zero, the exact fixed response, no helper/auth/protocol error, no token-shaped output, and no surviving helper/Prime/kernel/daemon process under the temporary paths.
-7. If a selected account is provider-exhausted or policy-blocked, record the typed provider result, select another eligible AIM label through the normal <code>aim prime use</code> owner, and retry only until one successful completion is obtained. Do not reauthenticate, log out, or change live roots.
-8. Run <code>aim prime uninstall --provider openai-codex</code> and <code>aim prime uninstall --provider anthropic</code> against the temporary agent directory, confirm the temporary <code>auth.json</code> contains neither managed descriptor, and preserve only redacted evidence.
+7. Give each process a bounded outer timeout. A successful proof requires exit status zero, the exact fixed response, no helper/auth/protocol error, no token-shaped output, and no surviving helper/Prime/kernel/daemon process under the temporary paths.
+8. If a selected account is provider-exhausted or policy-blocked, record the typed provider result, select another eligible AIM label through the same isolated <code>aim prime use ... --home "$PA_AIM_HOME"</code> owner, and retry only until one successful completion is obtained. Do not reauthenticate, log out, or change live roots.
+9. Run <code>aim prime uninstall --provider openai-codex --home "$PA_AIM_HOME"</code> and <code>aim prime uninstall --provider anthropic --home "$PA_AIM_HOME"</code>, confirm the temporary <code>auth.json</code> contains neither managed descriptor, stop both exact canary sockets through the source daemon client, and preserve only redacted evidence.
 
 The canary is a release blocker: reaching the provider with valid auth but receiving a quota/policy error is useful diagnosis, not a successful Claude/Codex completion.
 
@@ -889,25 +901,25 @@ Perform a fresh audit after implementation and local verification. This pass ide
 
 ### Audit checklist
 
-- [ ] Verify both frozen pins are ancestors of <code>HEAD</code>.
-- [ ] Compare the final tree against upstream for every file in the 16-commit range and explain every fork-side deviation.
-- [ ] Re-run <code>git merge-tree</code> conceptually against the frozen inputs and confirm all predicted conflicts are represented in the final resolution.
-- [ ] Inspect all 24 overlapping paths in full.
-- [ ] Search for old schema revision/ID assumptions, incomplete capability maps, unguarded new commands, and missing peer-matrix cases.
-- [ ] Verify schema revision 23's ID is generated by the digest test.
-- [ ] Search kernel code for raw PID signaling of forked kernels.
-- [ ] Trace every direct and forked kernel start/stop/exit path, journal write, generation transition, exit-status write, and lifecycle event.
-- [ ] Verify <code>HistoryManager.enabled=False</code> remains active for forked/direct paths where required.
-- [ ] Trace ACP MCP ownership through validation, connection, daemon, kernel runtime, replacement, detach, and failure cleanup.
-- [ ] Trace every refinement model call through request admission.
-- [ ] Trace goal continuation, typed error handling, timer timestamp selection, and MCP refresh.
-- [ ] Verify Fast-mode capability and 2x pricing across API-key/Codex/AIM rails.
-- [ ] Verify <code>gpt-5.6-sol-1m</code>, request-model ID, context, and compaction threshold in generated output and source generator.
-- [ ] Compare current changelog fragments to only the fork additions after the merge base; search for duplicated base/0.8.0 bullets.
-- [ ] Verify all package/lock versions and internal dependency ranges.
-- [ ] Search for conflict markers, temporary debug code, skipped/focused tests, broad <code>any</code>, dynamic imports, and secret-like values.
-- [ ] Confirm the pre-existing untracked bug document is unchanged in the original worktree and absent from the branch unless separately authorized.
-- [ ] Reconcile every acceptance item with a named local receipt or CI gate.
+- [x] Verify both frozen pins are ancestors of <code>HEAD</code>.
+- [x] Compare the final tree against upstream for every file in the 16-commit range and explain every fork-side deviation.
+- [x] Re-run <code>git merge-tree</code> conceptually against the frozen inputs and confirm all predicted conflicts are represented in the final resolution.
+- [x] Inspect all 24 overlapping paths in full.
+- [x] Search for old schema revision/ID assumptions, incomplete capability maps, unguarded new commands, and missing peer-matrix cases.
+- [x] Verify schema revision 23's ID is generated by the digest test.
+- [x] Search kernel code for raw PID signaling of forked kernels.
+- [x] Trace every direct and forked kernel start/stop/exit path, journal write, generation transition, exit-status write, and lifecycle event.
+- [x] Verify <code>HistoryManager.enabled=False</code> remains active for forked/direct paths where required.
+- [x] Trace ACP MCP ownership through validation, connection, daemon, kernel runtime, replacement, detach, and failure cleanup.
+- [x] Trace every refinement model call through request admission.
+- [x] Trace goal continuation, typed error handling, timer timestamp selection, and MCP refresh.
+- [x] Verify Fast-mode capability and 2x pricing across API-key/Codex/AIM rails.
+- [x] Verify <code>gpt-5.6-sol-1m</code>, request-model ID, context, and compaction threshold in generated output and source generator.
+- [x] Compare current changelog fragments to only the fork additions after the merge base; search for duplicated base/0.8.0 bullets.
+- [x] Verify all package/lock versions and internal dependency ranges.
+- [x] Search for conflict markers, temporary debug code, skipped/focused tests, broad <code>any</code>, dynamic imports, and secret-like values.
+- [x] Confirm the pre-existing untracked bug document is unchanged in the original worktree and absent from the branch unless separately authorized.
+- [x] Reconcile every acceptance item with a named local receipt or CI gate.
 
 ### Suggested read-only searches
 
@@ -937,6 +949,17 @@ Append a dated implementation-audit block to this document containing:
 
 - The audit reports no unresolved correctness, security, protocol, lineage, release-metadata, or preservation finding.
 - Any reopened phase has been repaired, retested, and re-audited in a new read-only pass.
+
+### 2026-08-23 implementation-audit result
+
+- Audited commit: <code>666a754eed008312a1c8995662ac68a27e2bb1ce</code> (tree <code>ed41e3571ab5ea26ec16f3a415b2608eeb7237ef</code>).
+- Frozen inputs: fork <code>7e7bb45cdfaddc1fa051678714147ae1534698d9</code>; upstream <code>e319a66d7351c75abe7f040d02d9a8d6e25028e9</code>; merge base <code>bb61ca21c3e27a5d2af7fab3ab662789a5e478d2</code>.
+- Findings: none. No source repair or reopened phase was required.
+- Acceptance proven: exact two-parent ancestry; all six conflict compositions; all 24 semantic overlaps; schema-23 capability union; handle-only fork control; ACP ownership/secret boundaries; admitted refinement; goal/timer/MCP/Fast behavior; generated alias/catalog; immutable released changelogs and 0.8.0 version alignment.
+- Existing proof reviewed: all focused local groups, 98-test Python discovery run, root repository check, deterministic generator, isolated source smoke, and successful isolated AIM-managed Codex/Claude completions.
+- Platform-dependent proof: two kernel and eight supervisor macOS skips remain mapped to mandatory Linux process/kernel/CI jobs. CI had not run at audit time.
+- Disposition: <strong>PASS to Phase 5; do not merge.</strong>
+- Full ledger: <code>docs/aelaguiz/PRIME_AGENT_UPSTREAM_0_8_0_INTEGRATION_PLAN_2026-08-22_PLAN_AUDIT.md</code>.
 
 ## Phase 5 - Synchronize the feature branch and open the draft PR
 
@@ -1178,31 +1201,31 @@ Append entries here during execution; do not replace plan requirements with an e
 
 # 15. Definition of done checklist
 
-- [ ] The refreshed latest official upstream pin is recorded and this plan reflects any delta from <code>e319a66d</code>.
-- [ ] The refreshed fork pin and merge base are recorded.
-- [ ] Integration occurred in a separate clean worktree with npm 11.10+.
-- [ ] Baseline fork preservation tests are recorded.
-- [ ] A two-parent merge commit contains the exact official upstream pin.
-- [ ] All six textual conflicts are semantically composed.
-- [ ] All 24 overlapping paths are fully audited.
-- [ ] Daemon protocol 7/schema 23 exposes both capability-gated features with a digest-derived ID.
-- [ ] Kernel parent/watchdog/handle/orphan behavior and fork lifecycle/history/exit evidence coexist.
-- [ ] ACP MCP ownership, validation, cleanup, and secret boundaries pass.
-- [ ] Fast mode, goal continuation, typed errors, elapsed timer, refinement hooks/outcomes, OAuth discovery, heartbeat filtering, and MCP refresh pass.
-- [ ] The model generator reproducibly emits upstream catalog state plus fork alias/compaction behavior.
-- [ ] Upstream 0.8.0 changelog sections are immutable and only fork additions after the merge base are in new fragments.
-- [ ] Root/workspace/internal dependency/lock versions agree at 0.8.0.
-- [ ] Every upstream-changed test file and every named preservation group passes locally where supported.
-- [ ] Root <code>npm run check</code> and <code>git diff --check</code> pass.
-- [ ] The isolated no-provider source/TUI/daemon smoke passes and leaves no process/state behind.
-- [ ] One isolated AIM-managed Codex completion returns exactly <code>AIM_CODEX_OK</code>, and one isolated AIM-managed Claude completion returns exactly <code>AIM_CLAUDE_OK</code>; temporary descriptors and processes are cleaned up without account reauthentication/logout or live-session mutation.
-- [ ] A separate read-only implementation audit reports no open finding.
+- [x] The refreshed latest official upstream pin is recorded and this plan reflects any delta from <code>e319a66d</code>.
+- [x] The refreshed fork pin and merge base are recorded.
+- [x] Integration occurred in a separate clean worktree with npm 11.10+.
+- [x] Baseline fork preservation tests are recorded.
+- [x] A two-parent merge commit contains the exact official upstream pin.
+- [x] All six textual conflicts are semantically composed.
+- [x] All 24 overlapping paths are fully audited.
+- [x] Daemon protocol 7/schema 23 exposes both capability-gated features with a digest-derived ID.
+- [x] Kernel parent/watchdog/handle/orphan behavior and fork lifecycle/history/exit evidence coexist.
+- [x] ACP MCP ownership, validation, cleanup, and secret boundaries pass.
+- [x] Fast mode, goal continuation, typed errors, elapsed timer, refinement hooks/outcomes, OAuth discovery, heartbeat filtering, and MCP refresh pass.
+- [x] The model generator reproducibly emits upstream catalog state plus fork alias/compaction behavior.
+- [x] Upstream 0.8.0 changelog sections are immutable and only fork additions after the merge base are in new fragments.
+- [x] Root/workspace/internal dependency/lock versions agree at 0.8.0.
+- [x] Every upstream-changed test file and every named preservation group passes locally where supported.
+- [x] Root <code>npm run check</code> and <code>git diff --check</code> pass.
+- [x] The isolated no-provider source/TUI/daemon smoke passes and leaves no process/state behind.
+- [x] One isolated AIM-managed Codex completion returns exactly <code>AIM_CODEX_OK</code>, and one isolated AIM-managed Claude completion returns exactly <code>AIM_CLAUDE_OK</code>; temporary descriptors and processes are cleaned up without account reauthentication/logout or live-session mutation.
+- [x] A separate read-only implementation audit reports no open finding.
 - [ ] The draft PR contains exact pins, conflict decisions, proof, risks, and rollback.
 - [ ] Every required GitHub Actions job succeeds on the exact PR head.
 - [ ] Amir explicitly approves merge after reviewing the green receipts.
 - [ ] The PR is merged with an ordinary merge commit, not squash/rebase.
 - [ ] Final <code>origin/main</code> contains both frozen pins as ancestors.
-- [ ] The original untracked bug document remains unchanged.
-- [ ] No package was published, no tag/release was created, no live daemon/session was restarted, and no deployment occurred.
+- [x] The original untracked bug document remains unchanged.
+- [x] No package was published, no tag/release was created, no live daemon/session was restarted, and no deployment occurred.
 
 Until every applicable item above is checked, the upstream integration is not complete.
