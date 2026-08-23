@@ -1688,7 +1688,10 @@ describe("ModelRegistry", () => {
 			const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 			const xaiModels = getModelsForProvider(registry, "xai");
 			expect(xaiModels.length).toBeGreaterThan(0);
-			expect(xaiModels.some((model) => model.id === "grok-4.6")).toBe(false);
+			expect(xaiModels.find((model) => model.id === "grok-4.6")).toMatchObject({
+				api: "openai-completions",
+				provider: "xai",
+			});
 			for (const model of xaiModels) {
 				expect(model.api).toBe("openai-completions");
 			}
@@ -1708,7 +1711,10 @@ describe("ModelRegistry", () => {
 				const registry = ModelRegistry.create(authStorage, modelsJsonPath);
 				const xaiModels = getModelsForProvider(registry, "xai");
 				expect(xaiModels.length).toBeGreaterThan(0);
-				expect(xaiModels.some((model) => model.id === "grok-4.6")).toBe(false);
+				expect(xaiModels.find((model) => model.id === "grok-4.6")).toMatchObject({
+					api: "openai-completions",
+					provider: "xai",
+				});
 				for (const model of xaiModels) {
 					expect(model.api).toBe("openai-completions");
 				}
@@ -1778,7 +1784,10 @@ describe("ModelRegistry", () => {
 			for (const model of getModelsForProvider(registry, "xai")) {
 				expect(model.api).toBe("openai-completions");
 			}
-			expect(getModelsForProvider(registry, "xai").some((model) => model.id === "grok-4.6")).toBe(false);
+			expect(getModelsForProvider(registry, "xai").find((model) => model.id === "grok-4.6")).toMatchObject({
+				api: "openai-completions",
+				provider: "xai",
+			});
 
 			authStorage.removeRuntimeApiKey("xai");
 			registry.refresh();

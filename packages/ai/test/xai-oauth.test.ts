@@ -370,4 +370,17 @@ describe("xAI OAuth model modification", () => {
 		const again = applyXaiOAuthModels([existing!]);
 		expect(again.filter((model) => model.id === "grok-4.6")).toHaveLength(1);
 	});
+
+	it("normalizes a catalog-provided grok-4.6 onto subscription thinking levels", () => {
+		const [grok46] = applyXaiOAuthModels([xaiModel({ id: "grok-4.6" })]);
+		expect(grok46.api).toBe("openai-responses");
+		expect(grok46.thinkingLevelMap).toEqual({
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+		});
+	});
 });

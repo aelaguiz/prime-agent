@@ -1,11 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [0.8.0] - 2026-08-21
 
-- Added a GPT-5.6 Sol 1M Codex alias that sends requests to GPT-5.6 Sol while declaring a 1M context window.
-- Added xAI SuperGrok / X Premium device-code OAuth and remapped stored subscription models onto the Responses API, including Grok 4.6.
-- Distinguished Anthropic subscription usage exhaustion from transient rate limits and preserved its retry/reset metadata.
 - Added endpoint binding to MCP OAuth credentials: tokens record the URL they were issued for, and refreshes carry the original binding forward without ever inferring one for unbound legacy credentials.
+- Added Fast mode (service_tier `priority`) support for OpenAI API-key models GPT-5.4/GPT-5.5/GPT-5.6, and corrected the GPT-5.6 fast-pricing multiplier from 2.5x to 2x per OpenAI's pricing table ([#1595](https://github.com/PrimeIntellect-ai/prime-agent/discussions/1595)).
+- Fixed path-scoped protected-resource discovery and resource-bound refresh for MCP OAuth servers.
 
 ## [0.7.4] - 2026-08-19
 

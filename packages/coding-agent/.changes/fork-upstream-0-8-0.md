@@ -1,0 +1,15 @@
+- Fixed worker RPC backpressure terminating the shared daemon, recovery launch storms, false no-hello incompatibility errors, and rebuilds deleting chunks still used by live processes.
+- Changed clients to reuse wire-compatible daemons instead of restarting resident sessions for build fingerprint differences.
+- Added durable per-process crash, signal, restart, and kernel lifecycle logs with privacy-reduced diagnostic reports.
+- Fixed Python kernel setup rejecting the managed Python it installed when uv was configured to use only system interpreters.
+- Fixed compromised daemon and session lockfiles terminating their owning processes from asynchronous lock-refresh callbacks.
+- Fixed `prime-agent attach` failing to find live agents owned by another local background service.
+- Fixed long-lived IPython sessions wedging after shell replies accumulated or the shell transport disconnected.
+- Fixed `/usage` hiding healthy AIM account limits when managed providers use different trusted AIM executables.
+- Added a bold red `FAST OFF` status alarm for fast-capable models when Fast mode is disabled.
+- Added provider-scoped credential rebinding when forking a saved session.
+- Added per-model compaction thresholds, with GPT-5.6 Sol 1M compacting after 900K context tokens.
+- Changed TUI effort selections to remain session-local, and defaulted GPT-5.6 Sol, Claude Fable 5, and Claude Opus 5 to xhigh reasoning in new sessions.
+- Added `/login` support for xAI SuperGrok / X Premium subscriptions, with live-session model rebinding onto the Responses rail and Grok 4.6 available after subscription login.
+- Fixed daemon-restored sessions losing their AIM credential route after another terminal changed the global provider binding.
+- Fixed AIM-managed Claude sessions silently waiting through multi-hour subscription usage-limit retries instead of failing with the reset time.
