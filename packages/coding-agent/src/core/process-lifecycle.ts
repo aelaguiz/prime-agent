@@ -205,10 +205,12 @@ function projectStackFrames(stack: string | undefined): JsonValue {
 	for (const line of stack.split("\n").slice(1, 33)) {
 		const match = line.match(/((?:file:\/\/)?[^()\s]+):(\d+):(\d+)\)?$/);
 		if (!match) continue;
-		let location = match[1].replace(/^file:\/\//, "");
+		let location = match[1].replace(/^file:\/\//, "").replaceAll("\\", "/");
 		const projectMarker = location.lastIndexOf("/prime-agent/");
+		const sourcePackageMarker = location.lastIndexOf("/packages/coding-agent/");
 		const dependencyMarker = location.lastIndexOf("/node_modules/");
 		if (projectMarker >= 0) location = location.slice(projectMarker + 1);
+		else if (sourcePackageMarker >= 0) location = `prime-agent/${location.slice(sourcePackageMarker + 1)}`;
 		else if (dependencyMarker >= 0) location = location.slice(dependencyMarker + 1);
 		else if (!location.startsWith("node:")) location = "<external>";
 		if (!/^(?:<external>|node:|prime-agent\/|node_modules\/)[a-zA-Z0-9_@./:+-]*$/.test(location)) {

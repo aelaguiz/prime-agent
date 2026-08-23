@@ -1,0 +1,3 @@
+- Added a GPT-5.6 Sol 1M Codex alias that sends requests to GPT-5.6 Sol while declaring a 1M context window.
+- Added xAI SuperGrok / X Premium device-code OAuth and remapped stored subscription models onto the Responses API, including Grok 4.6.
+- Distinguished Anthropic subscription usage exhaustion from transient rate limits and preserved its retry/reset metadata.

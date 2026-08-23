@@ -268,7 +268,10 @@ export function applyXaiSubscriptionModels(models: Model<Api>[]): Model<Api>[] {
 		};
 		if (model.reasoning) {
 			// Subscription Grok reasoning models always think; efforts are low/medium/high.
-			responsesModel.thinkingLevelMap = { ...model.thinkingLevelMap, off: null, minimal: null };
+			responsesModel.thinkingLevelMap =
+				model.id === GROK_46_SUBSCRIPTION_MODEL.id
+					? { ...GROK_46_SUBSCRIPTION_MODEL.thinkingLevelMap }
+					: { ...model.thinkingLevelMap, off: null, minimal: null };
 		}
 		return responsesModel;
 	});
