@@ -3,15 +3,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as acp from "@agentclientprotocol/sdk";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentSession } from "../../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../../../src/modes/acp/acp-meta.js";
 import { runAcpModeWithConnection } from "../../../src/modes/acp/index.js";
 import { InProcessAgentConnection } from "../../../src/modes/agent-connection/in-process-agent-connection.js";
 import { createHarness, type Harness } from "../harness.js";
 
-function runtimeHostFor(session: unknown): AgentSessionRuntime {
+function runtimeHostFor(session: AgentSession): AgentSessionRuntime {
 	return {
 		session,
+		services: { authStorage: session.modelRegistry.authStorage },
 		setRebindSession() {},
 		setBeforeSessionInvalidate() {},
 		async dispose() {},

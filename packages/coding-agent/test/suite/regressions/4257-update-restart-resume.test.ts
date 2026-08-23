@@ -61,6 +61,7 @@ function createState(
 ): ActiveSessionState {
 	const runtime = {
 		session: harness.session,
+		services: { authStorage: harness.authStorage },
 		metadata,
 		cwd: harness.tempDir,
 		runtimeConfig: { cwd: harness.tempDir, agentDir: harness.tempDir },

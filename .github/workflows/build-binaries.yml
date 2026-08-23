@@ -44,6 +44,7 @@ jobs:
         id: context
         env:
           BEFORE_SHA: ${{ github.event.before || '' }}
+          CAN_PUBLISH: ${{ github.repository == 'PrimeIntellect-ai/prime-agent' }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_NAME: ${{ github.event_name }}
           GITHUB_SHA_VALUE: ${{ github.sha }}
@@ -54,12 +55,14 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           beta_version=
-          build_ref=
+          build_ref="$GITHUB_SHA_VALUE"
           production_version=
           publish_beta=false
           publish_production=false
 
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+          if [ "$CAN_PUBLISH" != true ]; then
+            echo "Release publication is owned by PrimeIntellect-ai/prime-agent; validating build and check only."
+          elif [ "$EVENT_NAME" = workflow_dispatch ]; then
             if [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
               echo "Manual releases must run from the default branch (${DEFAULT_BRANCH}), not ${REF_NAME}." >&2
               exit 1
@@ -191,6 +194,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: [release-context, build]
+    if: github.repository == 'PrimeIntellect-ai/prime-agent' && (needs.release-context.outputs.publish_beta == 'true' || needs.release-context.outputs.publish_production == 'true')
     permissions:
       contents: write
     env:

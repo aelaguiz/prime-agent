@@ -6,6 +6,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import { ENV_AGENT_DIR } from "../../src/config.js";
+import type { AgentSession } from "../../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.js";
 import { PRIME_AGENT_META_NAMESPACE } from "../../src/modes/acp/acp-meta.js";
 import { runAcpModeWithConnection } from "../../src/modes/acp/index.js";
@@ -21,9 +22,10 @@ import { createHarness, type Harness } from "./harness.js";
  * protocol (as a standard update, or as namespaced `_meta`).
  */
 
-function runtimeHostFor(session: unknown): AgentSessionRuntime {
+function runtimeHostFor(session: AgentSession): AgentSessionRuntime {
 	return {
 		session,
+		services: { authStorage: session.modelRegistry.authStorage },
 		setRebindSession() {},
 		setBeforeSessionInvalidate() {},
 		async dispose() {},

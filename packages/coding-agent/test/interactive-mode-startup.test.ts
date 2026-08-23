@@ -26,7 +26,7 @@ describe("InteractiveMode startup hints", () => {
 			options: { returnToAgentsView },
 			editor: { getText: getEditorText },
 			connectionState: {
-				model: { name: "test-model", reasoning: true },
+				model: { id: "test-model", name: "test-model", reasoning: true },
 				thinkingLevel: "high",
 			},
 		};

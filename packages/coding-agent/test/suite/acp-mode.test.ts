@@ -9,9 +9,10 @@ import { InProcessAgentConnection } from "../../src/modes/agent-connection/in-pr
 import { createHarness } from "./harness.js";
 
 /** Minimal AgentSessionRuntime host over a real faux-backed AgentSession. */
-function runtimeHostFor(session: unknown): AgentSessionRuntime {
+function runtimeHostFor(session: AgentSession): AgentSessionRuntime {
 	return {
 		session,
+		services: { authStorage: session.modelRegistry.authStorage },
 		setRebindSession() {},
 		setBeforeSessionInvalidate() {},
 		async dispose() {},

@@ -7835,7 +7835,9 @@ export class InteractiveMode {
 						thinkingLevel: state.thinkingLevel,
 					});
 				}
-			} catch {}
+			} catch {
+				// The catalog refresh succeeded; the next state event reconciles this best-effort snapshot.
+			}
 			return [...this.connectionModels];
 		});
 		this.connectionModelsRefreshInFlight = { version, promise };

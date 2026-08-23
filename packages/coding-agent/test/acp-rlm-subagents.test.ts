@@ -75,6 +75,7 @@ function streamAnswer(text: string): ReturnType<typeof createAssistantMessageEve
 function runtimeHostFor(session: AgentSession): AgentSessionRuntime {
 	return {
 		session,
+		services: { authStorage: session.modelRegistry.authStorage },
 		setRebindSession() {},
 		setBeforeSessionInvalidate() {},
 		async dispose() {},
