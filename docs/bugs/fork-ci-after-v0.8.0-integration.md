@@ -1,7 +1,7 @@
 ---
 title: "Fork CI fails after the Prime Agent v0.8.0 integration"
 date: 2026-08-23
-status: verifying
+status: resolved
 owners: [prime-agent]
 reviewers: []
 related:
@@ -11,16 +11,18 @@ related:
   - https://github.com/aelaguiz/prime-agent/actions/runs/32659113044
   - https://github.com/aelaguiz/prime-agent/actions/runs/32659687295
   - https://github.com/aelaguiz/prime-agent/actions/runs/32659687286
+  - https://github.com/aelaguiz/prime-agent/actions/runs/32660564551
+  - https://github.com/aelaguiz/prime-agent/actions/runs/32660564549
 ---
 
 <!-- bugs:block:tldr -->
 ## TL;DR
 
-- **Symptom:** The second repair confirms the process cleanup boundary but exposes a Node 22.23/tsx loader-compatibility bug in shard 1 and a loaded real-IPython test exhausting its 60-second outer deadline in shard 2.
-- **Impact:** The fork still lacks a completely green integration signal after the v0.8.0 merge even though all original ACP, fixture-contract, check, and release-ownership failures are fixed.
-- **Most likely cause:** Node 22.23 with the current tsx loader rewrites the source import from `./cli-main.js` to `./cli-main.ts` before the downstream failure-injection hook sees it; the hook only matched `.js`. Concurrent real-kernel work can also consume the full 60-second test guard without violating KernelManager's behavior contract.
-- **Next action:** Push the exact-Node-verified loader match, bounded real-kernel headroom, and corrected cleanup bound; then monitor both workflows through completion.
-- **Status:** Verifying.
+- **Symptom:** Resolved. Fork `main` now completes the full Linux CI matrix and inherited release validation after the v0.8.0 integration.
+- **Impact:** Trustworthy branch validation is restored without enabling upstream-owned R2 publication from the fork or weakening production contracts.
+- **Root cause:** Stale partial test hosts omitted current runtime/session/model fields; fork release logic claimed upstream publication intent; recovered daemon writers raced teardown; Node 22.23/tsx rewrote the CLI loader target from `.js` to `.ts`; and one real-kernel test had insufficient loaded-runner headroom.
+- **Next action:** None. Treat future upstream integrations as ordinary changes and preserve the fork publication ownership gate.
+- **Status:** Resolved.
 <!-- /bugs:block:tldr -->
 
 <!-- bugs:block:analysis -->
@@ -116,4 +118,6 @@ The failure set is concentrated in coding-agent test contracts and one release o
 - Replaced the overly broad cleanup retry with a bounded 20-retry/25ms window and forceful shutdown of the recovered-worker process-smoke case.
 - Exact Node 22.23.2 verification passes: process lifecycle 13/13, IPython bootstrap 6/6, process smoke 10/10 applicable, ENG-4600 15/15, shard 1 with 1,484 passed/25 skipped, and shard 2 with 1,782 passed/14 skipped.
 - Repository-wide `npm run check` passes after formatting the real-kernel timeout declarations; TypeScript, installer rendering, and browser smoke checks remain green.
+- Exact code head `9ef9322e` passes the complete GitHub CI run `32660564551`: build/check, all three coding-agent shards, process smoke, kernel, AI, TUI, agent-core, runtime-python, contributor-trust, and the aggregate gate are green.
+- Exact code head `9ef9322e` also passes release run `32660564549`: release context and build/check are green, while fork-inapplicable pack, upload, and publish steps are correctly skipped.
 <!-- /bugs:block:implementation -->
