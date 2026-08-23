@@ -67,7 +67,7 @@ afterEach(async () => {
 	for (const directory of tempDirs.splice(0)) {
 		// Detached recovery processes can outlive the daemon socket just long enough
 		// to flush their final lifecycle record. Give that bounded write time to finish.
-		rmSync(directory, { recursive: true, force: true, maxRetries: 200, retryDelay: 50 });
+		rmSync(directory, { recursive: true, force: true, maxRetries: 20, retryDelay: 25 });
 	}
 });
 
@@ -1633,7 +1633,7 @@ describe("daemon supervisor resident workers", () => {
 		await expect(recoveredConnection.getState()).resolves.toMatchObject({ sessionId: createdSummary.sessionId });
 
 		await recoveredConnection.dispose();
-		await client.request({ type: "shutdown" });
+		await client.request({ type: "shutdown", force: true });
 		client.close();
 		await waitForSocketGone(socketPath);
 		await waitForProcessGone(recovered.workerPid);

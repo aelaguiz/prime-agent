@@ -56,6 +56,9 @@ function resolveKernelPython(): string | null {
 
 const python = resolveKernelPython();
 const describeIfKernel = python ? describe : describe.skip;
+// Shared CI runners execute real-kernel files concurrently. Keep a bounded
+// outer guard with enough startup and teardown headroom under that load.
+const REAL_KERNEL_TEST_TIMEOUT_MS = 120_000;
 
 describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 	const dir = mkdtempSync(join(tmpdir(), "prime-agent-bootstrap-"));
@@ -64,64 +67,74 @@ describeIfKernel("IPython RLM bootstrap (real kernel)", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	it("binds asyncio in the user namespace", async () => {
-		const manager = new KernelManager({ python: python as string, cwd: dir });
-		try {
-			await manager.start();
-			const bootstrap = await manager.execute(buildRlmBootstrapCode());
-			expect(bootstrap.status).toBe("ok");
+	it(
+		"binds asyncio in the user namespace",
+		async () => {
+			const manager = new KernelManager({ python: python as string, cwd: dir });
+			try {
+				await manager.start();
+				const bootstrap = await manager.execute(buildRlmBootstrapCode());
+				expect(bootstrap.status).toBe("ok");
 
-			const result = await manager.execute("_t = asyncio.create_task(asyncio.sleep(0))\nprint(type(_t).__name__)");
-			expect(result.status).toBe("ok");
-			expect(result.stdout).toContain("Task");
+				const result = await manager.execute(
+					"_t = asyncio.create_task(asyncio.sleep(0))\nprint(type(_t).__name__)",
+				);
+				expect(result.status).toBe("ok");
+				expect(result.stdout).toContain("Task");
 
-			const bashResult = await manager.execute('%%bash\nprintf %s "$NO_COLOR"');
-			expect(bashResult.status).toBe("ok");
-			expect(bashResult.stdout).toBe("1");
-		} finally {
-			await manager.dispose();
-		}
-	}, 60_000);
+				const bashResult = await manager.execute('%%bash\nprintf %s "$NO_COLOR"');
+				expect(bashResult.status).toBe("ok");
+				expect(bashResult.stdout).toBe("1");
+			} finally {
+				await manager.dispose();
+			}
+		},
+		REAL_KERNEL_TEST_TIMEOUT_MS,
+	);
 
-	it("emits canonical paths for edits after the kernel changes directories", async () => {
-		const firstDir = join(dir, "first");
-		const secondDir = join(dir, "second");
-		mkdirSync(firstDir, { recursive: true });
-		mkdirSync(secondDir, { recursive: true });
-		writeFileSync(join(firstDir, "same.txt"), "old");
-		writeFileSync(join(secondDir, "same.txt"), "old");
-		const editSkillRoot = join(process.cwd(), "skills", "edit");
-		const manager = new KernelManager({
-			python: python as string,
-			cwd: dir,
-			env: { PYTHONPATH: join(editSkillRoot, "src") },
-		});
-		try {
-			await manager.start();
-			const bootstrap = await manager.execute(
-				buildRlmBootstrapCode([
-					{
-						name: "edit",
-						importName: "edit",
-						packagePath: editSkillRoot,
-						pyprojectPath: join(editSkillRoot, "pyproject.toml"),
-					},
-				]),
-			);
-			expect(bootstrap.status).toBe("ok");
+	it(
+		"emits canonical paths for edits after the kernel changes directories",
+		async () => {
+			const firstDir = join(dir, "first");
+			const secondDir = join(dir, "second");
+			mkdirSync(firstDir, { recursive: true });
+			mkdirSync(secondDir, { recursive: true });
+			writeFileSync(join(firstDir, "same.txt"), "old");
+			writeFileSync(join(secondDir, "same.txt"), "old");
+			const editSkillRoot = join(process.cwd(), "skills", "edit");
+			const manager = new KernelManager({
+				python: python as string,
+				cwd: dir,
+				env: { PYTHONPATH: join(editSkillRoot, "src") },
+			});
+			try {
+				await manager.start();
+				const bootstrap = await manager.execute(
+					buildRlmBootstrapCode([
+						{
+							name: "edit",
+							importName: "edit",
+							packagePath: editSkillRoot,
+							pyprojectPath: join(editSkillRoot, "pyproject.toml"),
+						},
+					]),
+				);
+				expect(bootstrap.status).toBe("ok");
 
-			const first = await manager.execute(
-				'import os\nos.chdir("first")\nawait edit(path="same.txt", old_str="old", new_str="new")',
-			);
-			const second = await manager.execute(
-				'os.chdir("../second")\nawait edit(path="same.txt", old_str="old", new_str="new")',
-			);
+				const first = await manager.execute(
+					'import os\nos.chdir("first")\nawait edit(path="same.txt", old_str="old", new_str="new")',
+				);
+				const second = await manager.execute(
+					'os.chdir("../second")\nawait edit(path="same.txt", old_str="old", new_str="new")',
+				);
 
-			expect(first.diffs?.[0]?.path).toBe(realpathSync(join(firstDir, "same.txt")));
-			expect(second.diffs?.[0]?.path).toBe(realpathSync(join(secondDir, "same.txt")));
-			expect(first.diffs?.[0]?.path).not.toBe(second.diffs?.[0]?.path);
-		} finally {
-			await manager.dispose();
-		}
-	}, 60_000);
+				expect(first.diffs?.[0]?.path).toBe(realpathSync(join(firstDir, "same.txt")));
+				expect(second.diffs?.[0]?.path).toBe(realpathSync(join(secondDir, "same.txt")));
+				expect(first.diffs?.[0]?.path).not.toBe(second.diffs?.[0]?.path);
+			} finally {
+				await manager.dispose();
+			}
+		},
+		REAL_KERNEL_TEST_TIMEOUT_MS,
+	);
 });

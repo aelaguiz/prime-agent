@@ -55,15 +55,12 @@ function spawnFixture(
 	return child;
 }
 
-async function waitForExit(
-	child: ChildProcess,
-	timeoutMs = 10_000,
-): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+async function waitForExit(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
 	if (child.exitCode !== null || child.signalCode !== null) {
 		return { code: child.exitCode, signal: child.signalCode as NodeJS.Signals | null };
 	}
 	return new Promise((resolveExit, reject) => {
-		const timeout = setTimeout(() => reject(new Error("Timed out waiting for lifecycle fixture")), timeoutMs);
+		const timeout = setTimeout(() => reject(new Error("Timed out waiting for lifecycle fixture")), 10_000);
 		child.once("error", (error) => {
 			clearTimeout(timeout);
 			reject(error);
@@ -285,9 +282,7 @@ describe("process lifecycle crash evidence", () => {
 		});
 		children.add(child);
 
-		// The tsx loader intentionally stalls before cli-main; loaded CI shards can
-		// spend more than the ordinary fixture deadline compiling this real process.
-		const result = await waitForExit(child, 20_000);
+		const result = await waitForExit(child);
 		expect(result.code).toBe(1);
 		const records = readLifecycleRecords(agentDir);
 		const start = event(records, "process_start");

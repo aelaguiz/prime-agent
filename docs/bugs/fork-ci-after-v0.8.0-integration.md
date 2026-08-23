@@ -9,15 +9,17 @@ related:
   - https://github.com/aelaguiz/prime-agent/actions/runs/32657250958
   - https://github.com/aelaguiz/prime-agent/actions/runs/32659113077
   - https://github.com/aelaguiz/prime-agent/actions/runs/32659113044
+  - https://github.com/aelaguiz/prime-agent/actions/runs/32659687295
+  - https://github.com/aelaguiz/prime-agent/actions/runs/32659687286
 ---
 
 <!-- bugs:block:tldr -->
 ## TL;DR
 
-- **Symptom:** The first repair makes the fork release workflow and nine of eleven CI jobs green, but two loaded Linux process tests still fail after their behavior assertions: one on an `ENOTEMPTY` teardown race and one on a fixed 10-second child-exit deadline.
+- **Symptom:** The second repair confirms the process cleanup boundary but exposes a Node 22.23/tsx loader-compatibility bug in shard 1 and a loaded real-IPython test exhausting its 60-second outer deadline in shard 2.
 - **Impact:** The fork still lacks a completely green integration signal after the v0.8.0 merge even though all original ACP, fixture-contract, check, and release-ownership failures are fixed.
-- **Most likely cause:** Detached recovery processes can flush their last lifecycle record after the daemon socket and workers have closed, while the deliberately blocked real CLI process can take more than the ordinary fixture deadline to compile in a loaded shard.
-- **Next action:** Verify bounded process cleanup and the targeted extended loader deadline locally, rerun exact shard 1 plus repository checks, then push and monitor both workflows through completion.
+- **Most likely cause:** Node 22.23 with the current tsx loader rewrites the source import from `./cli-main.js` to `./cli-main.ts` before the downstream failure-injection hook sees it; the hook only matched `.js`. Concurrent real-kernel work can also consume the full 60-second test guard without violating KernelManager's behavior contract.
+- **Next action:** Push the exact-Node-verified loader match, bounded real-kernel headroom, and corrected cleanup bound; then monitor both workflows through completion.
 - **Status:** Verifying.
 <!-- /bugs:block:tldr -->
 
@@ -50,6 +52,10 @@ Fork commit `8685f1d024fd06bf14777e902d9a123d5aa3082c` builds and type-checks su
 - Replacement CI run `32659113077` clears every original ACP and stale-double failure. Nine of eleven constituent jobs pass, including coding-agent shards 2 and 3; only process smoke and coding-agent shard 1 remain red.
 - Process-smoke behavior passes, including snapshot streaming and same-worker adoption, before `afterEach` fails removing `/tmp/prime-daemon-supervisor-test-*/agent` with `ENOTEMPTY`. That is the same detached lifecycle-writer cleanup race reproduced locally in ENG-4600 after all behavior assertions pass.
 - Coding-agent shard 1 passes 1,482 tests (26 skipped); only `captures an actual CLI failure before cli-main loads` reaches its fixed 10-second `waitForExit()` deadline. The full file passes locally in roughly 1.5 seconds, identifying CI shard load rather than a changed lifecycle result.
+- Release run `32659687286` passes on follow-up head `7300023e`; fork publication remains correctly skipped.
+- CI run `32659687295` proves the original process-lifecycle diagnosis incomplete. On GitHub's Node 22.23.2, the child exits normally with code 0 after the extended deadline because the failure-injection hook never matches. An exact local Node 22.23.2 probe reproduces code 0 and shows the hook receives `./cli-main.ts`; accepting both `.js` and `.ts` restores the intended injected failure and exit code 1.
+- The same run's shard 2 has one failure among 1,781 passes: `binds asyncio in the user namespace` exhausts its 60-second outer test guard. The rest of the real-kernel file continues, and the complete file passes locally under Node 22.23.2; this supports bounded CI-load headroom rather than a production kernel change.
+- The 200-retry cleanup follow-up is too broad because recursive removal applies increasing retry delays. The superseded run remains in process smoke for more than seven minutes until canceled after its shard failures were already conclusive. A 20-retry, 25ms bounded window plus forceful shutdown of the recovered-worker case passes process smoke and ENG-4600 locally under Node 22.23.2.
 
 ## Investigation
 
@@ -61,14 +67,16 @@ The failure set is concentrated in coding-agent test contracts and one release o
 2. **Confirmed — two additional stale test doubles:** The in-process session double omits `rebindModelsFromRegistry()` and the startup connection-model fixture omits `id`.
 3. **Confirmed — locally enforced explanatory-comment violation:** The empty catch is intentional but its safety rationale is not inside the catch body as the invariant requires.
 4. **Confirmed — fork release ownership mismatch:** The inherited upstream workflow asserts publish intent without the upstream repository's R2 configuration.
-5. **Confirmed — bounded process-harness assumptions are too narrow under load:** The replacement Linux run exposes an OS-level directory removal race after successful daemon assertions and a deliberately blocked real-process fixture exceeding its ordinary 10-second deadline.
+5. **Confirmed — process cleanup needed a bounded post-shutdown window:** The first replacement Linux run exposes an OS-level directory removal race after successful daemon assertions; recovered-worker shutdown must be forceful before recursive cleanup.
+6. **Confirmed — the CLI failure hook is incompatible with Node 22.23's tsx resolution:** The hook receives `./cli-main.ts`, not the source-authored `./cli-main.js`, and therefore runs the normal CLI unless both forms are matched.
+7. **Confirmed — real-kernel test guard is too narrow under loaded CI:** One real-IPython case reaches exactly 60 seconds while all surrounding tests pass; a test-local 120-second outer guard preserves every assertion and production timeout.
 
 ## Scope and Simplicity Contract
 
 - **Human-authorized corrected behavior:** Make the fork's current `main` GitHub CI workflows pass, push the necessary fixes to `origin/main`, and continue through replacement runs until they pass.
 - **Smallest sufficient fix:** Supply the existing harness auth storage in the five partial runtime fixtures; add the current catalog-rebind method and required model ID to their direct test doubles; put the existing best-effort rationale inside the empty catch; and make upstream publication intent conditional on the canonical upstream repository while retaining fork build/check validation.
 - **Initial minimal convergence closure:** The shared runtime fixture contract spans ACP mode, ACP features, ACP RLM, canonical-cwd, and update-restart tests and must move together because they all call the same snapshot owner. The two independent direct fixtures, one catch body, and release-context/publish-job gates are the only additional owners. No production daemon/session protocol or behavior changes.
-- **Scope sign-off:** Signed off before implementation on 2026-08-23. The replacement run confirms the deferred process timeout and teardown race, authorizing only bounded harness cleanup and a test-specific loader deadline; production lifecycle behavior remains out of scope.
+- **Scope sign-off:** Signed off before implementation on 2026-08-23. Replacement runs authorize bounded harness cleanup, a two-form test-loader match for current Node/tsx resolution, and test-local real-kernel headroom; production lifecycle and kernel behavior remain out of scope.
 - **Enough proof:** Every previously failing focused test passes locally; `npm run check` passes with full output; a pushed exact head receives successful `CI` and `Release Prime Agent` conclusions on the fork.
 - **Do not build:** No test disabling, reduced matrix coverage, behavioral-operation retries, swallowed errors, compatibility fallbacks, dependency downgrade, daemon behavior expansion, or unrelated upstream cleanup.
 - **Accepted residual risk:** Platform-only behavior not exercised by the focused local macOS runs remains owned by the complete Linux GitHub matrix.
@@ -83,7 +91,9 @@ The failure set is concentrated in coding-agent test contracts and one release o
 4. Keep fork release build/check active, but set publication intent only for `PrimeIntellect-ai/prime-agent` and skip the publication job when neither channel is selected.
 5. Run every modified/failing test file, then all three exact CI shards and the required repository check.
 6. Commit only owned files, push `main`, and monitor both fork workflows through completion; repeat only for newly evidenced in-scope failures.
-7. Give detached fixture writers a bounded teardown window and extend only the deliberately loader-blocked real-process case to 20 seconds, then repeat its focused tests and exact shard 1.
+7. Give detached fixture writers a bounded teardown window and force shutdown in the recovered-worker case, then repeat process smoke and ENG-4600.
+8. Match both `.js` and `.ts` forms in the CLI failure-injection loader, retain the original 10-second exit deadline, and validate on GitHub's exact Node 22.23.2 runtime.
+9. Give only the two real-IPython integration cases a 120-second outer guard, then repeat the focused file and exact shard 2 under Node 22.23.2.
 <!-- /bugs:block:fix_plan -->
 
 <!-- bugs:block:implementation -->
@@ -101,4 +111,9 @@ The failure set is concentrated in coding-agent test contracts and one release o
 - The replacement CI run narrows the remaining failures to post-assertion `ENOTEMPTY` cleanup in process smoke and a 10-second real-process loader deadline in shard 1. The follow-up keeps all behavior assertions intact while adding bounded filesystem retries and extending only that intentionally blocked loader case.
 - Follow-up focused verification passes: process lifecycle 13/13, process smoke 10/10 applicable tests (8 platform/tag skips), and ENG-4600 supervisor singleton 15/15, including the teardown path that previously reproduced `ENOTEMPTY` locally.
 - Exact coding-agent shard 1 now passes 114 files with 1,484 tests passed and 25 skipped. Repository-wide `npm run check` also passes again with no formatter changes.
+- Pushed follow-up commit `7300023e` keeps release run `32659687286` green, but CI run `32659687295` exposes the Node 22.23 loader rewrite and one real-kernel outer timeout. The run is canceled after those failures are conclusive rather than waiting on the overly large recursive-removal retry.
+- Corrected the failure hook to match the `.ts` form observed on Node 22.23 while retaining `.js` compatibility and restoring the original 10-second child-exit guard.
+- Replaced the overly broad cleanup retry with a bounded 20-retry/25ms window and forceful shutdown of the recovered-worker process-smoke case.
+- Exact Node 22.23.2 verification passes: process lifecycle 13/13, IPython bootstrap 6/6, process smoke 10/10 applicable, ENG-4600 15/15, shard 1 with 1,484 passed/25 skipped, and shard 2 with 1,782 passed/14 skipped.
+- Repository-wide `npm run check` passes after formatting the real-kernel timeout declarations; TypeScript, installer rendering, and browser smoke checks remain green.
 <!-- /bugs:block:implementation -->
