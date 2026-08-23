@@ -1,0 +1,1 @@
+- Fixed `/usage` lookup failures closing the interactive client instead of showing an error.

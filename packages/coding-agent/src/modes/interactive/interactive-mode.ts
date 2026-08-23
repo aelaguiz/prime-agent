@@ -9256,113 +9256,119 @@ export class InteractiveMode {
 	}
 
 	private async handleUsageCommand(): Promise<void> {
-		const [stats, state] = await Promise.all([
-			this.agentConnection.getSessionStats(),
-			this.agentConnection.getState(),
-		]);
-		const hasBindingSnapshot = state.credentialBindings !== undefined;
-		const bindings = state.credentialBindings ?? [];
-		const aimBindings = bindings.filter((binding) => binding.source === "aimgr");
-		const providerAimExecutables = aimBindings.map((binding) =>
-			this.modelRegistry.authStorage.getAimExecutable(binding.provider),
-		);
-		const installedAimExecutable = providerAimExecutables.some((executable) => executable === undefined)
-			? this.modelRegistry.authStorage.getAimExecutable()
-			: undefined;
-		const bindingAimExecutables = providerAimExecutables.map((executable) => executable ?? installedAimExecutable);
-		const aimExecutables = [
-			...new Set(bindingAimExecutables.filter((executable): executable is string => typeof executable === "string")),
-		];
-		const accountUsageByExecutable = new Map<string, Awaited<ReturnType<typeof queryAimAccountUsage>>>();
-		const unavailableAimExecutables = new Set<string>();
-		if (aimExecutables.length > 0) {
-			this.showStatus("Checking AIM account usage…");
-			await Promise.all(
-				aimExecutables.map(async (executable) => {
-					try {
-						accountUsageByExecutable.set(executable, await queryAimAccountUsage(executable));
-					} catch {
-						unavailableAimExecutables.add(executable);
-					}
-				}),
+		try {
+			const [stats, state] = await Promise.all([
+				this.agentConnection.getSessionStats(),
+				this.agentConnection.getState(),
+			]);
+			const hasBindingSnapshot = state.credentialBindings !== undefined;
+			const bindings = state.credentialBindings ?? [];
+			const aimBindings = bindings.filter((binding) => binding.source === "aimgr");
+			const providerAimExecutables = aimBindings.map((binding) =>
+				this.modelRegistry.authStorage.getAimExecutable(binding.provider),
 			);
-		}
-
-		const formatReset = (resetAt: number | undefined): string => {
-			if (!resetAt) return "";
-			const remainingMs = resetAt - Date.now();
-			if (remainingMs <= 0) return " · resets now";
-			const minutes = Math.ceil(remainingMs / 60_000);
-			if (minutes < 60) return ` · resets in ${minutes}m`;
-			const hours = Math.ceil(remainingMs / 3_600_000);
-			if (hours < 48) return ` · resets in ${hours}h`;
-			return ` · resets in ${Math.ceil(hours / 24)}d`;
-		};
-		const formatAccountUsage = (usage: AimAccountUsage): string => {
-			let details = "";
-			if (usage.plan) details += `  ${theme.fg("dim", "Plan:")} ${usage.plan}\n`;
-			if (usage.ok && usage.windows.length > 0) {
-				for (const window of usage.windows) {
-					const limit = usage.limitReached ? " · limit reached" : "";
-					const stale = usage.stale ? " · stale" : "";
-					details += `  ${theme.fg("dim", `${window.label}:`)} ${Math.round(window.usedPercent)}% used${formatReset(window.resetAt)}${limit}${stale}\n`;
-				}
-			} else {
-				details += `  ${theme.fg("dim", "Provider usage unavailable")}\n`;
+			const installedAimExecutable = providerAimExecutables.some((executable) => executable === undefined)
+				? this.modelRegistry.authStorage.getAimExecutable()
+				: undefined;
+			const bindingAimExecutables = providerAimExecutables.map((executable) => executable ?? installedAimExecutable);
+			const aimExecutables = [
+				...new Set(
+					bindingAimExecutables.filter((executable): executable is string => typeof executable === "string"),
+				),
+			];
+			const accountUsageByExecutable = new Map<string, Awaited<ReturnType<typeof queryAimAccountUsage>>>();
+			const unavailableAimExecutables = new Set<string>();
+			if (aimExecutables.length > 0) {
+				this.showStatus("Checking AIM account usage…");
+				await Promise.all(
+					aimExecutables.map(async (executable) => {
+						try {
+							accountUsageByExecutable.set(executable, await queryAimAccountUsage(executable));
+						} catch {
+							unavailableAimExecutables.add(executable);
+						}
+					}),
+				);
 			}
-			return details;
-		};
-		const providerLabel = (provider: string): string => {
-			if (provider === "anthropic") return "Claude";
-			if (provider === "openai-codex") return "Codex";
-			return provider;
-		};
 
-		let info = `${theme.bold("Usage")}\n\n`;
-		if (state.model) {
-			info += `${theme.fg("dim", "Model:")} ${state.model.provider}/${state.model.id}\n`;
-		}
-		if (!hasBindingSnapshot) {
-			info += `${theme.fg("dim", "Account:")} Current session binding unavailable\n`;
-		} else if (aimBindings.length === 0) {
-			info += `${theme.fg("dim", "Account:")} Native or unmanaged\n`;
-		} else {
-			for (const [index, binding] of aimBindings.entries()) {
-				const source = binding.source === "aimgr" ? "AIM" : binding.source;
-				info += `${theme.fg("dim", `${providerLabel(binding.provider)}:`)} ${source} · ${binding.binding}\n`;
-				const aimExecutable = bindingAimExecutables[index];
-				const usage = aimExecutable
-					? accountUsageByExecutable
-							.get(aimExecutable)
-							?.find((account) => account.provider === binding.provider && account.label === binding.binding)
-					: undefined;
-				if (usage) {
-					info += formatAccountUsage(usage);
+			const formatReset = (resetAt: number | undefined): string => {
+				if (!resetAt) return "";
+				const remainingMs = resetAt - Date.now();
+				if (remainingMs <= 0) return " · resets now";
+				const minutes = Math.ceil(remainingMs / 60_000);
+				if (minutes < 60) return ` · resets in ${minutes}m`;
+				const hours = Math.ceil(remainingMs / 3_600_000);
+				if (hours < 48) return ` · resets in ${hours}h`;
+				return ` · resets in ${Math.ceil(hours / 24)}d`;
+			};
+			const formatAccountUsage = (usage: AimAccountUsage): string => {
+				let details = "";
+				if (usage.plan) details += `  ${theme.fg("dim", "Plan:")} ${usage.plan}\n`;
+				if (usage.ok && usage.windows.length > 0) {
+					for (const window of usage.windows) {
+						const limit = usage.limitReached ? " · limit reached" : "";
+						const stale = usage.stale ? " · stale" : "";
+						details += `  ${theme.fg("dim", `${window.label}:`)} ${Math.round(window.usedPercent)}% used${formatReset(window.resetAt)}${limit}${stale}\n`;
+					}
 				} else {
-					const usageUnavailable = !aimExecutable || unavailableAimExecutables.has(aimExecutable);
-					const unavailable = usageUnavailable ? "Provider usage unavailable" : "Account not found in AIM";
-					info += `  ${theme.fg("dim", unavailable)}\n`;
+					details += `  ${theme.fg("dim", "Provider usage unavailable")}\n`;
+				}
+				return details;
+			};
+			const providerLabel = (provider: string): string => {
+				if (provider === "anthropic") return "Claude";
+				if (provider === "openai-codex") return "Codex";
+				return provider;
+			};
+
+			let info = `${theme.bold("Usage")}\n\n`;
+			if (state.model) {
+				info += `${theme.fg("dim", "Model:")} ${state.model.provider}/${state.model.id}\n`;
+			}
+			if (!hasBindingSnapshot) {
+				info += `${theme.fg("dim", "Account:")} Current session binding unavailable\n`;
+			} else if (aimBindings.length === 0) {
+				info += `${theme.fg("dim", "Account:")} Native or unmanaged\n`;
+			} else {
+				for (const [index, binding] of aimBindings.entries()) {
+					const source = binding.source === "aimgr" ? "AIM" : binding.source;
+					info += `${theme.fg("dim", `${providerLabel(binding.provider)}:`)} ${source} · ${binding.binding}\n`;
+					const aimExecutable = bindingAimExecutables[index];
+					const usage = aimExecutable
+						? accountUsageByExecutable
+								.get(aimExecutable)
+								?.find((account) => account.provider === binding.provider && account.label === binding.binding)
+						: undefined;
+					if (usage) {
+						info += formatAccountUsage(usage);
+					} else {
+						const usageUnavailable = !aimExecutable || unavailableAimExecutables.has(aimExecutable);
+						const unavailable = usageUnavailable ? "Provider usage unavailable" : "Account not found in AIM";
+						info += `  ${theme.fg("dim", unavailable)}\n`;
+					}
 				}
 			}
-		}
 
-		info += `\n${theme.bold("Session")}\n`;
-		info += `${theme.fg("dim", "Tokens:")} ${formatTokenCount(stats.tokens.total)} total`;
-		info += ` · ${formatTokenCount(stats.tokens.input)} in · ${formatTokenCount(stats.tokens.output)} out`;
-		if (stats.tokens.cacheRead > 0) info += ` · ${formatTokenCount(stats.tokens.cacheRead)} cache read`;
-		info += "\n";
-		const cost = stats.cost < 0.01 ? stats.cost.toFixed(4) : stats.cost.toFixed(2);
-		info += `${theme.fg("dim", "Cost:")} $${cost}\n`;
-		const contextUsage = this.getConnectionContextUsage() ?? stats.contextUsage;
-		if (contextUsage?.tokens !== null && contextUsage?.tokens !== undefined) {
-			info += `${theme.fg("dim", "Context:")} ${formatTokenCount(contextUsage.tokens)} / ${formatTokenCount(contextUsage.contextWindow)}`;
-			if (contextUsage.percent !== null) info += ` (${Math.round(contextUsage.percent)}%)`;
+			info += `\n${theme.bold("Session")}\n`;
+			info += `${theme.fg("dim", "Tokens:")} ${formatTokenCount(stats.tokens.total)} total`;
+			info += ` · ${formatTokenCount(stats.tokens.input)} in · ${formatTokenCount(stats.tokens.output)} out`;
+			if (stats.tokens.cacheRead > 0) info += ` · ${formatTokenCount(stats.tokens.cacheRead)} cache read`;
 			info += "\n";
-		}
+			const cost = stats.cost < 0.01 ? stats.cost.toFixed(4) : stats.cost.toFixed(2);
+			info += `${theme.fg("dim", "Cost:")} $${cost}\n`;
+			const contextUsage = this.getConnectionContextUsage() ?? stats.contextUsage;
+			if (contextUsage?.tokens !== null && contextUsage?.tokens !== undefined) {
+				info += `${theme.fg("dim", "Context:")} ${formatTokenCount(contextUsage.tokens)} / ${formatTokenCount(contextUsage.contextWindow)}`;
+				if (contextUsage.percent !== null) info += ` (${Math.round(contextUsage.percent)}%)`;
+				info += "\n";
+			}
 
-		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(info.trimEnd(), 1, 0));
-		this.ui.requestRender();
+			this.chatContainer.addChild(new Spacer(1));
+			this.chatContainer.addChild(new Text(info.trimEnd(), 1, 0));
+			this.ui.requestRender();
+		} catch (error) {
+			this.showError(`Unable to load usage: ${error instanceof Error ? error.message : String(error)}`);
+		}
 	}
 
 	private handleLogsCommand(): void {
