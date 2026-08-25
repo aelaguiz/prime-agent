@@ -25,6 +25,8 @@ export interface RunningMcpServe {
 	readonly port: number;
 	readonly socketPath: string;
 	readonly daemonVersion: string;
+	/** True when the daemon runs an older build than this process. */
+	readonly staleDaemon: boolean;
 	close(): Promise<void>;
 }
 
@@ -39,9 +41,10 @@ export async function runMcpServe(options: McpServeOptions): Promise<void> {
 		return;
 	}
 	const server = await startMcpServe(options);
+	const skew = server.staleDaemon ? `, older than this build ${VERSION}` : "";
 	console.log(
 		`mcp-serve listening on http://${options.bind}:${server.port}${MCP_PATH} ` +
-			`(daemon: ${server.socketPath}, ${server.daemonVersion})`,
+			`(daemon: ${server.socketPath}, ${server.daemonVersion}${skew})`,
 	);
 	await waitForShutdown();
 	await server.close();
@@ -74,6 +77,7 @@ export async function startMcpServe(options: {
 		port: typeof address === "object" && address !== null ? address.port : options.port,
 		socketPath: context.bridge.socketPath,
 		daemonVersion: context.bridge.hello?.appVersion ?? "unknown",
+		staleDaemon: context.bridge.isStaleDaemon,
 		close: async () => {
 			httpServer.closeAllConnections();
 			await new Promise<void>((resolve) => httpServer.close(() => resolve()));

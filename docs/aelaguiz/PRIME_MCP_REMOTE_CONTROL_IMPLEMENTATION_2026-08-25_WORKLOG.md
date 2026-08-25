@@ -276,3 +276,57 @@ Commands and results:
 
 Files touched: `src/modes/mcp-serve/{daemon-bridge,tools}.ts`, `test/mcp-serve-render.test.ts`,
 `test/mcp-serve-e2e.test.ts`, this worklog.
+
+## Stale-daemon support (branch `fix/mcp-serve-stale-daemon`, 2026-08-25)
+
+Observed failure on amirs-mac-studio: its daemon runs an older build with active sessions, so
+`ensureInteractiveDaemonRunning` correctly refuses to replace it (`StaleDaemonError`), `DaemonBridge.start`
+threw, and mcp-serve exited 1 in a launchd crash loop.
+
+Branch note: `git checkout main` is impossible in this worktree (main is checked out in
+`/Users/aelaguiz/workspace/prime-agent`), so the branch was created directly from the merged commit with
+`git checkout -b fix/mcp-serve-stale-daemon origin/main` (2849f5ed5).
+
+Change (`daemon-bridge.ts`): probe first, then decide.
+
+| Probe status | Action |
+|---|---|
+| `absent`, `current` | `ensureInteractiveDaemonRunning`, then connect (today's path) |
+| `stale` | connect WITHOUT ensure; record the skew; never try to replace a live daemon |
+| `unavailable` | fail with a clear message naming the socket and the handshake failure |
+
+`recoverDaemon` (auto-reconnect) and the bridge's own `recover()` both re-probe through the same
+`planDaemonConnection` decision, so a mid-flight recovery never calls `ensureInteractiveDaemonRunning`
+against a stale daemon (which would throw `StaleDaemonError` inside the reconnect loop), while a daemon
+that actually went away is still replaced by a current one.
+
+Command compatibility at schema 17 (checked against `DAEMON_COMMAND_COMPATIBILITY`): every core command
+this server uses is `LEGACY_DAEMON_COMMAND` (protocol 7 only) — `list`, `create`, `kill`, `get_state`,
+`get_messages`, `get_session_stats`, `get_queue`, `get_last_assistant_text`, `abort`, `abort_bash`,
+`abort_compaction`, `retry_worker`. `prompt`/`steer`/`follow_up` need `session_input_admission` and
+`heartbeats_list` needs `heartbeat_catalog`; both capabilities exist in the v0.7.2 default set. The only
+gated command is `get_rlm_children` (`minSchemaRevision: 17` plus capability `authoritative_child_roster`,
+added later), so on an older daemon `session_detail` loses only its children section, through the existing
+`notes` path. Nothing needed coding around.
+
+Verification (all against throwaway sockets and isolated agent dirs):
+
+- Real stale daemon fixture: a throwaway copy of the tree outside the repo, version `0.7.99`, schema
+  revision 17 with the v0.7.2 capability list. `probeDaemonVersion` reported `stale`, and mcp-serve
+  connected instead of exiting:
+  `mcp-serve listening on http://127.0.0.1:7725/mcp (daemon: ..., 0.7.99, older than this build 0.8.0)`.
+  `status` header: `daemon 0.7.99, protocol 7, schema protocol-7-schema-17-legacyfixture, mcp-serve runs 0.8.0`.
+  `start_session`, `send`, `transcript`, `kill_session` all worked; `session_detail` degraded exactly as
+  designed: `notes: children unavailable: The running Prime Agent daemon does not support authoritative_child_roster.`
+- `unavailable` branch, against a socket served by a process that never sends a public hello:
+  exit 1 with `Cannot use the Prime Agent daemon at <socket> because a daemon is listening but did not
+  complete the handshake: Timed out after 2000ms ...` — no replacement attempted.
+- `current` branch unchanged against the real default daemon: `status` returned the live fleet.
+- Unit tests: `planDaemonConnection` for all four probe statuses, plus a status-header test asserting the
+  skew note renders.
+
+Commands and results: `npm run check` exit 0 (`Checked 971 files in 646ms. No fixes applied.`);
+`test/mcp-serve-render.test.ts` 37 passed; `test/mcp-serve-e2e.test.ts` 1 passed (4.2s).
+
+Files touched: `src/modes/mcp-serve/{daemon-bridge,mcp-serve-mode}.ts`, `test/mcp-serve-render.test.ts`,
+this worklog.

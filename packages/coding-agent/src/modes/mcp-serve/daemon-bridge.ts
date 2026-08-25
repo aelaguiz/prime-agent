@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { ensureInteractiveDaemonRunning } from "../../cli/daemon-launch.js";
+import { ensureInteractiveDaemonRunning, probeDaemonVersion } from "../../cli/daemon-launch.js";
 import { DaemonCapabilityUnavailableError, DaemonClient, type DaemonHello } from "../daemon/daemon-client.js";
 import { type DaemonErrorInfo, isDaemonMutatingCommand } from "../daemon/daemon-protocol.js";
 import { defaultDaemonSocketPath } from "../daemon/daemon-socket.js";
@@ -32,6 +32,42 @@ export interface DaemonBridgeOptions {
 	daemonSocket?: string;
 }
 
+export type DaemonProbeStatus = "absent" | "current" | "stale" | "unavailable";
+
+export interface DaemonConnectionPlan {
+	/** Spawn or refresh a daemon before connecting. */
+	ensure: boolean;
+	/** The daemon runs an older build than this process; commands are gated per hello. */
+	stale: boolean;
+	/** Set when connecting cannot be made to work and the caller must give up. */
+	fatal?: string;
+}
+
+/**
+ * Decide how to reach a daemon from a version probe.
+ *
+ * A daemon that answers a handshake is never replaced. A stale one still owns
+ * real sessions, and `ensureInteractiveDaemonRunning` refuses to replace a busy
+ * one anyway (`StaleDaemonError`) — so asking it to would only turn an
+ * introspectable older daemon into a startup crash. Connect and let
+ * `DaemonClient.request` gate individual commands against the daemon's hello.
+ */
+export function planDaemonConnection(status: DaemonProbeStatus): DaemonConnectionPlan {
+	switch (status) {
+		case "absent":
+		case "current":
+			return { ensure: true, stale: false };
+		case "stale":
+			return { ensure: false, stale: true };
+		case "unavailable":
+			return {
+				ensure: false,
+				stale: false,
+				fatal: "a daemon is listening but did not complete the handshake",
+			};
+	}
+}
+
 /**
  * Single daemon connection shared by every MCP tool handler. Read getters and
  * control commands only: the bridge never attaches, never sends client env, and
@@ -43,6 +79,7 @@ export class DaemonBridge {
 	private readonly client: DaemonClient;
 	private started = false;
 	private recovering?: Promise<void>;
+	private staleDaemon = false;
 
 	constructor(options: DaemonBridgeOptions = {}) {
 		this.socketPath = options.daemonSocket ?? defaultDaemonSocketPath();
@@ -53,12 +90,26 @@ export class DaemonBridge {
 		return this.client.hello;
 	}
 
+	/** True when the daemon runs an older build than this process. */
+	get isStaleDaemon(): boolean {
+		return this.staleDaemon;
+	}
+
 	async start(): Promise<void> {
 		if (this.started) {
 			return;
 		}
 		this.armAutoReconnect();
-		await ensureInteractiveDaemonRunning(this.socketPath);
+		const probe = await probeDaemonVersion(this.socketPath);
+		const plan = planDaemonConnection(probe.status);
+		if (plan.fatal) {
+			const detail = probe.status === "unavailable" ? `: ${probe.error.message}` : "";
+			throw new Error(`Cannot use the Prime Agent daemon at ${this.socketPath} because ${plan.fatal}${detail}`);
+		}
+		this.staleDaemon = plan.stale;
+		if (plan.ensure) {
+			await ensureInteractiveDaemonRunning(this.socketPath);
+		}
 		await this.client.connect();
 		await this.client.waitForHello();
 		this.started = true;
@@ -114,7 +165,7 @@ export class DaemonBridge {
 
 	private async runRecovery(cause: unknown): Promise<void> {
 		try {
-			await ensureInteractiveDaemonRunning(this.socketPath);
+			await this.recoverDaemonProcess();
 			// The client runs its own reconnect loop after a socket loss. Let it finish
 			// first: two concurrent connects race, and the loser destroys the socket the
 			// winner just established.
@@ -142,7 +193,21 @@ export class DaemonBridge {
 		}
 	}
 
+	/**
+	 * Re-probe before every recovery attempt, so a daemon that is merely older is
+	 * reconnected to rather than replaced, and a daemon that actually went away is
+	 * replaced by a current one.
+	 */
+	private async recoverDaemonProcess(): Promise<void> {
+		const probe = await probeDaemonVersion(this.socketPath);
+		const plan = planDaemonConnection(probe.status);
+		this.staleDaemon = plan.stale;
+		if (plan.ensure) {
+			await ensureInteractiveDaemonRunning(this.socketPath);
+		}
+	}
+
 	private armAutoReconnect(): void {
-		this.client.enableAutoReconnect({ recoverDaemon: () => ensureInteractiveDaemonRunning(this.socketPath) });
+		this.client.enableAutoReconnect({ recoverDaemon: () => this.recoverDaemonProcess() });
 	}
 }

@@ -1,6 +1,7 @@
 import { fauxAssistantMessage, fauxText, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { planDaemonConnection } from "../src/modes/mcp-serve/daemon-bridge.js";
 import {
 	deriveFleet,
 	deriveSession,
@@ -453,5 +454,47 @@ describe("mcp-serve session selector resolution", () => {
 
 	it("returns nothing for a selector that matches no session", () => {
 		expect(resolveSessionSummary(fleet, "no-such-session")).toBeUndefined();
+	});
+});
+
+describe("mcp-serve daemon connection planning", () => {
+	it("spawns or refreshes a daemon when none is running or it matches this build", () => {
+		expect(planDaemonConnection("absent")).toEqual({ ensure: true, stale: false });
+		expect(planDaemonConnection("current")).toEqual({ ensure: true, stale: false });
+	});
+
+	it("connects to an older daemon instead of trying to replace it", () => {
+		expect(planDaemonConnection("stale")).toEqual({ ensure: false, stale: true });
+	});
+
+	it("gives up on a daemon that never completes the handshake", () => {
+		const plan = planDaemonConnection("unavailable");
+		expect(plan).toMatchObject({ ensure: false, stale: false });
+		expect(plan.fatal).toContain("handshake");
+	});
+});
+
+describe("mcp-serve version skew reporting", () => {
+	it("puts the skew note in the status header", () => {
+		const selection = selectFleetRows(deriveFleet([summary({ sessionName: "one" })], NOW), {
+			includeChildren: false,
+			maxRows: 30,
+			maxInactiveRows: 20,
+		});
+		const header = renderFleetStatus({
+			host: "testhost",
+			daemon: {
+				socketPath: "/tmp/daemon.sock",
+				appVersion: "0.7.2",
+				protocolVersion: 7,
+				schemaId: "protocol-7-schema-16-1bcb9e7f1a49",
+				versionSkew: "mcp-serve runs 0.8.0",
+			},
+			selection,
+			pendingQuestions: new Map(),
+		}).split("\n")[0]!;
+		expect(header).toContain("daemon 0.7.2");
+		expect(header).toContain("schema protocol-7-schema-16-1bcb9e7f1a49");
+		expect(header).toContain("mcp-serve runs 0.8.0");
 	});
 });
