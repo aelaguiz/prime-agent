@@ -189,3 +189,56 @@ Note for future process work on this machine: the CLI rewrites `process.title` t
 
 Files touched: `src/modes/mcp-serve/mcp-serve-mode.ts`, `test/mcp-serve-e2e.test.ts`, `package.json`
 (test lanes), this worklog.
+
+## M4b — Review hardening (2026-08-25)
+
+Independent review: `/tmp/prime-mcp-research/review-m4.md` (verdict: fix-then-ship, P0 = 2, P1 = 4,
+P2 = 12). Fixed everything the parent triaged; P2-4 (export a sentinel from `agent-session.ts`) and
+P2-12 (hidden-children state counts) were declined by the parent.
+
+- **P0-1 / P2-3 / P2-7 (`tools.ts`)**: the supervisor refuses to route a session command to a worker
+  without a live client, so `get_state` fails on exactly the sessions that need repair. New
+  `readSessionSummary` falls back to the row from `list` (`publicSummary` keeps `workerState` and
+  `sessionFile` there), with `matchesSessionSelector` mirroring `matchWorkers`. `restart_session`
+  now reaches `retry_worker`, and takes it for `recovering` as well as `failed` — matching what
+  `status` reported. `kill_session` re-checks after a failed kill and reports the stop honestly when
+  the supervisor stopped an unresponsive worker anyway.
+- **P0-2 / P2-11 (`daemon-bridge.ts`)**: a mutating command is never retried. A client-side timeout
+  does not cancel daemon work (worker requests run up to 24h) and a retry carries a fresh wire id, so
+  the daemon's idempotency journal would miss it and the session would receive the command twice.
+  `DaemonCapabilityUnavailableError` is non-retryable too. Read-only commands keep recover-and-retry.
+- **P1-1 / P1-2 (`daemon-bridge.ts`)**: `recover()` is single-flight, waits up to 2s for the client's
+  own reconnect loop to win before calling `reconnect()` itself, and re-arms `enableAutoReconnect`
+  (the client clears its reconnect options for good after one expired 60s window).
+- **P1-3 / P1-4 (`test/mcp-serve-e2e.test.ts`)**: `session_detail` now asserts `notes` is empty and
+  `stats`/`heartbeats` are present, which proves all five optional getters answered on a real daemon.
+  The flow gained `restart_session` on the healthy session (asserts the `kill_and_resume` path, the
+  new id, and the retained session file), `resume_session` from the retained file after
+  `kill_session` (the `create {sessionPath}` path), a transcript check that survives both, and a
+  resume of a live session asserting `was_already_active`. No failed-worker fixture was built: the
+  `retry_worker` path stays covered by code shape only.
+- **P2-1**: `list {all: true}` uses the 30s catalog timeout the shipped CLI callers use.
+- **P2-2**: `session_detail` and `transcript` descriptions point at `resume_session` for rows that
+  `status --all` shows but that have no live worker.
+- **P2-5**: a failed post-create prompt no longer hides the session identity; `start_session`,
+  `resume_session`, and `restart_session` report `Started <selector> ... Prompt failed: <message>`.
+- **P2-6**: `interrupt` says `Sent interrupt (turn) to <session>` instead of claiming an effect.
+- **P2-8 / P2-9 / P2-10 (`mcp-serve-mode.ts`)**: an oversized body is drained and discarded so the
+  caller reads the 400 (hard ceiling 16 MiB, then the socket is dropped); the three voided promises
+  in the HTTP path have catches; `--stdio` exits when the client closes the pipe, and the shutdown
+  helper removes its signal listeners.
+
+Commands and results:
+
+- `npm run check` — exit 0, `Checked 970 files in 545ms. No fixes applied.`
+- `test/mcp-serve-render.test.ts` — 29 passed.
+- `test/mcp-serve-e2e.test.ts` — 3 consecutive runs passed (4.0s, 3.9s, 4.0s).
+- Manual proof of P2-8: a 5 MiB body returns
+  `400 {"jsonrpc":"2.0","error":{"code":-32700,"message":"Request body exceeds 4194304 bytes"},"id":null}`
+  (before the fix the client saw a broken pipe); a 20 MiB body is dropped at the drain ceiling; a
+  normal `status` call on the same server still works.
+- Manual proof of P2-10: an MCP stdio client saw all nine tools and the child process exited on
+  client close.
+
+Files touched: `src/modes/mcp-serve/{daemon-bridge,tools,mcp-serve-mode}.ts`,
+`test/mcp-serve-e2e.test.ts`, this worklog.

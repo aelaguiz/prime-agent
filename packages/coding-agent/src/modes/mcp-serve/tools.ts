@@ -7,8 +7,10 @@ import { VERSION } from "../../config.js";
 import { formatAgentCronJob } from "../../core/cron-jobs.js";
 import type { SessionStats } from "../../core/session-stats.js";
 import type { AgentConnectionHeartbeat, AgentConnectionRlmChildAgentSnapshot } from "../agent-connection/types.js";
+import { matchesSessionIdSuffix } from "../daemon/daemon-session-id.js";
 import type { SessionSummary } from "../daemon/daemon-session-list.js";
 import {
+	DAEMON_CATALOG_TIMEOUT_MS,
 	DAEMON_CREATE_TIMEOUT_MS,
 	DAEMON_GET_TIMEOUT_MS,
 	type DaemonBridge,
@@ -116,7 +118,8 @@ function registerSessionDetailTool(server: McpServer, context: McpServeToolConte
 			title: "Session detail",
 			description:
 				"Everything known about one session: derived state and evidence, token and cost stats, " +
-				"queued messages, RLM children, heartbeats, and the full pending question.",
+				"queued messages, RLM children, heartbeats, and the full pending question. " +
+				"Needs a running session; bring an inactive one back with resume_session first.",
 			inputSchema: { session: z.string().describe(SESSION_PARAM_DESCRIPTION) },
 		},
 		async ({ session }) =>
@@ -195,7 +198,8 @@ function registerTranscriptTool(server: McpServer, context: McpServeToolContext)
 			title: "Session transcript",
 			description:
 				"Recent messages of one session, newest last, bounded by a character budget. " +
-				"Page further back by passing the returned next_before as before.",
+				"Page further back by passing the returned next_before as before. " +
+				"Needs a running session; bring an inactive one back with resume_session first.",
 			inputSchema: {
 				session: z.string().describe(SESSION_PARAM_DESCRIPTION),
 				max_chars: z
@@ -288,7 +292,7 @@ function registerInterruptTool(server: McpServer, context: McpServeToolContext):
 				const command = target === "bash" ? "abort_bash" : target === "compaction" ? "abort_compaction" : "abort";
 				await context.bridge.command({ type: command, activeSessionId: session });
 				return {
-					text: `Interrupted ${target} on ${session}.`,
+					text: `Sent interrupt (${target}) to ${session}. Poll status to see whether it stopped.`,
 					structuredContent: { session, what: target, command },
 				};
 			}),
@@ -316,11 +320,11 @@ function registerStartSessionTool(server: McpServer, context: McpServeToolContex
 					...(name ? { name } : {}),
 				});
 				const session = sessionSelector(summary);
-				const delivered = await deliverPrompt(context.bridge, session, prompt);
+				const outcome = await deliverPromptOutcome(context.bridge, session, prompt);
 				const derived = deriveSession(await refreshState(context.bridge, session, summary), Date.now(), 0);
 				return {
-					text: `Started ${session}\n${renderSessionLine(derived)}\nPrompt ${delivered} - admitted, not completed. Poll status for progress.`,
-					structuredContent: { session: derived, promptDelivered: delivered },
+					text: `Started ${session}\n${renderSessionLine(derived)}\n${renderDelivery("Prompt", outcome)}`,
+					structuredContent: { session: derived, ...deliveryContent("promptDelivered", outcome) },
 				};
 			}),
 	);
@@ -341,15 +345,15 @@ function registerResumeSessionTool(server: McpServer, context: McpServeToolConte
 		async ({ session, message }) =>
 			runTool(async () => {
 				const resumed = await resumeSession(context.bridge, session);
-				const delivered = message ? await deliverPrompt(context.bridge, resumed.session, message) : undefined;
+				const outcome = message ? await deliverPromptOutcome(context.bridge, resumed.session, message) : undefined;
 				const lines = [
 					resumed.wasAlreadyActive ? `${resumed.session} was already running.` : `Resumed ${resumed.session}.`,
 				];
 				if (resumed.summary) {
 					lines.push(renderSessionLine(deriveSession(resumed.summary, Date.now(), 0)));
 				}
-				if (delivered) {
-					lines.push(`Message ${delivered} - admitted, not completed. Poll status for progress.`);
+				if (outcome) {
+					lines.push(renderDelivery("Message", outcome));
 				}
 				return {
 					text: lines.join("\n"),
@@ -357,7 +361,7 @@ function registerResumeSessionTool(server: McpServer, context: McpServeToolConte
 						session: resumed.session,
 						was_already_active: resumed.wasAlreadyActive,
 						...(resumed.summary ? { summary: deriveSession(resumed.summary, Date.now(), 0) } : {}),
-						...(delivered ? { messageDelivered: delivered } : {}),
+						...(outcome ? deliveryContent("messageDelivered", outcome) : {}),
 					},
 				};
 			}),
@@ -381,15 +385,17 @@ function registerRestartSessionTool(server: McpServer, context: McpServeToolCont
 			runTool(async () => {
 				const bridge = context.bridge;
 				// Read the session file BEFORE the kill: the row leaves the live list afterwards.
-				const state = await bridge.command<SessionSummary>(
-					{ type: "get_state", activeSessionId: session },
-					DAEMON_GET_TIMEOUT_MS,
-				);
+				const state = await readSessionSummary(bridge, session);
+				if (!state) {
+					throw new Error(`Unknown active session: ${session}`);
+				}
 				const previousSession = sessionSelector(state);
 				let path: "retry_worker" | "kill_and_resume";
 				let summary: SessionSummary | undefined;
 				let nextSession: string;
-				if (state.workerState === "failed") {
+				// A recovering worker is reported as worker_failed by status, so it takes the
+				// same repair path the caller was told about.
+				if (state.workerState === "failed" || state.workerState === "recovering") {
 					path = "retry_worker";
 					await bridge.command({ type: "retry_worker", activeSessionId: previousSession });
 					nextSession = previousSession;
@@ -403,7 +409,9 @@ function registerRestartSessionTool(server: McpServer, context: McpServeToolCont
 					summary = resumed.summary;
 					nextSession = resumed.session;
 				}
-				const delivered = recovery_message ? await deliverPrompt(bridge, nextSession, recovery_message) : undefined;
+				const outcome = recovery_message
+					? await deliverPromptOutcome(bridge, nextSession, recovery_message)
+					: undefined;
 				const lines = [
 					path === "retry_worker"
 						? `Retried the failed worker for ${previousSession}.`
@@ -412,8 +420,8 @@ function registerRestartSessionTool(server: McpServer, context: McpServeToolCont
 				if (summary) {
 					lines.push(renderSessionLine(deriveSession(summary, Date.now(), 0)));
 				}
-				if (delivered) {
-					lines.push(`Recovery message ${delivered} - admitted, not completed. Poll status for progress.`);
+				if (outcome) {
+					lines.push(renderDelivery("Recovery message", outcome));
 				}
 				return {
 					text: lines.join("\n"),
@@ -423,7 +431,7 @@ function registerRestartSessionTool(server: McpServer, context: McpServeToolCont
 						session: nextSession,
 						session_file: state.sessionFile,
 						...(summary ? { summary: deriveSession(summary, Date.now(), 0) } : {}),
-						...(delivered ? { recoveryMessageDelivered: delivered } : {}),
+						...(outcome ? deliveryContent("recoveryMessageDelivered", outcome) : {}),
 					},
 				};
 			}),
@@ -440,20 +448,30 @@ function registerKillSessionTool(server: McpServer, context: McpServeToolContext
 		},
 		async ({ session }) =>
 			runTool(async () => {
-				const state = await optional(() =>
-					context.bridge.command<SessionSummary>(
-						{ type: "get_state", activeSessionId: session },
-						DAEMON_GET_TIMEOUT_MS,
-					),
-				);
-				await context.bridge.command({ type: "kill", activeSessionId: session });
+				const bridge = context.bridge;
+				const state = await readSessionSummary(bridge, session);
+				let note = "";
+				try {
+					await bridge.command({ type: "kill", activeSessionId: session });
+				} catch (error) {
+					// The supervisor refuses to route a command to a failed worker but still
+					// stops it, so an error here can mean the session is already gone.
+					if (await readSessionSummary(bridge, session)) {
+						throw error;
+					}
+					note = " The worker was not answering, so the daemon stopped it directly.";
+				}
 				return {
 					text:
-						`Stopped ${session}.` +
+						`Stopped ${session}.${note}` +
 						(state?.sessionFile
 							? ` Session file kept at ${state.sessionFile}; resume_session brings it back.`
 							: ""),
-					structuredContent: { session, ...(state?.sessionFile ? { session_file: state.sessionFile } : {}) },
+					structuredContent: {
+						session,
+						...(state?.sessionFile ? { session_file: state.sessionFile } : {}),
+						...(note ? { note: note.trim() } : {}),
+					},
 				};
 			}),
 	);
@@ -507,6 +525,35 @@ async function deliverPrompt(bridge: DaemonBridge, session: string, message: str
 		});
 		return "queued";
 	}
+}
+
+/**
+ * The session already exists once the prompt is attempted, so a prompt failure must
+ * not hide its identity: a caller that only saw the error would create another one.
+ */
+async function deliverPromptOutcome(
+	bridge: DaemonBridge,
+	session: string,
+	message: string,
+): Promise<{ delivered: "accepted" | "queued" } | { error: string }> {
+	try {
+		return { delivered: await deliverPrompt(bridge, session, message) };
+	} catch (error) {
+		return { error: error instanceof Error ? error.message : String(error) };
+	}
+}
+
+function renderDelivery(label: string, outcome: { delivered: "accepted" | "queued" } | { error: string }): string {
+	return "error" in outcome
+		? `${label} failed: ${outcome.error}`
+		: `${label} ${outcome.delivered} - admitted, not completed. Poll status for progress.`;
+}
+
+function deliveryContent(
+	key: string,
+	outcome: { delivered: "accepted" | "queued" } | { error: string },
+): Record<string, string> {
+	return "error" in outcome ? { [`${key}Error`]: outcome.error } : { [key]: outcome.delivered };
 }
 
 async function createSession(bridge: DaemonBridge, command: DaemonCreateCommand): Promise<SessionSummary> {
@@ -628,8 +675,41 @@ function renderSessionDetail(detail: SessionDetail): string {
 	return lines.join("\n");
 }
 
+/**
+ * The supervisor refuses to route a session command to a worker without a live
+ * client ("Session worker is failed"/"recovering"), so `get_state` is unusable on
+ * exactly the sessions that need repair. Its own session list still carries the
+ * row, stamped with `workerState` and `sessionFile`.
+ */
+async function readSessionSummary(bridge: DaemonBridge, selector: string): Promise<SessionSummary | undefined> {
+	const state = await optional(() =>
+		bridge.command<SessionSummary>({ type: "get_state", activeSessionId: selector }, DAEMON_GET_TIMEOUT_MS),
+	);
+	if (state) {
+		return state;
+	}
+	const sessions = await optional(() => listSessions(bridge, false));
+	return sessions?.find((summary) => matchesSessionSelector(summary, selector));
+}
+
+/** Mirrors the supervisor's own `matchWorkers` selector semantics. */
+function matchesSessionSelector(summary: SessionSummary, selector: string): boolean {
+	const activeSessionId = sessionSelector(summary);
+	return (
+		activeSessionId === selector ||
+		summary.sessionId === selector ||
+		summary.sessionName === selector ||
+		matchesSessionIdSuffix(activeSessionId, selector) ||
+		matchesSessionIdSuffix(summary.sessionId, selector)
+	);
+}
+
 async function listSessions(bridge: DaemonBridge, all: boolean): Promise<SessionSummary[]> {
-	const data = await bridge.command<{ sessions?: unknown }>({ type: "list", all }, DAEMON_GET_TIMEOUT_MS);
+	// `all` makes the supervisor scan every saved session in its catalog process.
+	const data = await bridge.command<{ sessions?: unknown }>(
+		{ type: "list", all },
+		all ? DAEMON_CATALOG_TIMEOUT_MS : DAEMON_GET_TIMEOUT_MS,
+	);
 	const sessions = Array.isArray(data.sessions) ? data.sessions : [];
 	return sessions.filter(isDaemonSessionSummary);
 }

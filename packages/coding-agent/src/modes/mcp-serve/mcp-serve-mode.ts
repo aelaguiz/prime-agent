@@ -19,6 +19,7 @@ export const MCP_SERVE_DEFAULT_BIND = "0.0.0.0";
 
 const MCP_PATH = "/mcp";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const MAX_REQUEST_DRAIN_BYTES = 16 * 1024 * 1024;
 
 export interface RunningMcpServe {
 	readonly port: number;
@@ -42,7 +43,7 @@ export async function runMcpServe(options: McpServeOptions): Promise<void> {
 		`mcp-serve listening on http://${options.bind}:${server.port}${MCP_PATH} ` +
 			`(daemon: ${server.socketPath}, ${server.daemonVersion})`,
 	);
-	await waitForShutdownSignal();
+	await waitForShutdown();
 	await server.close();
 }
 
@@ -58,7 +59,9 @@ export async function startMcpServe(options: {
 }): Promise<RunningMcpServe> {
 	const context = await createToolContext(options.daemonSocket);
 	const httpServer = createServer((request, response) => {
-		void handleHttpRequest(request, response, context);
+		handleHttpRequest(request, response, context).catch((error: unknown) => {
+			console.error(`mcp-serve request handler failed: ${error instanceof Error ? error.message : String(error)}`);
+		});
 	});
 	try {
 		await listen(httpServer, options.port, options.bind);
@@ -93,10 +96,13 @@ async function createToolContext(daemonSocket: string | undefined): Promise<McpS
 async function serveStdio(context: McpServeToolContext): Promise<void> {
 	const server = createMcpServer(context);
 	const transport = new StdioServerTransport();
+	const clientClosed = new Promise<void>((resolve) => {
+		server.server.onclose = () => resolve();
+	});
 	await server.connect(transport);
 	// stdout is the protocol channel in stdio mode; every log line goes to stderr.
 	process.stderr.write(`mcp-serve ready on stdio (daemon: ${context.bridge.socketPath})\n`);
-	await waitForShutdownSignal();
+	await waitForShutdown(clientClosed);
 	await server.close();
 }
 
@@ -127,8 +133,8 @@ async function handleHttpRequest(
 	const server = createMcpServer(context);
 	const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
 	response.on("close", () => {
-		void transport.close();
-		void server.close();
+		transport.close().catch(() => undefined);
+		server.close().catch(() => undefined);
 	});
 	try {
 		await server.connect(transport);
@@ -159,17 +165,29 @@ function readJsonBody(request: IncomingMessage): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];
 		let size = 0;
+		let oversize = false;
 		request.on("data", (chunk: Buffer) => {
 			size += chunk.length;
 			if (size > MAX_REQUEST_BYTES) {
-				reject(new Error(`Request body exceeds ${MAX_REQUEST_BYTES} bytes`));
-				request.destroy();
+				// Keep draining (discarding) an oversized body instead of destroying the
+				// socket, so the caller can finish its upload and read the 400 rather than
+				// seeing a dropped connection. Give up on a caller that ignores the limit.
+				chunks.length = 0;
+				oversize = true;
+				if (size > MAX_REQUEST_DRAIN_BYTES) {
+					request.destroy();
+					reject(new Error(`Request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+				}
 				return;
 			}
 			chunks.push(chunk);
 		});
 		request.on("error", reject);
 		request.on("end", () => {
+			if (oversize) {
+				reject(new Error(`Request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+				return;
+			}
 			if (size === 0) {
 				resolve(undefined);
 				return;
@@ -194,16 +212,22 @@ function listen(server: Server, port: number, bind: string): Promise<void> {
 	});
 }
 
-function waitForShutdownSignal(): Promise<void> {
-	return new Promise((resolve) => {
-		const onSignal = () => {
+/** Resolves on SIGINT/SIGTERM, or on `closed` when the transport goes away first. */
+async function waitForShutdown(closed?: Promise<void>): Promise<void> {
+	let onSignal: (() => void) | undefined;
+	const signalled = new Promise<void>((resolve) => {
+		onSignal = resolve;
+		process.once("SIGINT", resolve);
+		process.once("SIGTERM", resolve);
+	});
+	try {
+		await (closed ? Promise.race([signalled, closed]) : signalled);
+	} finally {
+		if (onSignal) {
 			process.off("SIGINT", onSignal);
 			process.off("SIGTERM", onSignal);
-			resolve();
-		};
-		process.once("SIGINT", onSignal);
-		process.once("SIGTERM", onSignal);
-	});
+		}
+	}
 }
 
 function jsonRpcError(code: number, message: string): Record<string, unknown> {

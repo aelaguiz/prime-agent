@@ -203,7 +203,10 @@ describe("mcp-serve end to end", () => {
 			const detail = await callTool(client, "session_detail", { session: selector });
 			expect(detail.isError).toBe(false);
 			expect(detail.text).toContain(projectDir);
-			expect(Array.isArray(detail.structured.notes)).toBe(true);
+			// Every optional getter must have answered: `notes` only holds failures.
+			expect(detail.structured.notes).toEqual([]);
+			expect(detail.structured.stats).toBeDefined();
+			expect(detail.structured.heartbeats).toEqual([]);
 
 			const transcript = await callTool(client, "transcript", { session: selector, max_chars: 2000 });
 			expect(transcript.isError).toBe(false);
@@ -214,12 +217,46 @@ describe("mcp-serve end to end", () => {
 			expect(interrupted.isError).toBe(false);
 			expect(interrupted.text).toContain(selector);
 
-			const killed = await callTool(client, "kill_session", { session: selector });
+			// A healthy session restarts through the kill-and-resume path. The failed-worker
+			// path (retry_worker) has no fixture here and is covered by code shape only.
+			const restarted = await callTool(client, "restart_session", { session: selector });
+			expect(restarted.isError).toBe(false);
+			expect(restarted.structured.path).toBe("kill_and_resume");
+			expect(restarted.structured.previous_session).toBe(selector);
+			const restartedSelector = String(restarted.structured.session);
+			expect(restartedSelector).not.toBe(selector);
+			const sessionFile = String(restarted.structured.session_file);
+			expect(sessionFile).toContain(agentDir);
+			expect(sessions(await callTool(client, "status", {}))).toHaveLength(1);
+
+			const killed = await callTool(client, "kill_session", { session: restartedSelector });
 			expect(killed.isError).toBe(false);
 			expect(killed.text).toContain("resume_session");
+			expect(killed.structured.session_file).toBe(sessionFile);
 
 			const afterKill = await callTool(client, "status", {});
 			expect(sessions(afterKill)).toHaveLength(0);
+
+			// Resuming the retained file exercises create-with-sessionPath.
+			const resumed = await callTool(client, "resume_session", { session: sessionFile });
+			expect(resumed.isError).toBe(false);
+			expect(resumed.structured.was_already_active).toBe(false);
+			const resumedSelector = String(resumed.structured.session);
+			const afterResume = await callTool(client, "status", {});
+			expect(sessions(afterResume)).toHaveLength(1);
+			expect(sessions(afterResume)[0]).toMatchObject({ session: resumedSelector, name: "e2e-demo" });
+
+			// The transcript survived the restart and the resume.
+			const resumedTranscript = await callTool(client, "transcript", { session: resumedSelector });
+			expect(resumedTranscript.text).toContain("first task");
+
+			// A live session resumes to itself instead of being opened twice.
+			const already = await callTool(client, "resume_session", { session: resumedSelector });
+			expect(already.structured.was_already_active).toBe(true);
+			expect(already.structured.session).toBe(resumedSelector);
+
+			expect((await callTool(client, "kill_session", { session: resumedSelector })).isError).toBe(false);
+			expect(sessions(await callTool(client, "status", {}))).toHaveLength(0);
 
 			const unknown = await callTool(client, "session_detail", { session: "no-such-session" });
 			expect(unknown.isError).toBe(true);
