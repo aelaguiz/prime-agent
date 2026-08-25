@@ -242,3 +242,37 @@ Commands and results:
 
 Files touched: `src/modes/mcp-serve/{daemon-bridge,tools,mcp-serve-mode}.ts`,
 `test/mcp-serve-e2e.test.ts`, this worklog.
+
+## M4c — Re-check fixes (2026-08-25)
+
+Re-check verified all six M4b fixes as genuinely fixed and found four regressions introduced by that
+commit. All four fixed as proposed.
+
+- **NEW-1 (`tools.ts`)**: the `list` fallback now mirrors `matchWorkers`' RESOLUTION rules, not just its
+  predicate. `resolveSessionSummary` filters exact matches (activeSessionId ?? id, sessionId,
+  sessionName) first and only falls back to id-suffix matches when there is no exact hit, and throws
+  `Ambiguous active session "<selector>"` on more than one candidate. Before this, an ambiguous suffix
+  could make `restart_session` kill and resume an arbitrary session.
+- **NEW-2 (`tools.ts`)**: `kill_session` only tells the "the daemon stopped it anyway" story for a
+  session that existed BEFORE the kill and is provably gone after it. A selector that never resolved now
+  reports the daemon's error. If the post-kill re-read itself fails, the original kill error is reported
+  rather than a guessed success.
+- **NEW-3 (`daemon-bridge.ts`)**: recovery now runs for every command type; only the re-send is declined
+  for mutating commands. A client that only sends mutations heals the connection and re-arms
+  auto-reconnect again, with the no-double-delivery guarantee unchanged.
+- **NEW-4 (`tools.ts`)**: when both `get_state` and `list` fail, `readSessionSummary` throws
+  `Cannot read session "<selector>": <list error> (state read: <state error>)` instead of letting a
+  daemon outage be reported as an unknown session.
+
+Added coverage (not requested, but this is the destructive path the reviewer flagged):
+`resolveSessionSummary` is exported and unit-tested for exact-beats-suffix, suffix-only, ambiguity, and
+no-match; the e2e test asserts `kill_session` on an unknown selector returns `isError`.
+
+Commands and results:
+
+- `npm run check` — exit 0, `Checked 970 files in 616ms. No fixes applied.`
+- `test/mcp-serve-render.test.ts` — 33 passed (29 + 4 new).
+- `test/mcp-serve-e2e.test.ts` — 2 consecutive runs passed (4.43s, 4.37s).
+
+Files touched: `src/modes/mcp-serve/{daemon-bridge,tools}.ts`, `test/mcp-serve-render.test.ts`,
+`test/mcp-serve-e2e.test.ts`, this worklog.

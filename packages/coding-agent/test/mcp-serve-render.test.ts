@@ -12,6 +12,7 @@ import {
 	STALLED_AFTER_MS,
 	selectFleetRows,
 } from "../src/modes/mcp-serve/render.js";
+import { resolveSessionSummary } from "../src/modes/mcp-serve/tools.js";
 
 const NOW = Date.UTC(2026, 7, 25, 12, 0, 0);
 
@@ -428,5 +429,29 @@ describe("mcp-serve transcript rendering", () => {
 
 	it("handles an empty transcript", () => {
 		expect(renderTranscript([], {})).toMatchObject({ text: "[no messages]", total: 0 });
+	});
+});
+
+describe("mcp-serve session selector resolution", () => {
+	const fleet = [
+		summary({ id: "99991111aaaa", sessionId: "99991111aaaa", activeSessionId: "99991111aaaa", sessionName: "one" }),
+		summary({ id: "2222aaaa", sessionId: "2222aaaa", activeSessionId: "2222aaaa", sessionName: "two" }),
+		summary({ id: "3333bbbb", sessionId: "3333bbbb", activeSessionId: "3333bbbb", sessionName: "1111aaaa" }),
+	];
+
+	it("prefers an exact match anywhere in the fleet over an earlier suffix match", () => {
+		expect(resolveSessionSummary(fleet, "1111aaaa")?.activeSessionId).toBe("3333bbbb");
+	});
+
+	it("matches by id suffix when nothing matches exactly", () => {
+		expect(resolveSessionSummary(fleet, "bbbb")?.sessionName).toBe("1111aaaa");
+	});
+
+	it("refuses an ambiguous selector instead of picking a row", () => {
+		expect(() => resolveSessionSummary(fleet, "aaaa")).toThrow('Ambiguous active session "aaaa"');
+	});
+
+	it("returns nothing for a selector that matches no session", () => {
+		expect(resolveSessionSummary(fleet, "no-such-session")).toBeUndefined();
 	});
 });

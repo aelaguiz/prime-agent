@@ -75,14 +75,15 @@ export class DaemonBridge {
 		try {
 			return await this.send<T>(body, timeoutMs);
 		} catch (error) {
-			if (
-				error instanceof DaemonCommandError ||
-				error instanceof DaemonCapabilityUnavailableError ||
-				isDaemonMutatingCommand(body)
-			) {
+			if (error instanceof DaemonCommandError || error instanceof DaemonCapabilityUnavailableError) {
 				throw error;
 			}
+			// Recover for every command type, so a client that only sends mutations still
+			// heals the connection (and re-arms auto-reconnect), then decline the re-send.
 			await this.recover(error);
+			if (isDaemonMutatingCommand(body)) {
+				throw error;
+			}
 			return await this.send<T>(body, timeoutMs);
 		}
 	}

@@ -455,8 +455,20 @@ function registerKillSessionTool(server: McpServer, context: McpServeToolContext
 					await bridge.command({ type: "kill", activeSessionId: session });
 				} catch (error) {
 					// The supervisor refuses to route a command to a failed worker but still
-					// stops it, so an error here can mean the session is already gone.
-					if (await readSessionSummary(bridge, session)) {
+					// stops it, so an error here can mean the session is already gone. That
+					// story only holds for a session that existed before the kill and is
+					// provably gone after it; anything else is a real failure.
+					if (!state) {
+						throw error;
+					}
+					let remaining: SessionSummary | undefined;
+					try {
+						remaining = await readSessionSummary(bridge, session);
+					} catch {
+						// The stop cannot be confirmed, so report the original failure.
+						throw error;
+					}
+					if (remaining) {
 						throw error;
 					}
 					note = " The worker was not answering, so the daemon stopped it directly.";
@@ -682,26 +694,57 @@ function renderSessionDetail(detail: SessionDetail): string {
  * row, stamped with `workerState` and `sessionFile`.
  */
 async function readSessionSummary(bridge: DaemonBridge, selector: string): Promise<SessionSummary | undefined> {
-	const state = await optional(() =>
-		bridge.command<SessionSummary>({ type: "get_state", activeSessionId: selector }, DAEMON_GET_TIMEOUT_MS),
-	);
-	if (state) {
-		return state;
+	let stateError: unknown;
+	try {
+		return await bridge.command<SessionSummary>(
+			{ type: "get_state", activeSessionId: selector },
+			DAEMON_GET_TIMEOUT_MS,
+		);
+	} catch (error) {
+		stateError = error;
 	}
-	const sessions = await optional(() => listSessions(bridge, false));
-	return sessions?.find((summary) => matchesSessionSelector(summary, selector));
+	let sessions: SessionSummary[];
+	try {
+		sessions = await listSessions(bridge, false);
+	} catch (error) {
+		// Both reads failed, so the daemon is the problem, not the selector.
+		throw new Error(
+			`Cannot read session "${selector}": ${errorMessage(error)} (state read: ${errorMessage(stateError)})`,
+		);
+	}
+	return resolveSessionSummary(sessions, selector);
 }
 
-/** Mirrors the supervisor's own `matchWorkers` selector semantics. */
-function matchesSessionSelector(summary: SessionSummary, selector: string): boolean {
-	const activeSessionId = sessionSelector(summary);
+/**
+ * Applies `matchWorkers`' resolution rules, not just its predicate: an exact hit
+ * anywhere in the fleet beats every suffix hit, and an ambiguous selector is an
+ * error rather than an arbitrary row — otherwise a destructive tool could act on
+ * the wrong session.
+ */
+export function resolveSessionSummary(
+	sessions: readonly SessionSummary[],
+	selector: string,
+): SessionSummary | undefined {
+	const exact = sessions.filter((summary) => matchesSessionSelectorExactly(summary, selector));
+	const candidates = exact.length > 0 ? exact : sessions.filter((summary) => matchesSessionIdTail(summary, selector));
+	if (candidates.length > 1) {
+		throw new Error(`Ambiguous active session "${selector}"`);
+	}
+	return candidates[0];
+}
+
+function matchesSessionSelectorExactly(summary: SessionSummary, selector: string): boolean {
+	return sessionSelector(summary) === selector || summary.sessionId === selector || summary.sessionName === selector;
+}
+
+function matchesSessionIdTail(summary: SessionSummary, selector: string): boolean {
 	return (
-		activeSessionId === selector ||
-		summary.sessionId === selector ||
-		summary.sessionName === selector ||
-		matchesSessionIdSuffix(activeSessionId, selector) ||
-		matchesSessionIdSuffix(summary.sessionId, selector)
+		matchesSessionIdSuffix(sessionSelector(summary), selector) || matchesSessionIdSuffix(summary.sessionId, selector)
 	);
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
 }
 
 async function listSessions(bridge: DaemonBridge, all: boolean): Promise<SessionSummary[]> {

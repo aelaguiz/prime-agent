@@ -261,6 +261,11 @@ describe("mcp-serve end to end", () => {
 			const unknown = await callTool(client, "session_detail", { session: "no-such-session" });
 			expect(unknown.isError).toBe(true);
 			expect(unknown.text).toContain("no-such-session");
+
+			// A selector that never resolved must never be reported as stopped.
+			const killUnknown = await callTool(client, "kill_session", { session: "no-such-session" });
+			expect(killUnknown.isError).toBe(true);
+			expect(killUnknown.text).toContain("no-such-session");
 		} finally {
 			await client.close();
 		}
