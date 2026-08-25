@@ -20,3 +20,50 @@ Files touched: `package-lock.json`, `packages/coding-agent/package.json`, this w
 
 Decisions: none beyond the plan. The plan docs in `docs/aelaguiz/` are left untracked; the parent
 owns committing them.
+
+## M1 — Vertical slice: `status` end-to-end (2026-08-25)
+
+Built:
+
+- `src/modes/mcp-serve/daemon-bridge.ts` — one `DaemonClient` with `enableAutoReconnect`
+  (`recoverDaemon: ensureInteractiveDaemonRunning`), `command<T>()` that throws `DaemonCommandError`
+  with the daemon's verbatim message + `errorInfo.code`, and one bounded recover-and-retry for
+  transport failures (never for a daemon `success: false`). No attach, no client env, no
+  `extension_ui`.
+- `src/modes/mcp-serve/render.ts` — `deriveSessionState`, `deriveSession`, `deriveFleet`
+  (child counts from parent linkage, needs-attention-first sort), `renderFleetStatus`,
+  `renderSessionLine`, char caps.
+- `src/modes/mcp-serve/tools.ts` — `status` tool (`{ all?: boolean }`), `list {all}` plus
+  best-effort parallel `get_last_assistant_text` (5s each) for `waiting_on_user` rows.
+- `src/modes/mcp-serve/mcp-serve-mode.ts` — `runMcpServe`: stateless Streamable HTTP on
+  `node:http` at `/mcp` (fresh `McpServer` + transport per POST, cleaned up on `res.close`),
+  405 for GET/DELETE, 404 elsewhere, 4 MiB body cap, `--stdio` variant with stderr-only logging,
+  SIGINT/SIGTERM shutdown.
+- CLI: `CommandSpec` in `src/cli/command-registry.ts`, `case "mcp-serve"` plus a verb-local flag
+  parser in `src/cli/public-command.ts` (`--port`, `--bind`, `--stdio`, `--socket|--daemon-socket`
+  via `normalizeSocketPath`).
+
+Commands and results:
+
+- `npm run check` (repo root) — exit 0, `Checked 968 files in 570ms. No fixes applied.`
+- `npx tsx src/cli.ts help mcp-serve` — renders usage, description, and the four options.
+- `npx tsx src/cli.ts mcp-serve --port 7717 --bind 127.0.0.1` against the real default daemon,
+  driven by an MCP SDK `StreamableHTTPClientTransport` client: `tools/list` -> `status`;
+  `status` returned 96 real sessions, text 14,917 chars, longest line 200 chars, no tool error.
+- SIGTERM to the serving process: port released, exit code 0.
+
+Correction found against live data (plan §2.2 state table): the plan derives `inactive` from
+`lifecycle !== "live" || !activeSessionId`. On this machine 48 of 96 rows in the LIVE list are RLM
+child sessions that legitimately have no `activeSessionId` (`daemon-supervisor.ts` uses
+`summary.activeSessionId ?? summary.id` everywhere), so that rule marked live child agents
+`inactive`. The row is now classified `inactive` only when `lifecycle !== "live"` or `workerState`
+is absent — the supervisor stamps `workerState` on every summary it publishes from a live worker
+(`publicSummary`), and `summaryForInactiveSession` never sets it. Session selectors follow the same
+convention: `activeSessionId ?? id`.
+
+Open questions raised with the parent: RLM children dominate the fleet view (48 of 96 rows, all
+`stalled` by the plan's rule and therefore sorted above working sessions), and the full status text
+is ~15 KB.
+
+Files touched: `src/modes/mcp-serve/{daemon-bridge,render,tools,mcp-serve-mode}.ts`,
+`src/cli/command-registry.ts`, `src/cli/public-command.ts`, `package.json` (zod), this worklog.
