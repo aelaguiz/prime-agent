@@ -20,24 +20,74 @@ export const MCP_SERVE_DEFAULT_BIND = "0.0.0.0";
 const MCP_PATH = "/mcp";
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
 
+export interface RunningMcpServe {
+	readonly port: number;
+	readonly socketPath: string;
+	readonly daemonVersion: string;
+	close(): Promise<void>;
+}
+
 export async function runMcpServe(options: McpServeOptions): Promise<void> {
-	const bridge = new DaemonBridge({ ...(options.daemonSocket ? { daemonSocket: options.daemonSocket } : {}) });
+	if (options.stdio) {
+		const context = await createToolContext(options.daemonSocket);
+		try {
+			await serveStdio(context);
+		} finally {
+			context.bridge.close();
+		}
+		return;
+	}
+	const server = await startMcpServe(options);
+	console.log(
+		`mcp-serve listening on http://${options.bind}:${server.port}${MCP_PATH} ` +
+			`(daemon: ${server.socketPath}, ${server.daemonVersion})`,
+	);
+	await waitForShutdownSignal();
+	await server.close();
+}
+
+/**
+ * Start the HTTP server and return a handle. Signal handling stays in
+ * `runMcpServe` so an embedding caller (a test) owns the lifecycle itself.
+ * Port 0 binds an ephemeral port; the handle reports the real one.
+ */
+export async function startMcpServe(options: {
+	port: number;
+	bind: string;
+	daemonSocket?: string;
+}): Promise<RunningMcpServe> {
+	const context = await createToolContext(options.daemonSocket);
+	const httpServer = createServer((request, response) => {
+		void handleHttpRequest(request, response, context);
+	});
+	try {
+		await listen(httpServer, options.port, options.bind);
+	} catch (error) {
+		context.bridge.close();
+		throw error;
+	}
+	const address = httpServer.address();
+	return {
+		port: typeof address === "object" && address !== null ? address.port : options.port,
+		socketPath: context.bridge.socketPath,
+		daemonVersion: context.bridge.hello?.appVersion ?? "unknown",
+		close: async () => {
+			httpServer.closeAllConnections();
+			await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+			context.bridge.close();
+		},
+	};
+}
+
+async function createToolContext(daemonSocket: string | undefined): Promise<McpServeToolContext> {
+	const bridge = new DaemonBridge({ ...(daemonSocket ? { daemonSocket } : {}) });
 	try {
 		await bridge.start();
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(`mcp-serve cannot reach the Prime Agent daemon at ${bridge.socketPath}: ${message}`);
 	}
-	const context: McpServeToolContext = { bridge, host: hostname() };
-	try {
-		if (options.stdio) {
-			await serveStdio(context);
-			return;
-		}
-		await serveHttp(options, context);
-	} finally {
-		bridge.close();
-	}
+	return { bridge, host: hostname() };
 }
 
 async function serveStdio(context: McpServeToolContext): Promise<void> {
@@ -48,21 +98,6 @@ async function serveStdio(context: McpServeToolContext): Promise<void> {
 	process.stderr.write(`mcp-serve ready on stdio (daemon: ${context.bridge.socketPath})\n`);
 	await waitForShutdownSignal();
 	await server.close();
-}
-
-async function serveHttp(options: McpServeOptions, context: McpServeToolContext): Promise<void> {
-	const httpServer = createServer((request, response) => {
-		void handleHttpRequest(request, response, context);
-	});
-	await listen(httpServer, options.port, options.bind);
-	const daemonVersion = context.bridge.hello?.appVersion ?? "unknown";
-	console.log(
-		`mcp-serve listening on http://${options.bind}:${options.port}${MCP_PATH} ` +
-			`(daemon: ${context.bridge.socketPath}, ${daemonVersion})`,
-	);
-	await waitForShutdownSignal();
-	httpServer.closeAllConnections();
-	await new Promise<void>((resolve) => httpServer.close(() => resolve()));
 }
 
 async function handleHttpRequest(

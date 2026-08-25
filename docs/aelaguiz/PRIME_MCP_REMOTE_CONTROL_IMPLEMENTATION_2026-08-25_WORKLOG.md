@@ -150,3 +150,42 @@ and `RLM_*`. A daemon spawned with an inherited environment starts as a WORKER a
 public hello. The e2e test must strip `PRIME_AGENT_INTERNAL_*` (and `RLM_*`) from the child env.
 
 Files touched: `src/modes/mcp-serve/{render,tools}.ts`, `test/mcp-serve-render.test.ts`, worklog.
+
+## M4 — E2E suite test + hardening (2026-08-25)
+
+Built:
+
+- `mcp-serve-mode.ts` split: `startMcpServe({ port, bind, daemonSocket })` starts the HTTP server and
+  returns a handle (`port`, `socketPath`, `daemonVersion`, `close()`); `runMcpServe` keeps the signal
+  handling and the startup log. Port 0 binds an ephemeral port, which is what the test uses.
+- `test/mcp-serve-e2e.test.ts`: spawns a real daemon on a unique tmp socket via tsx
+  (`--mode daemon --daemon-socket <tmp> --offline`, `PI_OFFLINE=1`, isolated `ENV_AGENT_DIR`),
+  starts mcp-serve in-process on an ephemeral port against that socket, and drives it with the real
+  MCP SDK `StreamableHTTPClientTransport`: tools/list (all nine, in order) -> status (empty) ->
+  start_session -> status (1 session, not `inactive`) -> send (real + unknown selector) ->
+  session_detail -> transcript -> interrupt -> kill_session -> status (empty) -> unknown selector
+  returns `isError`. Teardown closes the server, sends `shutdown {force: true}`, SIGTERMs the child,
+  waits for exit, and removes temp dirs with retries.
+- The spawned daemon environment strips `PRIME_AGENT_INTERNAL_*` and `RLM_*`; without that the child
+  starts as a session worker and never completes the public handshake.
+- Lane convention followed rather than invented: `test:ci` now excludes `test/mcp-serve-e2e.test.ts`
+  alongside `test/daemon-supervisor-process.test.ts`, and `test:process` runs both. CI already runs
+  `npm run test:process` as its own job.
+
+Commands and results:
+
+- `npm run check` — exit 0, `Checked 970 files in 603ms. No fixes applied.`
+- `npx tsx ../../node_modules/vitest/dist/cli.js --run test/mcp-serve-e2e.test.ts` — 1 passed
+  (~2.6s; three consecutive runs green, no leftover sockets, processes, or temp dirs).
+- `npx tsx ../../node_modules/vitest/dist/cli.js --run test/mcp-serve-render.test.ts` — 29 passed.
+- Daemon-churn proof, throwaway socket: `status` green, daemon pid 62434, `kill -9 62434`, process
+  confirmed gone, next `status` call returned `isError=false` with correct output, and the socket was
+  then held by a NEW daemon pid 67473 (respawned through `ensureInteractiveDaemonRunning` from the
+  bridge recovery path). No crash in the mcp-serve log.
+
+Note for future process work on this machine: the CLI rewrites `process.title` to `prime-agent`, so
+`pgrep -f` on daemon arguments finds nothing. Identify a daemon by its socket
+(`lsof -nP -U | grep <socket>`) instead.
+
+Files touched: `src/modes/mcp-serve/mcp-serve-mode.ts`, `test/mcp-serve-e2e.test.ts`, `package.json`
+(test lanes), this worklog.
