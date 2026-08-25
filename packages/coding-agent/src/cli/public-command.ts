@@ -3,6 +3,8 @@ import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { AuthStorage } from "../core/auth-storage.js";
 import { runMcpManagementCommand } from "../core/mcp/mcp-command.js";
 import { SettingsManager } from "../core/settings-manager.js";
+import { normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
+import { MCP_SERVE_DEFAULT_BIND, MCP_SERVE_DEFAULT_PORT, runMcpServe } from "../modes/mcp-serve/mcp-serve-mode.js";
 import { handlePackageCommand, isSelfUpdateSource } from "../package-manager-cli.js";
 import { INTERNAL_RUNTIME_COMMAND_MARKER, parseArgs } from "./args.js";
 import {
@@ -119,6 +121,8 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 			return runPackage(args.slice(1));
 		case "mcp":
 			return runMcp(args.slice(1));
+		case "mcp-serve":
+			return runMcpServeCommand(args.slice(1));
 		case "update": {
 			const rest = args.slice(1);
 			const hasLegacySelfTarget = rest.some((arg) => arg === "--self" || isSelfUpdateSource(arg));
@@ -279,6 +283,43 @@ async function runMcp(args: string[]): Promise<PublicCommandResult> {
 	const settingsManager = SettingsManager.create(process.cwd());
 	const result = await runMcpManagementCommand(args, settingsManager, AuthStorage.create());
 	console.log(result.message);
+	return HANDLED;
+}
+
+async function runMcpServeCommand(args: string[]): Promise<PublicCommandResult> {
+	let port = MCP_SERVE_DEFAULT_PORT;
+	let bind = MCP_SERVE_DEFAULT_BIND;
+	let stdio = false;
+	let daemonSocket: string | undefined;
+
+	for (let index = 0; index < args.length; index++) {
+		const arg = args[index]!;
+		if (arg === "--stdio") {
+			stdio = true;
+			continue;
+		}
+		if (arg === "--port" || arg === "--bind" || arg === "--socket" || arg === "--daemon-socket") {
+			const value = args[index + 1];
+			if (value === undefined) {
+				return fail(`${arg} requires a value`, `Run "${APP_NAME} help mcp-serve" for usage.`);
+			}
+			index++;
+			if (arg === "--port") {
+				if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+					return fail(`Invalid port: ${value}`);
+				}
+				port = Number(value);
+			} else if (arg === "--bind") {
+				bind = value;
+			} else {
+				daemonSocket = normalizeSocketPath(value);
+			}
+			continue;
+		}
+		return fail(`Unknown option for mcp-serve: ${arg}`, `Run "${APP_NAME} help mcp-serve" for usage.`);
+	}
+
+	await runMcpServe({ port, bind, stdio, ...(daemonSocket ? { daemonSocket } : {}) });
 	return HANDLED;
 }
 

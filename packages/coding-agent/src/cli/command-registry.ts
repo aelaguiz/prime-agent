@@ -119,6 +119,19 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 		summary: "Remove a user MCP server",
 	},
 	{
+		path: ["mcp-serve"],
+		usage: "mcp-serve [--port <n>] [--bind <addr>] [--stdio] [--daemon-socket <path>]",
+		summary: "Serve MCP remote-control for this machine's agents",
+		description:
+			"Exposes this machine's agent sessions to an MCP client. The HTTP transport has no authentication; only serve it on a trusted network.",
+		options: [
+			"--port <n>              Listen on this port (default: 7717)",
+			"--bind <addr>           Bind to this address (default: 0.0.0.0)",
+			"--stdio                 Serve on stdio instead of HTTP",
+			"--daemon-socket <path>  Use a specific daemon socket",
+		],
+	},
+	{
 		path: ["package"],
 		usage: "package <install|remove|list|update>",
 		summary: "Manage capability packages",
