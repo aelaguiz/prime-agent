@@ -103,3 +103,50 @@ Polish: child counts are singular/plural correct, and the context percentage is 
 Files touched: `src/modes/mcp-serve/{render,tools}.ts`, `test/mcp-serve-render.test.ts`,
 `docs/aelaguiz/PRIME_MCP_REMOTE_CONTROL_IMPLEMENTATION_2026-08-25.md` (§0/§2.2/§2.3 updated to the
 approved reality), this worklog.
+
+## M3 — Control tools (2026-08-25)
+
+Built:
+
+- Approved M2 follow-ups: `transcript` clips each message at 25% of the page budget (300-char
+  floor) and appends `[message truncated - fetch alone with before=<index+1>, max_chars=20000]`;
+  `session_detail` reports a `notes:` line naming each section whose getter failed, instead of
+  hiding it.
+- `send` (multi-session, modes auto/steer/follow_up, per-session `accepted|queued|error`, one
+  failure never stops the others), `interrupt` (turn/bash/compaction), `start_session`,
+  `resume_session`, `restart_session`, `kill_session`.
+
+Commands and results:
+
+- `npm run check` — exit 0.
+- `npx tsx ../../node_modules/vitest/dist/cli.js --run test/mcp-serve-render.test.ts` — 29 passed
+  (two new transcript sub-cap tests).
+- Manual sequence against a THROWAWAY daemon socket and isolated agent dir
+  (`--mode daemon --daemon-socket /tmp/prime-mcpserve-m3-*.sock --offline`, `PI_OFFLINE=1`,
+  `PRIME_AGENT_CODING_AGENT_DIR` under `/tmp`), `mcp-serve` on port 7719 pointed at that socket:
+  status (empty) -> start_session -> status -> send (auto to a busy session + an unknown session)
+  -> send steer -> send follow_up -> session_detail -> transcript -> interrupt turn -> interrupt
+  bash -> restart_session -> status -> resume_session (already live) -> kill_session -> status
+  (empty) -> resume_session by sessionId with a message -> status. All tools returned
+  `isError=false` except the deliberately unknown selector, which returned the daemon's own
+  wording. Throwaway daemon, worker, sockets, and temp dirs removed afterwards.
+
+Corrections found by running it:
+
+1. `queueIfBusy: true` is NOT enough to queue onto a session that is already streaming.
+   `agent-session.ts` rejects any visible-queue prompt without `streamingBehavior`
+   ("Agent is already processing. Specify streamingBehavior ..."). `send mode=auto` now retries the
+   rejected prompt once with `streamingBehavior: "followUp"` and reports `queued`. No pre-check, so
+   there is no race window.
+2. A `create` response carries the worker's own summary without the supervisor's fields
+   (`workerState`), so a freshly started session rendered as `inactive`. `start_session` and
+   `resume_session` now re-read `get_state` for the authoritative row.
+3. `resume_session` on a live session succeeded but reported `was_already_active: false`, because
+   the supervisor silently reuses the live worker. It now probes `get_state` first and reports the
+   live session honestly; the `session_already_active` error path is still handled.
+
+Environment note for M4: this machine's agent shells export `PRIME_AGENT_INTERNAL_DAEMON_WORKER`
+and `RLM_*`. A daemon spawned with an inherited environment starts as a WORKER and never sends a
+public hello. The e2e test must strip `PRIME_AGENT_INTERNAL_*` (and `RLM_*`) from the child env.
+
+Files touched: `src/modes/mcp-serve/{render,tools}.ts`, `test/mcp-serve-render.test.ts`, worklog.

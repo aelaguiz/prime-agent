@@ -412,6 +412,20 @@ describe("mcp-serve transcript rendering", () => {
 		expect(window.nextBefore).toBeUndefined();
 	});
 
+	it("caps one message at a quarter of the page and points at the drill-down", () => {
+		const long = [{ role: "user" as const, content: "z".repeat(5000), timestamp: 1 }];
+		const window = renderTranscript(long, { maxChars: 4000 });
+		expect(window.text).toContain("[message truncated - fetch alone with before=1, max_chars=20000]");
+		expect(window.text.length).toBeLessThan(1200);
+	});
+
+	it("keeps a floor under the per-message budget on small pages", () => {
+		const long = [{ role: "user" as const, content: "z".repeat(5000), timestamp: 1 }];
+		const window = renderTranscript(long, { maxChars: 400 });
+		expect(window.text).toContain("[message truncated");
+		expect(window.text.length).toBeGreaterThan(300);
+	});
+
 	it("handles an empty transcript", () => {
 		expect(renderTranscript([], {})).toMatchObject({ text: "[no messages]", total: 0 });
 	});

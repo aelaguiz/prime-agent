@@ -381,11 +381,27 @@ export interface TranscriptWindow {
 }
 
 export const TRANSCRIPT_DEFAULT_MAX_CHARS = 4000;
+export const TRANSCRIPT_MAX_CHARS_LIMIT = 20_000;
 
 const TOOL_CALL_ARGUMENTS_MAX_CHARS = 120;
+/** One message may spend at most this share of a page, so a page always shows several. */
+const TRANSCRIPT_MESSAGE_SHARE = 0.25;
+const TRANSCRIPT_MESSAGE_MIN_CHARS = 300;
 
 /** Compact one-message rendering; covers every role the coding agent can persist. */
 export function renderMessage(message: AgentMessage, maxChars: number): string {
+	return renderMessageEntry(message, maxChars).text;
+}
+
+function renderMessageEntry(message: AgentMessage, maxChars: number): { text: string; truncated: boolean } {
+	const full = renderMessageText(message);
+	return full.length <= maxChars
+		? { text: full, truncated: false }
+		: { text: `${full.slice(0, Math.max(0, maxChars - 1))}\u2026`, truncated: true };
+}
+
+function renderMessageText(message: AgentMessage): string {
+	const maxChars = Number.MAX_SAFE_INTEGER;
 	switch (message.role) {
 		case "user":
 			return `[user] ${clip(contentText(message.content), maxChars)}`;
@@ -432,11 +448,16 @@ export function renderTranscript(
 		return { text: "[no messages]", firstIndex: 0, lastIndex: 0, total };
 	}
 
+	const messageMaxChars = Math.max(TRANSCRIPT_MESSAGE_MIN_CHARS, Math.floor(maxChars * TRANSCRIPT_MESSAGE_SHARE));
 	const rendered: string[] = [];
 	let used = 0;
 	let firstIndex = end - 1;
 	for (let index = end - 1; index >= 0; index--) {
-		const line = `#${index} ${renderMessage(messages[index]!, maxChars)}`;
+		const entry = renderMessageEntry(messages[index]!, messageMaxChars);
+		const marker = entry.truncated
+			? ` [message truncated - fetch alone with before=${index + 1}, max_chars=${TRANSCRIPT_MAX_CHARS_LIMIT}]`
+			: "";
+		const line = `#${index} ${entry.text}${marker}`;
 		if (rendered.length > 0 && used + line.length > maxChars) {
 			break;
 		}
