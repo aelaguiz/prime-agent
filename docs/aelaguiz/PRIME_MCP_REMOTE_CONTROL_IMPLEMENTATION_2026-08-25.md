@@ -40,6 +40,8 @@ cd /Users/aelaguiz/workspace/prime-agent-worktrees/mcp-serve
 npm install                                   # worktree has no node_modules yet
 npm install @modelcontextprotocol/sdk -w packages/coding-agent
 # 1.30.0 (2026-07-27) clears the 7-day min-release-age rule; requires npm >= 11.10
+npm install zod@^3.25.76 -w packages/coding-agent
+# The SDK's tool-schema layer needs zod; it was only a hoisted peer install before (approved M1)
 npm run check                                 # must be green BEFORE any code is written (baseline)
 ```
 
@@ -108,12 +110,21 @@ Pure functions, no I/O — this is the unit-testable core.
 
 | Derived state | Rule (first match wins) |
 |---|---|
+| `inactive` | `lifecycle !== "live"` or no `workerState` (saved-only row) |
 | `worker_failed` | `workerState === "failed"` or `"recovering"` |
 | `working` | `activity === "working"` or `isStreaming` or `isRunningTools` or `isBashRunning` or `hasRunningRlmChildren` |
 | `waiting_on_user` | idle and `taskState === "needs_input"` |
-| `stalled` | idle, no `taskState`, and `lastActivityAt` older than 30 min |
+| `stalled` | idle root session (`rlmDepth` 0 or absent), no `taskState`, `lastActivityAt` older than 30 min |
 | `idle` | everything else live |
-| `inactive` | `lifecycle !== "live"` or no `activeSessionId` (saved-only row) |
+
+Corrections made during M1 against the live fleet, approved 2026-08-25:
+- Liveness is `workerState`, not `activeSessionId`. The supervisor stamps `workerState` on every
+  summary it publishes from a live worker (`publicSummary`) and `summaryForInactiveSession` never
+  sets it. RLM child sessions are live but carry no `activeSessionId` of their own (48 of 96 rows on
+  this machine), so that field cannot stand in for liveness.
+- A session selector is `activeSessionId ?? id`, matching `matchWorkers` / `findSummaryInWorker`.
+- An RLM child (`rlmDepth > 0`) never classifies `stalled`; it falls through to `idle`. A child
+  answers its parent and never owns a user verdict.
 
 Always emit raw evidence next to the verdict: `minutes_since_activity`, `workerState`,
 `attachedClients`, `isStreaming/isRunningTools/isBashRunning`, child count. The LLM recap
@@ -146,7 +157,7 @@ Common param: `session: string` — "activeSessionId | sessionId | id-suffix | s
 
 | Tool | Input schema (zod) | Daemon commands | Output (structured) |
 |---|---|---|---|
-| `status` | `{ all?: boolean }` (default false = live only) | `list {all}`; for each `waiting_on_user` session `get_last_assistant_text` (parallel, best-effort, 5s timeout each) | `{ host, daemon: {version, protocol, schemaId, skew}, sessions: DerivedSession[] }` |
+| `status` | `{ all?: boolean, include_children?: boolean, max_rows?: number }` (defaults: false, false, 30) | `list {all}`; for each `waiting_on_user` session `get_last_assistant_text` (parallel, best-effort, 5s timeout each) | `{ host, daemon: {version, protocol, schemaId, skew}, sessions: DerivedSession[], counts, totals }` |
 | `session_detail` | `{ session: string }` | `get_state`, `get_session_stats`, `get_queue`, `get_rlm_children`, `get_last_assistant_text`, `heartbeats_list {activeSessionId}` | full detail incl. pending question (untruncated last assistant text up to 2,000 chars), queued messages, children, heartbeats, token/cost stats |
 | `transcript` | `{ session: string, max_chars?: number (default 4000), before?: number }` | `get_messages` | rendered window + paging cursor (`before` = message index) |
 | `send` | `{ sessions: string[], message: string, mode?: "auto"\|"steer"\|"follow_up" (default auto) }` | per session: mode auto -> `prompt {message, queueIfBusy: true}`; steer -> `steer {message}`; follow_up -> `follow_up {message}` | per-session `{ session, delivered: "accepted"\|"queued"\|"error", error? }` |
@@ -155,6 +166,14 @@ Common param: `session: string` — "activeSessionId | sessionId | id-suffix | s
 | `resume_session` | `{ session: string, message?: string }` | `create {sessionPath: selector}`; treat `session_already_active` as success; optional follow-up `prompt` | live session essentials + `was_already_active` |
 | `restart_session` | `{ session: string, recovery_message?: string }` | `get_state`; if `workerState === "failed"` -> `retry_worker`; else `kill` then `create {sessionPath: <sessionFile from state>}`; then optional `prompt` with recovery_message | old/new activeSessionId + what path was taken |
 | `kill_session` | `{ session: string }` | `kill` | ack (notes the session file remains resumable) |
+
+`status` payload rules (approved 2026-08-25, after the M1 fleet measurement showed 96 rows / ~15 KB):
+- `include_children: false` (default) hides `rlmDepth > 0` rows. Child counts are computed BEFORE
+  filtering, so a parent still reports `N children`.
+- `max_rows` (default 30) applies AFTER the needs-attention sort. Suppressed rows collapse into one
+  trailing line, `+N more: x working, y idle, z inactive`; `structuredContent` carries the full counts.
+- `all: true` adds saved rows, capped at the 20 most recently modified; the header reports the total
+  saved count. Live rows are never capped by that rule.
 
 Notes:
 - `send.sessions` as an array IS the broadcast/recover-all feature. Report per-session outcomes;

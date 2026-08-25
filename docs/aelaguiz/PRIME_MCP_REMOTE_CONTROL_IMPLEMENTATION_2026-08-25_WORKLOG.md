@@ -67,3 +67,39 @@ is ~15 KB.
 
 Files touched: `src/modes/mcp-serve/{daemon-bridge,render,tools,mcp-serve-mode}.ts`,
 `src/cli/command-registry.ts`, `src/cli/public-command.ts`, `package.json` (zod), this worklog.
+
+## M2 — Read tools (2026-08-25)
+
+Built (plus the approved status payload rules from the M1 gate):
+
+- `render.ts`: `selectFleetRows` (hide `rlmDepth > 0` rows unless asked, child counts computed
+  BEFORE filtering, saved-row cap, `max_rows` cap with a `+N more: ...` collapse line and full
+  counts), header now reports shown/total, hidden children, and saved-row capping;
+  `rlmDepth > 0` never classifies `stalled`; `renderMessage` for all seven roles (user, assistant
+  with tool calls, toolResult incl. error/image, bashExecution, custom, branchSummary,
+  compactionSummary); `renderTranscript` newest-last window with an explicit truncation marker and
+  a `nextBefore` paging cursor; `truncate` for newline-preserving blocks.
+- `tools.ts`: `status` gains `include_children` and `max_rows`; new `session_detail`
+  (`get_state` required, then best-effort `get_session_stats`, `get_queue`, `get_rlm_children`,
+  `get_last_assistant_text`, `heartbeats_list` in parallel) and `transcript`
+  (`get_messages` + window + paging cursor).
+- `test/mcp-serve-render.test.ts`: 27 unit tests over the state table (every rule and precedence),
+  the 30-minute boundary, selector fallback, selection/caps, header and collapse rendering, one
+  case per message role, and transcript paging.
+
+Commands and results:
+
+- `npm run check` — exit 0, `Checked 969 files in 550ms. No fixes applied.`
+- `npx tsx ../../node_modules/vitest/dist/cli.js --run test/mcp-serve-render.test.ts` — 27 passed.
+- Live smoke against the real daemon through the MCP SDK HTTP client: `status` now renders 26 rows
+  (74 children hidden, 7.6 KB), `session_detail` returns stats/children/heartbeats/last assistant
+  message, `transcript` pages backwards with `next_before`, and an unknown selector returns
+  `isError: true` with the daemon's own wording (`get_state failed: Unknown active session: ...`).
+
+Decisions: `totals.suppressed` counts every row not rendered (row cap plus saved cap) and
+`suppressedCounts` matches it, so the `+N more` line never disagrees with the counts.
+Polish: child counts are singular/plural correct, and the context percentage is rounded.
+
+Files touched: `src/modes/mcp-serve/{render,tools}.ts`, `test/mcp-serve-render.test.ts`,
+`docs/aelaguiz/PRIME_MCP_REMOTE_CONTROL_IMPLEMENTATION_2026-08-25.md` (§0/§2.2/§2.3 updated to the
+approved reality), this worklog.
