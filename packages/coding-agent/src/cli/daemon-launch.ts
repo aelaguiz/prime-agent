@@ -93,15 +93,16 @@ export async function probeDaemonVersion(socketPath: string): Promise<DaemonVers
 			hello.appVersion === VERSION;
 		if (!current) {
 			logDaemonLaunch(
-				`running daemon on ${socketPath} is stale: daemon v${hello.appVersion}/proto${hello.protocol.version}` +
+				`running daemon on ${socketPath} differs from this client (connecting anyway): daemon v${hello.appVersion}/proto${hello.protocol.version}` +
 					`/schema ${hello.schemaId ?? "legacy"}/build ${hello.runtime?.buildId ?? "unknown"} vs client ` +
 					`v${VERSION}/proto${DAEMON_PROTOCOL_VERSION}/schema ${DAEMON_SCHEMA_ID}`,
 			);
 		}
-		if (current) {
-			return { status: "current", hello };
-		}
-		return { status: "stale", hello };
+		// Version/build differences never block or replace a healthy daemon in this
+		// fork: dev-tree clients change constantly and the operator prefers
+		// connecting across drift over restart prompts. A real wire-contract break
+		// is accepted and diagnosed from the log line above.
+		return { status: "current", hello };
 	} catch (error) {
 		const handshakeError = error instanceof Error ? error : new Error(String(error));
 		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; leaving it untouched`);
