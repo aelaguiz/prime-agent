@@ -40,3 +40,14 @@ related:
 - Final root `npm run check`: passed. Biome checked 971 files with no fixes; TypeScript `tsgo --noEmit`, installer render, and browser smoke all passed.
 - `git diff --check`: passed. The changed-path audit found no file under `packages/coding-agent/src/modes/daemon/` and no daemon-protocol change.
 - Shared dependencies were linked only for isolated-worktree verification, then the worktree-only symlink was removed; the main workspace dependency directory remained intact.
+
+## 2026-08-28 — Publication, merge, and installation
+
+- Created implementation commit `80babc62cece644f1f1b2e87670d62cf16b3e950` (`feat(tui): stop and archive current agent with ctrl-x`).
+- Pushed `feat/tui-stop-and-exit` to `origin`.
+- Confirmed the main workspace's pre-existing dirty files did not overlap the 17 feature paths, then fast-forwarded local `main` from `9464637466416a1d9e57c5c056e192c64d3f0950` to the implementation commit without staging, stashing, or modifying unrelated work.
+- Pushed `origin/main` to the same implementation commit.
+- Verified `/Users/aelaguiz/.local/bin/prime-agent` executes `/Users/aelaguiz/workspace/prime-agent/prime-agent.sh`; that launcher runs the merged TypeScript source unless explicitly passed `--dist`.
+- Installed-command smoke: `prime-agent --version` exited 0 with `0.8.0`.
+- Installed-source smoke: importing `KeybindingsManager` from the merged main checkout exited 0 and printed `installed app.session.stop=ctrl+x`.
+- Rechecked the main worktree after merge: all pre-existing unrelated modified/untracked files remained present, and `main` matched `origin/main`.

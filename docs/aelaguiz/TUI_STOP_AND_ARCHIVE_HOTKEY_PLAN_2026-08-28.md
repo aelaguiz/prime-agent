@@ -1,7 +1,7 @@
 ---
 title: Add a TUI hotkey that stops and archives the current Prime Agent
 date: 2026-08-28
-status: active
+status: complete
 owners:
   - aelaguiz
 reviewers:
@@ -180,7 +180,7 @@ No file under `packages/coding-agent/src/modes/daemon/` or daemon protocol is an
 <!-- arch_skill:block:implementation_audit -->
 # Implementation Audit
 
-**Verdict: VERIFIED — implementation is complete; publication, merge, and installation proof remain.**
+**Verdict: COMPLETE — the frozen scope is implemented, published, merged, and installed.**
 
 - `app.session.stop` is canonical, configurable, editor-scoped, defaults to `Ctrl+X`, and is protected from extension interception.
 - Interactive Mode preserves drafts, coalesces repeated presses, waits for `AgentConnection.stop()`, suppresses the requested close event, exits only on success, and keeps failures visible/retryable.
@@ -188,7 +188,9 @@ No file under `packages/coding-agent/src/modes/daemon/` or daemon protocol is an
 - Quick/full TUI help and lifecycle documentation clearly distinguish `Ctrl+X` stop/archive from `Ctrl+D` detach.
 - Focused verification passed 141 tests across four files. The final root `npm run check` passed Biome over 971 files with no fixes, TypeScript, installer render, and browser smoke.
 - `git diff --check` passed and the daemon-source diff audit was empty.
+- Implementation commit `80babc62cece644f1f1b2e87670d62cf16b3e950` was pushed to `origin/feat/tui-stop-and-exit`, fast-forwarded into the existing dirty-but-nonoverlapping `/Users/aelaguiz/workspace/prime-agent` main worktree, and pushed to `origin/main` without disturbing unrelated edits.
+- The installed `/Users/aelaguiz/.local/bin/prime-agent` wrapper resolves to `/Users/aelaguiz/workspace/prime-agent/prime-agent.sh`, which launches source by default. Post-merge smoke returned version `0.8.0`, and a runtime import from that installed checkout resolved `app.session.stop=ctrl+x`.
 
-Implementation evidence: [worklog](./TUI_STOP_AND_ARCHIVE_HOTKEY_PLAN_2026-08-28_WORKLOG.md). Delivery evidence will be appended after the authorized push, main-workspace merge, and installed-command smoke check.
+Complete implementation and delivery evidence: [worklog](./TUI_STOP_AND_ARCHIVE_HOTKEY_PLAN_2026-08-28_WORKLOG.md).
 
 <!-- /arch_skill:block:implementation_audit -->
