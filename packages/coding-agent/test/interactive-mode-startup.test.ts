@@ -210,6 +210,98 @@ describe("InteractiveMode startup hints", () => {
 		expect(requestAgentsView).not.toHaveBeenCalled();
 	});
 
+	it("protects a draft from the stop-and-archive hotkey", () => {
+		const stopAgentAndExit = vi.fn();
+		const showStatus = vi.fn();
+		const mode = Object.assign(
+			createMode(false, false, () => "unsent draft"),
+			{
+				stopAgentAndExit,
+				showStatus,
+			},
+		);
+
+		Reflect.get(InteractiveMode.prototype, "handleStopAgent").call(mode);
+
+		expect(stopAgentAndExit).not.toHaveBeenCalled();
+		expect(showStatus).toHaveBeenCalledWith("Clear or stash the prompt before stopping the agent", "warning");
+	});
+
+	it("stops once and exits without a stale resume hint", async () => {
+		let releaseStop!: () => void;
+		const stopGate = new Promise<void>((resolve) => {
+			releaseStop = resolve;
+		});
+		const stop = vi.fn(() => stopGate);
+		const shutdown = vi.fn(async () => {});
+		const mode = Object.assign(createMode(), {
+			isStoppingAgent: false,
+			isShuttingDown: false,
+			agentConnection: { stop },
+			showStatus: vi.fn(),
+			showError: vi.fn(),
+			shutdown,
+		});
+		const stopAgentAndExit = Reflect.get(InteractiveMode.prototype, "stopAgentAndExit");
+
+		const firstStop = stopAgentAndExit.call(mode) as Promise<void>;
+		await stopAgentAndExit.call(mode);
+
+		expect(stop).toHaveBeenCalledOnce();
+		expect(shutdown).not.toHaveBeenCalled();
+
+		releaseStop();
+		await firstStop;
+
+		expect(shutdown).toHaveBeenCalledOnce();
+		expect(shutdown).toHaveBeenCalledWith({ showResumeHint: false });
+	});
+
+	it("keeps the TUI open and retryable when stop-and-archive fails", async () => {
+		const shutdown = vi.fn(async () => {});
+		const showError = vi.fn();
+		const mode = Object.assign(createMode(), {
+			isStoppingAgent: false,
+			isShuttingDown: false,
+			agentConnection: { stop: vi.fn(async () => Promise.reject(new Error("daemon refused stop"))) },
+			showStatus: vi.fn(),
+			showError,
+			shutdown,
+		});
+
+		await Reflect.get(InteractiveMode.prototype, "stopAgentAndExit").call(mode);
+
+		expect(mode.isStoppingAgent).toBe(false);
+		expect(shutdown).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledWith("Failed to stop and archive agent: daemon refused stop");
+	});
+
+	it("suppresses only the connection-close error expected during a requested stop", async () => {
+		let listener!: (event: { type: "closed"; error?: string }) => Promise<void>;
+		const showError = vi.fn();
+		const mode = Object.assign(createMode(), {
+			isStoppingAgent: true,
+			isShuttingDown: false,
+			agentConnection: {
+				subscribe: (next: typeof listener) => {
+					listener = next;
+					return () => {};
+				},
+			},
+			showError,
+		});
+
+		Reflect.get(InteractiveMode.prototype, "subscribeToAgent").call(mode);
+		await listener({ type: "closed", error: "expected stop close" });
+
+		expect(showError).not.toHaveBeenCalled();
+
+		mode.isStoppingAgent = false;
+		await listener({ type: "closed", error: "unexpected close" });
+
+		expect(showError).toHaveBeenCalledWith("unexpected close");
+	});
+
 	it("explains that the agents view needs the daemon for non-daemon chats", async () => {
 		const showStatus = vi.fn();
 		const shutdown = vi.fn(async () => {});
@@ -264,6 +356,8 @@ describe("InteractiveMode startup hints", () => {
 		const guide = Reflect.get(InteractiveMode.prototype, "getShortcutGuide").call(createMode());
 
 		expect(guide).toContain("`!` shell mode · `/` commands · `@` file paths");
+		expect(guide).toContain("`Ctrl+X` stop & archive agent");
+		expect(guide).toContain("`Ctrl+D` detach; resident agent keeps running");
 		expect(guide).toContain("stash prompt");
 		expect(guide).toContain("`/hotkeys` full reference");
 		expect(guide).not.toContain("Ctrl+Z");
@@ -296,9 +390,12 @@ describe("InteractiveMode startup hints", () => {
 	it("keeps /hotkeys comprehensive without Ctrl+Z", () => {
 		const guide = Reflect.get(InteractiveMode.prototype, "getHotkeysGuide").call(createMode());
 
+		expect(new KeybindingsManager().getEffectiveConfig()["app.session.stop"]).toBe("ctrl+x");
 		expect(guide).toContain("**Navigation**");
 		expect(guide).toContain("**Editing**");
 		expect(guide).toContain("**Fullscreen mode (`/fullscreen`)**");
+		expect(guide).toContain("Stop and archive current agent (when editor is empty)");
+		expect(guide).toContain("Detach and exit; agent keeps running (when editor is empty)");
 		expect(guide).toContain("Queue follow-up message");
 		expect(guide).not.toContain("Ctrl+Z");
 		expect(guide).not.toContain("Suspend to background");

@@ -5,6 +5,7 @@ import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import type { AimCredentialBinding } from "../src/core/aim-external-auth.js";
 import { emptyGoalState } from "../src/core/goals.js";
+import type { SessionState } from "../src/core/session-manager.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
 
@@ -16,6 +17,7 @@ interface FakeSessionControl {
 	session: RuntimeSession;
 	listenerCount(): number;
 	unsubscribeCount(): number;
+	sessionStates(): SessionState[];
 	emit(event: AgentSessionEvent): void;
 }
 
@@ -75,6 +77,7 @@ function userMessage(text: string, timestamp: number): AgentMessage {
 
 function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionControl {
 	const listeners = new Set<AgentSessionEventListener>();
+	const sessionStates: SessionState[] = [];
 	let unsubscriptions = 0;
 	const thinkingLevel: AgentConnectionState["thinkingLevel"] = "medium";
 	const buildSessionContext = () => ({
@@ -91,6 +94,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 			getEntries: () => [],
 			getTree: () => [],
 			buildSessionContext,
+			appendSessionState: (state: SessionState) => sessionStates.push(state),
 		},
 		buildSessionContext,
 		model: undefined,
@@ -142,6 +146,7 @@ function createFakeSession(id: string, messages: AgentMessage[]): FakeSessionCon
 		session,
 		listenerCount: () => listeners.size,
 		unsubscribeCount: () => unsubscriptions,
+		sessionStates: () => [...sessionStates],
 		emit(event: AgentSessionEvent) {
 			for (const listener of [...listeners]) {
 				listener(event);
@@ -258,6 +263,17 @@ describe("InProcessAgentConnection", () => {
 			thinkingLevel: "medium",
 			model: null,
 		});
+	});
+
+	it("archives a persisted session and disposes its process-local runtime", async () => {
+		const session = createFakeSession("stop", []);
+		const runtime = new FakeRuntime(session.session);
+		const connection = new InProcessAgentConnection(asRuntime(runtime));
+
+		await connection.stop();
+
+		expect(session.sessionStates()).toEqual([{ status: "archived" }]);
+		expect(runtime.disposed).toBe(true);
 	});
 
 	it("builds initial snapshots from the current runtime", async () => {

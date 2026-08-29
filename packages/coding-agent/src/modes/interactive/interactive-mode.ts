@@ -1383,7 +1383,8 @@ export class InteractiveMode {
 						hint("app.clear", "to interrupt"),
 						rawKeyHint(`${keyText("app.clear")} twice`, "to exit"),
 						hint("app.input.clear", "to clear input"),
-						hint("app.exit", "to exit (empty)"),
+						hint("app.exit", "to detach and exit (empty)"),
+						hint("app.session.stop", "to stop and archive (empty)"),
 						hint("app.suspend", "to suspend"),
 						keyHint("tui.editor.deleteToLineEnd", "to delete to end"),
 						rawKeyHint("/effort", "to set thinking level"),
@@ -4149,6 +4150,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.interrupt", () => this.handleInterruptKey());
 		this.defaultEditor.onAction("app.shortcuts", () => this.showShortcutGuide());
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
+		this.defaultEditor.onAction("app.session.stop", () => this.handleStopAgent());
 		this.defaultEditor.onAction("app.suspend", () => this.handleCtrlZ());
 
 		// Global debug handler on TUI (works regardless of focus)
@@ -5149,7 +5151,7 @@ export class InteractiveMode {
 					}
 				} else if (event.type === "heartbeats_changed") {
 					await this.refreshHeartbeatCatalog();
-				} else if (event.type === "closed") {
+				} else if (event.type === "closed" && !this.isStoppingAgent && !this.isShuttingDown) {
 					this.showError(event.error ?? "Agent connection closed");
 				}
 			} catch (error) {
@@ -6802,6 +6804,30 @@ export class InteractiveMode {
 		void this.shutdown();
 	}
 
+	private handleStopAgent(): void {
+		if (this.editor.getText().length > 0) {
+			this.showStatus("Clear or stash the prompt before stopping the agent", "warning");
+			return;
+		}
+		void this.stopAgentAndExit();
+	}
+
+	private isStoppingAgent = false;
+
+	private async stopAgentAndExit(): Promise<void> {
+		if (this.isStoppingAgent || this.isShuttingDown) return;
+		this.isStoppingAgent = true;
+		this.showStatus("Stopping and archiving agent…");
+		try {
+			await this.agentConnection.stop();
+		} catch (error) {
+			this.isStoppingAgent = false;
+			this.showError(`Failed to stop and archive agent: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
+		await this.shutdown({ showResumeHint: false });
+	}
+
 	/**
 	 * Gracefully shutdown the agent.
 	 * Stops the TUI before emitting shutdown events so extension UI cleanup cannot
@@ -6809,14 +6835,17 @@ export class InteractiveMode {
 	 */
 	private isShuttingDown = false;
 
-	private async shutdown(): Promise<void> {
+	private async shutdown(options: { showResumeHint?: boolean } = {}): Promise<void> {
 		if (this.isShuttingDown) return;
 		this.isShuttingDown = true;
 		this.unregisterSignalHandlers();
 		this.clearCtrlCExitHint({ render: false });
 
 		// Fetch while the connection is still alive; exit must not fail on a stats error.
-		const sessionStats = await this.agentConnection.getSessionStats().catch(() => undefined);
+		const sessionStats =
+			options.showResumeHint === false
+				? undefined
+				: await this.agentConnection.getSessionStats().catch(() => undefined);
 
 		// Drain any in-flight Kitty key release events before stopping.
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
@@ -6828,9 +6857,11 @@ export class InteractiveMode {
 		} finally {
 			await this.options.onShutdown?.();
 		}
-		const resumeHint = formatResumeHint(sessionStats);
-		if (resumeHint) {
-			console.log(resumeHint);
+		if (options.showResumeHint !== false) {
+			const resumeHint = formatResumeHint(sessionStats);
+			if (resumeHint) {
+				console.log(resumeHint);
+			}
 		}
 		process.exit(0);
 	}
@@ -9905,6 +9936,8 @@ export class InteractiveMode {
 		const externalEditor = this.getAppKeyDisplay("app.editor.external");
 		const promptStash = this.getAppKeyDisplay("app.prompt.stash");
 		const pasteImage = this.getAppKeyDisplay("app.clipboard.pasteImage");
+		const stopAgent = this.getAppKeyDisplay("app.session.stop");
+		const exit = this.getAppKeyDisplay("app.exit");
 
 		return `
 **Prompt**
@@ -9913,6 +9946,7 @@ export class InteractiveMode {
 \`${clearInput}\` interrupt · press twice to rewind or clear the prompt
 
 **Controls**
+\`${stopAgent}\` stop & archive agent (empty prompt) · \`${exit}\` detach; resident agent keeps running (empty prompt)
 \`${selectModel}\` select model · \`/effort\` set reasoning · \`${expandTools}\` tool output
 \`${expandMessages}\` agent messages · \`${expandEdits}\` edit diffs · \`${toggleThinking}\` thinking blocks · \`${promptStash}\` stash prompt · \`${externalEditor}\` edit in \`$EDITOR\`
 \`${pasteImage}\` paste image
@@ -9950,6 +9984,7 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 		const interrupt = this.getAppKeyDisplay("app.interrupt");
 		const shortcutsKey = this.getAppKeyDisplay("app.shortcuts");
 		const exit = this.getAppKeyDisplay("app.exit");
+		const stopAgent = this.getAppKeyDisplay("app.session.stop");
 		const selectModel = this.getAppKeyDisplay("app.model.select");
 		const expandTools = this.getAppKeyDisplay("app.tools.expand");
 		const expandMessages = this.getAppKeyDisplay("app.messages.expand");
@@ -9999,7 +10034,8 @@ ${shortcutsKey ? `\`${shortcutsKey}\` quick shortcuts · ` : ""}\`/hotkeys\` ful
 | \`${tab}\` | Path completion / accept autocomplete |
 | \`${clearInput}\` | Clear input / cancel autocomplete |
 | \`${clear}\` | Interrupt current operation (first) / exit (second) |
-${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shortcutsKey ? `| \`${shortcutsKey}\` | Show quick shortcuts |\n` : ""}| \`${exit}\` | Exit (when editor is empty) |
+${interrupt ? `| \`${interrupt}\` | Interrupt current operation |\n` : ""}${shortcutsKey ? `| \`${shortcutsKey}\` | Show quick shortcuts |\n` : ""}| \`${stopAgent}\` | Stop and archive current agent (when editor is empty) |
+| \`${exit}\` | Detach and exit; agent keeps running (when editor is empty) |
 | \`${selectModel}\` | Open model selector |
 | \`${expandTools}\` | Toggle tool output expansion |
 | \`${expandMessages}\` | Toggle agent message expansion |

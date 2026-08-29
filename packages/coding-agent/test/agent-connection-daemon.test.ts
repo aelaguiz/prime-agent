@@ -390,6 +390,8 @@ class FakeDaemonClient {
 			case "set_scoped_models":
 			case "rename_saved_session":
 			case "extension_ui_response":
+			case "kill":
+			case "complete_owned_session":
 			case "detach":
 				return { type: "response", command: command.type, success: true };
 			case "cancel_rlm_child":
@@ -2985,6 +2987,33 @@ describe("DaemonAgentConnection", () => {
 		);
 		await expect(connection.importFromJsonl("/tmp/not-found.jsonl")).rejects.toMatchObject({
 			filePath: "/tmp/not-found.jsonl",
+		});
+	});
+
+	it("uses the existing kill lifecycle to stop and archive a resident session", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-1");
+		await connection.attach();
+
+		await connection.stop();
+
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "kill"]);
+		expect(fakeClient.requests.at(-1)).toMatchObject({ type: "kill", activeSessionId: "active-1" });
+	});
+
+	it("completes an owned no-session worker instead of routing a resident kill", async () => {
+		const fakeClient = new FakeDaemonClient();
+		const connection = new DaemonAgentConnection(asDaemonClient(fakeClient), "active-owned", {
+			ownedSession: true,
+		});
+		await connection.attach();
+
+		await connection.stop();
+
+		expect(fakeClient.requests.map((request) => request.type)).toEqual(["attach", "complete_owned_session"]);
+		expect(fakeClient.requests.at(-1)).toMatchObject({
+			type: "complete_owned_session",
+			activeSessionId: "active-owned",
 		});
 	});
 

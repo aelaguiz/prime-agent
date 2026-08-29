@@ -46,7 +46,7 @@ The client can detach at any point. The resident worker continues to own the que
 
 Normal interactive sessions run in resident worker processes managed by a local supervisor. The worker owns the root session, its IPython kernel, scheduled jobs, and RLM descendants.
 
-Closing the terminal UI detaches the client; it does not stop the worker. List and reconnect to active agents with:
+`Ctrl+D` detaches and exits; it does not stop the worker. When you are finished with the current agent, press `Ctrl+X` with an empty prompt to stop it, archive its transcript, and exit. List and reconnect to active agents with:
 
 ```bash
 prime-agent list

@@ -1434,6 +1434,14 @@ export class DaemonAgentConnection implements AgentConnection {
 		};
 	}
 
+	async stop(): Promise<void> {
+		if (this.options.ownedSession) {
+			await this.requestOk({ type: "complete_owned_session", activeSessionId: this.activeSessionId });
+			return;
+		}
+		await this.requestOk({ type: "kill", activeSessionId: this.activeSessionId });
+	}
+
 	async dispose(): Promise<void> {
 		if (this.disposed || this.disposing) {
 			return;

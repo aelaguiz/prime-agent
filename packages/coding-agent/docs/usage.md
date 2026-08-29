@@ -110,7 +110,7 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 ## Agents and Recursive Subagents
 
-Normal interactive sessions are persistent agents backed by isolated worker processes. Closing the TUI detaches the client; use `prime-agent agents`, `prime-agent list`, or `prime-agent attach <agent>` to find and reattach to running work. `prime-agent stop <agent>` stops one root agent, while `prime-agent shutdown` stops all workers and the local supervisor.
+Normal interactive sessions are persistent agents backed by isolated worker processes. `Ctrl+D` detaches and exits while leaving the current agent running; `Ctrl+X` with an empty prompt stops and archives that agent before exiting. Use `prime-agent agents`, `prime-agent list`, or `prime-agent attach <agent>` to find and reattach to running work. `prime-agent stop <agent>` stops one root agent from the shell, while `prime-agent shutdown` stops all workers and the local supervisor.
 
 Within a session, the model can delegate through the `rlm` callable already available in IPython:
 

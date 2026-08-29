@@ -178,7 +178,9 @@ See `/hotkeys` for the full list. Customize via `~/.prime/agent/keybindings.json
 | Key | Action |
 |-----|--------|
 | Ctrl+C | Interrupt active work, or show the exit hint when idle |
-| Ctrl+C twice | Exit while the exit hint is visible |
+| Ctrl+C twice | Detach and exit while the exit hint is visible |
+| Ctrl+D | Detach and exit; leave the current agent running (empty prompt) |
+| Ctrl+X | Stop and archive the current agent, then exit (empty prompt) |
 | Escape | Clear the input without interrupting active work |
 | Escape twice | Open `/tree` |
 | Ctrl+L | Open model selector |

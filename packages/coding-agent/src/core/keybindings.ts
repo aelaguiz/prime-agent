@@ -36,6 +36,7 @@ export interface AppKeybindings {
 	"app.message.moveLater": true;
 	"app.clipboard.pasteImage": true;
 	"app.clipboard.copyLoginUrl": true;
+	"app.session.stop": true;
 	"app.session.new": true;
 	"app.session.tree": true;
 	"app.session.fork": true;
@@ -79,7 +80,7 @@ export const KEYBINDINGS = {
 	"app.clear": { defaultKeys: "ctrl+c", description: "Interrupt current operation, then exit" },
 	"app.input.clear": { defaultKeys: "escape", description: "Interrupt response or clear prompt" },
 	"app.shortcuts": { defaultKeys: "?", description: "Show keyboard shortcuts" },
-	"app.exit": { defaultKeys: "ctrl+d", description: "Exit when editor is empty" },
+	"app.exit": { defaultKeys: "ctrl+d", description: "Detach and exit when editor is empty" },
 	"app.suspend": {
 		defaultKeys: process.platform === "win32" ? [] : "ctrl+z",
 		description: "Suspend to background",
@@ -146,6 +147,11 @@ export const KEYBINDINGS = {
 	"app.clipboard.copyLoginUrl": {
 		defaultKeys: ["c", "alt+c"],
 		description: "Copy login URL",
+	},
+	"app.session.stop": {
+		defaultKeys: "ctrl+x",
+		description: "Stop and archive current agent when editor is empty",
+		defaultKeyScope: "editor",
 	},
 	"app.session.new": { defaultKeys: [], description: "Start a new session" },
 	"app.session.tree": { defaultKeys: [], description: "Open session tree" },
@@ -266,6 +272,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	clear: "app.clear",
 	clearInput: "app.input.clear",
 	exit: "app.exit",
+	stopSession: "app.session.stop",
 	suspend: "app.suspend",
 	selectModel: "app.model.select",
 	expandTools: "app.tools.expand",

@@ -1,0 +1,1 @@
+- Added a configurable Ctrl-X chat shortcut to stop and archive the current agent before exiting.

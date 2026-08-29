@@ -94,7 +94,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.interrupt` | *(none)* | Interrupt current operation |
 | `app.clear` | `ctrl+c` | Interrupt current operation, then exit |
 | `app.input.clear` | `escape` | Clear input |
-| `app.exit` | `ctrl+d` | Exit (when editor empty) |
+| `app.exit` | `ctrl+d` | Detach and exit; a resident agent keeps running (when editor empty) |
 | `app.suspend` | `ctrl+z` (none on Windows) | Suspend to background |
 | `app.editor.external` | `ctrl+g` | Open in external editor (`$VISUAL` or `$EDITOR`) |
 | `app.clipboard.pasteImage` | `ctrl+v` (`alt+v` on Windows) | Paste image from clipboard |
@@ -104,6 +104,7 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
+| `app.session.stop` | `ctrl+x` | Stop and archive the current agent, then exit (when editor empty) |
 | `app.session.new` | *(none)* | Start a new session (`/new`) |
 | `app.session.tree` | *(none)* | Open session tree navigator (`/tree`) |
 | `app.session.fork` | *(none)* | Fork current session (`/fork`) |

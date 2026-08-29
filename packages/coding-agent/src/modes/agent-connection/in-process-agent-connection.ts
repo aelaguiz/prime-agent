@@ -627,6 +627,13 @@ export class InProcessAgentConnection implements AgentConnection {
 		};
 	}
 
+	async stop(): Promise<void> {
+		if (this.session.sessionFile) {
+			this.session.sessionManager.appendSessionState({ status: "archived" });
+		}
+		await this.dispose();
+	}
+
 	async dispose(): Promise<void> {
 		this.abortAllSideQuestions();
 		await Promise.allSettled([...this.sessionInputPauses.values()].map((pause) => pause.release()));

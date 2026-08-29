@@ -763,6 +763,8 @@ export interface AgentConnection {
 	/** Read-only live-session watcher; unavailable transports return undefined. */
 	watchSession(activeSessionId: string): Promise<AgentConnectionSessionWatcher | undefined>;
 
+	/** Stop and archive the current persisted session using the transport's existing lifecycle. */
+	stop(): Promise<void>;
 	dispose(): Promise<void>;
 }
 
