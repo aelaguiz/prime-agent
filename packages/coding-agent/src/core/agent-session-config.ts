@@ -1,4 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { ServiceTier } from "@earendil-works/pi-ai";
 import type { AgentAutonomousConfig } from "./autonomous.js";
 
 export type AgentExecutionMode = "interactive" | "print" | "json" | "rpc" | "acp";
@@ -13,6 +14,7 @@ export interface AgentSessionRuntimeConfig {
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
+	serviceTier?: ServiceTier;
 	models?: string[];
 	tools?: string[];
 	noTools?: boolean;
@@ -77,6 +79,7 @@ export function mergeAgentSessionRuntimeConfig(
 		systemPrompt: override.systemPrompt ?? base.systemPrompt,
 		appendSystemPrompt: cloneArray(override.appendSystemPrompt ?? base.appendSystemPrompt),
 		thinking: override.thinking ?? base.thinking,
+		serviceTier: override.serviceTier !== undefined ? override.serviceTier : base.serviceTier,
 		models: cloneArray(override.models ?? base.models),
 		tools: cloneArray(override.tools ?? base.tools),
 		noTools: override.noTools ?? base.noTools,

@@ -136,10 +136,10 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("acp_mcp_servers");
 	});
 
-	it("publishes the composed revision with both AIM handoff and ACP MCP capabilities", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(23);
+	it("publishes the composed revision with AIM handoff, ACP MCP, and create service-tier capabilities", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(24);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
-			expect.arrayContaining(["aim_credential_handoff", "acp_mcp_servers"]),
+			expect.arrayContaining(["aim_credential_handoff", "acp_mcp_servers", "create_service_tier"]),
 		);
 		expect(DAEMON_COMMAND_COMPATIBILITY.handoff_aim_credential).toEqual({
 			minProtocol: 7,
@@ -210,6 +210,18 @@ describe("daemon protocol helpers", () => {
 				telemetryDisabled: true,
 			}),
 		).toEqual([{ minProtocol: 7, minSchemaRevision: 14 }, { minProtocol: 7 }]);
+	});
+
+	it("gates new-client service-tier creates while preserving old-client create compatibility", () => {
+		const oldClientCreate = { type: "create", config: { cwd: "/tmp" } } as const satisfies DaemonCommand;
+		expect(getDaemonCommandCompatibilities(oldClientCreate)).toEqual([{ minProtocol: 7 }]);
+		expect(
+			getDaemonCommandCompatibilities({
+				...oldClientCreate,
+				config: { ...oldClientCreate.config, serviceTier: "priority" },
+			}),
+		).toEqual([{ minProtocol: 7, minSchemaRevision: 24, capability: "create_service_tier" }, { minProtocol: 7 }]);
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("create_service_tier");
 	});
 
 	it("capability-gates authoritative rosters and transient owned-session recovery context", () => {

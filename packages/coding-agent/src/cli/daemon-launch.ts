@@ -614,6 +614,7 @@ const EARLY_LAUNCH_VALUE_FLAGS = new Set([
 	"--tools",
 	"-t",
 	"--thinking",
+	"--service-tier",
 	"--extension",
 	"-e",
 	"--skill",

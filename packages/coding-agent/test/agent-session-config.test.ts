@@ -173,6 +173,15 @@ describe("mergeAgentSessionRuntimeConfig", () => {
 		expect(mergeAgentSessionRuntimeConfig({}, {}).telemetryDisabled).toBeUndefined();
 	});
 
+	it("preserves and overrides per-session service tier without making it durable daemon state", () => {
+		expect(mergeAgentSessionRuntimeConfig({ serviceTier: "priority" }, {}).serviceTier).toBe("priority");
+		expect(mergeAgentSessionRuntimeConfig({ serviceTier: "priority" }, { serviceTier: "default" }).serviceTier).toBe(
+			"default",
+		);
+		expect(mergeAgentSessionRuntimeConfig({ serviceTier: "priority" }, { serviceTier: null }).serviceTier).toBeNull();
+		expect(durableAgentSessionRuntimeConfig({ serviceTier: "priority" })).toEqual({});
+	});
+
 	it("persists only typed daemon host settings", () => {
 		const durable = durableAgentSessionRuntimeConfig({
 			cwd: "/repo",

@@ -231,6 +231,27 @@ describe("parseArgs", () => {
 			expect(result.thinking).toBe("high");
 		});
 
+		test.each(["default", "priority"] as const)("parses --service-tier %s", (serviceTier) => {
+			const result = parseArgs(["--service-tier", serviceTier]);
+			expect(result.serviceTier).toBe(serviceTier);
+			expect(result.unknownFlags.has("service-tier")).toBe(false);
+		});
+
+		test("diagnoses invalid and missing --service-tier values without treating them as extension flags", () => {
+			const invalid = parseArgs(["--service-tier", "flex"]);
+			expect(invalid.serviceTier).toBeUndefined();
+			expect(invalid.diagnostics).toContainEqual({
+				type: "warning",
+				message: 'Invalid service tier "flex". Valid values: default, priority',
+			});
+			expect(invalid.unknownFlags.has("service-tier")).toBe(false);
+
+			const missing = parseArgs(["--service-tier"]);
+			expect(missing.serviceTier).toBeUndefined();
+			expect(missing.diagnostics).toContainEqual({ type: "error", message: "--service-tier requires a value" });
+			expect(missing.unknownFlags.has("service-tier")).toBe(false);
+		});
+
 		test("parses --models as comma-separated list", () => {
 			const result = parseArgs(["--models", "gpt-4o,claude-sonnet,gemini-pro"]);
 			expect(result.models).toEqual(["gpt-4o", "claude-sonnet", "gemini-pro"]);

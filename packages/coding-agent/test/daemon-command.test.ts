@@ -339,6 +339,44 @@ describe("daemon command", () => {
 		});
 	});
 
+	it("forwards an explicit service tier in daemon create config", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"create",
+				"--service-tier",
+				"priority",
+				"my-session",
+			]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests[0]).toMatchObject({
+			type: "create",
+			name: "my-session",
+			config: { serviceTier: "priority" },
+		});
+	});
+
+	it("rejects invalid daemon service tiers before sending create", async () => {
+		await handleDaemonCommand([
+			"daemon",
+			"--socket",
+			"/tmp/prime-agent.sock",
+			"create",
+			"--service-tier",
+			"flex",
+			"my-session",
+		]);
+
+		expect(process.exitCode).toBe(1);
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(consoleErrorMessages.some((message) => String(message).includes('Invalid service tier "flex"'))).toBe(
+			true,
+		);
+	});
+
 	it("parses extension flag values with equals without consuming the create name", async () => {
 		await expect(
 			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "create", "--ticket=123", "my-session"]),

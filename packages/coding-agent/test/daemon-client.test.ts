@@ -248,6 +248,46 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send new-client service-tier create config to an old daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION - 1);
+
+		await expect(client.request({ type: "create", config: { serviceTier: "priority" } })).rejects.toThrow(
+			"does not support create_service_tier",
+		);
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
+	it("keeps old-client create config compatible with a new daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["create_service_tier"], DAEMON_SCHEMA_REVISION);
+
+		const response = client.request({ type: "create", config: { cwd: "/tmp" } });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		const envelope = JSON.parse(socket.writes[0]!.trim()) as {
+			id: string;
+			command: { type: string; config?: { cwd?: string; serviceTier?: unknown } };
+		};
+		expect(envelope.command).toEqual({ type: "create", config: { cwd: "/tmp" }, id: envelope.id });
+		expect(envelope.command.config).not.toHaveProperty("serviceTier");
+
+		socket.emit(
+			"data",
+			`${JSON.stringify({ id: envelope.id, type: "response", command: "create", success: true })}\n`,
+		);
+		await expect(response).resolves.toMatchObject({ success: true });
+		client.close();
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();
