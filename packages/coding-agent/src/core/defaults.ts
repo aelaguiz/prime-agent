@@ -8,7 +8,7 @@ type ModelIdentity = {
 };
 
 const MODEL_THINKING_DEFAULTS: Readonly<Record<string, ThinkingLevel>> = {
-	"openai-codex/gpt-5.6-sol": "max",
+	"openai-codex/gpt-5.6-sol": "xhigh",
 	"anthropic/claude-fable-5": "xhigh",
 	"anthropic/claude-opus-5": "xhigh",
 };
