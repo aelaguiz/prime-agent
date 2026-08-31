@@ -15,7 +15,7 @@ import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
 import type { SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import { isLocalPath } from "../utils/paths.js";
-import { isValidCliServiceTier, isValidThinkingLevel } from "./args.js";
+import { isValidThinkingLevel } from "./args.js";
 import { formatSessionListTable } from "./daemon-list-format.js";
 import { runPs, runReap } from "./daemon-ps.js";
 
@@ -497,14 +497,6 @@ function parseSessionOption(
 				throw new Error(`Invalid thinking level "${level}"`);
 			}
 			config.thinking = level;
-			return withValue(arg);
-		}
-		case "--service-tier": {
-			const serviceTier = readValue();
-			if (!isValidCliServiceTier(serviceTier)) {
-				throw new Error(`Invalid service tier "${serviceTier}"`);
-			}
-			config.serviceTier = serviceTier;
 			return withValue(arg);
 		}
 		case "--extension":

@@ -68,9 +68,8 @@ export const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION = 7;
 // Revision 21 composes capability-gated AIM credential handoff with the upstream schema.
 // Revision 22 adds capability-gated, connection-owner-scoped ACP MCP server replacement.
 // Revision 23 publishes the composed AIM credential handoff and ACP MCP server schema.
-// Revision 24 adds capability-gated service tier selection to create session configs.
-export const DAEMON_SCHEMA_REVISION = 24;
-export const DAEMON_SCHEMA_ID = "protocol-7-schema-24-633d151dce99";
+export const DAEMON_SCHEMA_REVISION = 23;
+export const DAEMON_SCHEMA_ID = "protocol-7-schema-23-633d151dce99";
 
 export type DaemonProtocolName = typeof DAEMON_PROTOCOL_NAME;
 export type DaemonProtocolVersion = number;
@@ -116,8 +115,7 @@ export type DaemonServerCapability =
 	| "rlm_quiescence_barrier"
 	| "session_input_pause"
 	| "owned_prompt_cancellation"
-	| "acp_mcp_servers"
-	| "create_service_tier";
+	| "acp_mcp_servers";
 
 export type DaemonReplayStatus = "complete" | "partial" | "unavailable";
 
@@ -163,7 +161,6 @@ export const DAEMON_DEFAULT_SERVER_CAPABILITIES: readonly DaemonServerCapability
 	"rlm_quiescence_barrier",
 	"session_input_pause",
 	"acp_mcp_servers",
-	"create_service_tier",
 ];
 
 export interface DaemonRuntimeIdentity {
@@ -728,11 +725,6 @@ const DELETE_RLM_SUBAGENT_COMMAND = {
 } as const;
 const FLAT_SESSION_TREE_COMMAND = { minProtocol: 7 } as const;
 const TELEMETRY_POLICY_COMMAND = { minProtocol: 7, minSchemaRevision: 14 } as const;
-const CREATE_SERVICE_TIER_CONFIG = {
-	minProtocol: 7,
-	minSchemaRevision: 24,
-	capability: "create_service_tier",
-} as const;
 const AIM_CREDENTIAL_HANDOFF_COMMAND = {
 	minProtocol: 7,
 	minSchemaRevision: 15,
@@ -874,9 +866,6 @@ export function getDaemonCommandCompatibilities(command: DaemonCommand): readonl
 		((command.type === "attach" || command.type === "reattach") && command.telemetryDisabled !== undefined) ||
 		(command.type === "create" && command.config?.telemetryDisabled !== undefined);
 	if (carriesTelemetryPolicy) requirements.push(TELEMETRY_POLICY_COMMAND);
-	if (command.type === "create" && command.config?.serviceTier !== undefined) {
-		requirements.push(CREATE_SERVICE_TIER_CONFIG);
-	}
 	if ((command.type === "prompt" || command.type === "prompt_and_wait") && command.admissionId !== undefined) {
 		requirements.push(PROMPT_ADMISSION_CANCELLATION_COMMAND);
 	}

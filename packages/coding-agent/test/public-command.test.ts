@@ -366,7 +366,6 @@ describe("public command routing", () => {
 		expect(help).toContain("Options:");
 		expect(help).toContain("Run options:");
 		expect(help).toContain("--mode <text|json|rpc|acp|daemon>");
-		expect(help).toContain("--service-tier <default|priority>");
 		expect(help).toContain("Autonomous options:");
 		for (const option of [
 			"--autonomous",

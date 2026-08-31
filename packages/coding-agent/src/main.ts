@@ -563,9 +563,6 @@ function buildSessionOptions(
 	if (config.thinking) {
 		options.thinkingLevel = config.thinking;
 	}
-	if (config.serviceTier !== undefined) {
-		options.serviceTier = config.serviceTier;
-	}
 
 	// Scoped models for Ctrl+P cycling
 	// Keep thinking level undefined when not explicitly set in the model pattern.
@@ -651,7 +648,6 @@ function runtimeConfigFromArgs(
 		systemPrompt: parsed.systemPrompt,
 		appendSystemPrompt: parsed.appendSystemPrompt,
 		thinking: parsed.thinking,
-		serviceTier: parsed.serviceTier,
 		models: parsed.models,
 		tools: parsed.tools,
 		noTools: parsed.noTools,

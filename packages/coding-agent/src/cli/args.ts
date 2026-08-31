@@ -7,7 +7,6 @@ import { APP_NAME } from "../config.js";
 import { THINKING_LEVELS } from "../core/thinking-levels.js";
 
 export type Mode = "text" | "json" | "rpc" | "acp" | "daemon";
-export type CliServiceTier = "default" | "priority";
 
 export interface Args {
 	provider?: string;
@@ -17,7 +16,6 @@ export interface Args {
 	systemPrompt?: string;
 	appendSystemPrompt?: string[];
 	thinking?: ThinkingLevel;
-	serviceTier?: CliServiceTier;
 	continue?: boolean;
 	resume?: true | string;
 	help?: boolean;
@@ -70,10 +68,6 @@ export const INTERNAL_RUNTIME_COMMAND_MARKER = "\0prime-agent-runtime-command";
 
 export function isValidThinkingLevel(level: string): level is ThinkingLevel {
 	return THINKING_LEVELS.includes(level as ThinkingLevel);
-}
-
-export function isValidCliServiceTier(value: string): value is CliServiceTier {
-	return value === "default" || value === "priority";
 }
 
 export function parseArgs(args: string[]): Args {
@@ -186,18 +180,6 @@ export function parseArgs(args: string[]): Args {
 					type: "warning",
 					message: `Invalid thinking level "${level}". Valid values: ${THINKING_LEVELS.join(", ")}`,
 				});
-			}
-		} else if (arg === "--service-tier") {
-			if (hasRequiredOptionValue(args, i, arg, result)) {
-				const value = args[++i];
-				if (isValidCliServiceTier(value)) {
-					result.serviceTier = value;
-				} else {
-					result.diagnostics.push({
-						type: "warning",
-						message: `Invalid service tier "${value}". Valid values: default, priority`,
-					});
-				}
 			}
 		} else if (arg === "--print" || arg === "-p") {
 			result.print = true;
