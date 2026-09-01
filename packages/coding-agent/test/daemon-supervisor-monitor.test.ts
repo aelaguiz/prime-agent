@@ -1,45 +1,87 @@
-import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { type ChildProcess, type SpawnOptions, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
 import type { Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getProcessStartId } from "../src/core/session-lease.js";
+import * as orphanProcessModule from "../src/core/orphan-process-journal.js";
+import { initializeOrphanProcessJournal } from "../src/core/orphan-process-journal.js";
+import {
+	createProcessIdentityOwnerToken,
+	getProcessStartId,
+	isExactProcessStartId,
+	matchesExactProcessIdentity,
+} from "../src/core/session-lease.js";
 import type { DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import { CommandRecoveryJournal } from "../src/modes/daemon/command-recovery-journal.js";
-import { DaemonCatalogClient } from "../src/modes/daemon/daemon-catalog-process.js";
-import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import {
 	createDaemonCommandEnvelope,
 	DAEMON_UPDATE_RESTART_FORMAT_VERSION,
 	type DaemonAttachResult,
+	failure,
 	success,
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
+import { DaemonSocketPathLease, normalizeSocketPath } from "../src/modes/daemon/daemon-socket.js";
 import { DaemonSupervisor, DaemonWorkerRuntimeIdentityError } from "../src/modes/daemon/daemon-supervisor.js";
-import { DaemonWorkerClient } from "../src/modes/daemon/daemon-worker-client.js";
+import {
+	canonicalDaemonWorkerSocketPath,
+	defaultDaemonWorkerDescriptorDir,
+} from "../src/modes/daemon/daemon-worker-cleanup.js";
+import {
+	DaemonWorkerAuthenticationError,
+	DaemonWorkerClient,
+	DaemonWorkerProbeTimeoutError,
+} from "../src/modes/daemon/daemon-worker-client.js";
 import {
 	DAEMON_WORKER_STARTUP_GATE_COMMIT,
 	DAEMON_WORKER_SUPERVISOR_SOCKET_ENV,
+	type DaemonWorkerDescriptor,
 	type DaemonWorkerFrameHeader,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 import { MutationDrainLatch } from "../src/modes/daemon/mutation-drain-latch.js";
 import { WorkerRecoveryJournal } from "../src/modes/daemon/worker-recovery-journal.js";
 import type { PrivateFrame } from "../src/modes/session-worker/private-framing.js";
 import * as childProcessModule from "../src/utils/child-process.js";
+import { seedSupervisorRoster } from "./fixtures/roster-seed.js";
 import { createDeferred } from "./suite/scheduling.js";
 
 const workerLaunchTestState = vi.hoisted(() => ({
 	capture: false,
 	forceMissingProcessStartId: false,
-	fixtureMode: "worker" as "worker" | "close-gate" | "rollback-gate" | "successful-gate",
+	processStartIdMissesRemaining: 0,
+	forcedProcessStartId: undefined as string | undefined,
+	processIdentityAuthority: undefined as
+		| ((pid: number, expectedProcessStartId?: string) => "exact-live" | "exact-dead" | "retained")
+		| undefined,
+	exactIdentityMatch: undefined as ((pid: number, expectedProcessStartId: string) => boolean) | undefined,
+	assertExactSupervisorOwner: undefined as ((...args: unknown[]) => Promise<string>) | undefined,
+	assertLegacySupervisorOwner: undefined as ((...args: unknown[]) => Promise<string>) | undefined,
+	fixtureMode: "worker" as "worker" | "close-gate" | "rollback-gate" | "successful-gate" | "supervisor",
 	gateMarkerPath: "",
 	tsxCliPath: "",
 	cliEntrypoint: "",
-	spawned: [] as Array<{ child: ChildProcess; args: readonly string[] }>,
+	spawnFailureCode: undefined as string | undefined,
+	observeProcessStartId: undefined as ((pid: number) => string | undefined) | undefined,
+	spawned: [] as Array<{
+		child: ChildProcess;
+		args: readonly string[];
+		options: SpawnOptions;
+		processStartId?: string;
+	}>,
 }));
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -49,9 +91,39 @@ vi.mock("node:child_process", async (importOriginal) => {
 	return {
 		...actual,
 		spawn(command: string, args: readonly string[], options: SpawnOptions): ChildProcess {
+			const failureCode = workerLaunchTestState.spawnFailureCode;
+			if (failureCode) {
+				// Node's failed-spawn shape: no pid, stdio undefined, "error" then "close".
+				const failing = Object.assign(new EventEmitter(), {
+					pid: undefined,
+					stdio: undefined,
+					stderr: undefined,
+					unref: () => {},
+				}) as unknown as ChildProcess;
+				process.nextTick(() => {
+					failing.emit(
+						"error",
+						Object.assign(new Error(`spawn ${command} ${failureCode}`), { code: failureCode }),
+					);
+					failing.emit("close", null, null);
+				});
+				return failing;
+			}
 			const child = actual.spawn(command, args, options);
 			if (workerLaunchTestState.capture) {
-				workerLaunchTestState.spawned.push({ child, args });
+				const token =
+					typeof options.argv0 === "string" && options.argv0.startsWith("prime-agent-owner-token=")
+						? `token:${options.argv0.slice("prime-agent-owner-token=".length)}`
+						: undefined;
+				const observed = child.pid ? workerLaunchTestState.observeProcessStartId?.(child.pid) : undefined;
+				workerLaunchTestState.spawned.push({
+					child,
+					args,
+					options,
+					...((observed ?? (process.platform === "darwin" ? token : undefined))
+						? { processStartId: observed ?? token }
+						: {}),
+				});
 			}
 			return child;
 		},
@@ -65,6 +137,12 @@ vi.mock("../src/cli/subprocess-launch.js", async (importOriginal) => {
 		createCliSubprocessLaunchSpec(args: readonly string[]) {
 			if (!workerLaunchTestState.capture) {
 				return (actual.createCliSubprocessLaunchSpec as (args: readonly string[]) => unknown)(args);
+			}
+			if (workerLaunchTestState.fixtureMode === "supervisor") {
+				return {
+					command: process.execPath,
+					args: ["--eval", "setInterval(() => {}, 1000)", "--", ...args],
+				};
 			}
 			if (workerLaunchTestState.fixtureMode === "rollback-gate") {
 				const markerPath = JSON.stringify(workerLaunchTestState.gateMarkerPath);
@@ -106,14 +184,65 @@ vi.mock("../src/cli/subprocess-launch.js", async (importOriginal) => {
 vi.mock("../src/core/session-lease.js", async (importOriginal) => {
 	const actual = (await importOriginal()) as Record<string, unknown> & {
 		getProcessStartId(pid: number): string | undefined;
+		classifyProcessIdentityAuthority(
+			pid: number,
+			expectedProcessStartId?: string,
+			options?: unknown,
+		): "exact-live" | "exact-dead" | "retained";
+		matchesExactProcessIdentity(pid: number, expectedProcessStartId: string, options?: unknown): boolean;
 	};
 	return {
 		...actual,
+		classifyProcessIdentityAuthority(pid: number, expectedProcessStartId?: string, options?: unknown) {
+			return (
+				workerLaunchTestState.processIdentityAuthority?.(pid, expectedProcessStartId) ??
+				actual.classifyProcessIdentityAuthority(pid, expectedProcessStartId, options)
+			);
+		},
+		matchesExactProcessIdentity(pid: number, expectedProcessStartId: string, options?: unknown): boolean {
+			return (
+				workerLaunchTestState.exactIdentityMatch?.(pid, expectedProcessStartId) ??
+				actual.matchesExactProcessIdentity(pid, expectedProcessStartId, options)
+			);
+		},
 		getProcessStartId(pid: number): string | undefined {
-			return workerLaunchTestState.forceMissingProcessStartId ? undefined : actual.getProcessStartId(pid);
+			if (workerLaunchTestState.forcedProcessStartId !== undefined) {
+				return workerLaunchTestState.forcedProcessStartId;
+			}
+			if (pid !== process.pid && workerLaunchTestState.processStartIdMissesRemaining > 0) {
+				workerLaunchTestState.processStartIdMissesRemaining--;
+				return undefined;
+			}
+			return workerLaunchTestState.forceMissingProcessStartId && pid !== process.pid
+				? undefined
+				: actual.getProcessStartId(pid);
 		},
 	};
 });
+
+vi.mock("../src/modes/daemon/daemon-supervisor-ownership.js", async (importOriginal) => {
+	const actual = (await importOriginal()) as Record<string, unknown> & {
+		assertDaemonSupervisorOwnerCurrent(...args: unknown[]): Promise<string>;
+		assertDaemonSupervisorOwnerCurrentForWorkerAuthentication(...args: unknown[]): Promise<string>;
+	};
+	return {
+		...actual,
+		assertDaemonSupervisorOwnerCurrent(...args: unknown[]): Promise<string> {
+			return (
+				workerLaunchTestState.assertExactSupervisorOwner?.(...args) ??
+				actual.assertDaemonSupervisorOwnerCurrent(...args)
+			);
+		},
+		assertDaemonSupervisorOwnerCurrentForWorkerAuthentication(...args: unknown[]): Promise<string> {
+			return (
+				workerLaunchTestState.assertLegacySupervisorOwner?.(...args) ??
+				actual.assertDaemonSupervisorOwnerCurrentForWorkerAuthentication(...args)
+			);
+		},
+	};
+});
+
+workerLaunchTestState.observeProcessStartId = getProcessStartId;
 
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const previousSupervisorRegistryDir = process.env[supervisorRegistryDirEnv];
@@ -156,7 +285,6 @@ interface DeferredRecoveryHarness {
 	shuttingDown: boolean;
 	assertRecoveryAllowed: ReturnType<typeof vi.fn>;
 	persistWorker: ReturnType<typeof vi.fn>;
-	syncAgentPeers: ReturnType<typeof vi.fn>;
 	recoverWorker: ReturnType<typeof vi.fn>;
 	handleWorkerClose(worker: DeferredRecoveryWorker, client: object, error: Error): Promise<void>;
 	deferWorkerRecovery(worker: DeferredRecoveryWorker, error: Error): void;
@@ -173,6 +301,16 @@ async function waitForCapturedChildClose(child: ChildProcess): Promise<void> {
 	await new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 }
 
+async function waitForExactChildProcessStartId(pid: number): Promise<string> {
+	const deadline = Date.now() + 2000;
+	do {
+		const processStartId = getProcessStartId(pid);
+		if (processStartId && isExactProcessStartId(processStartId)) return processStartId;
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+	} while (Date.now() < deadline);
+	throw new Error(`Could not observe exact process identity for ${pid}`);
+}
+
 async function waitForFile(path: string): Promise<void> {
 	const deadline = Date.now() + 1000;
 	while (!existsSync(path) && Date.now() < deadline) {
@@ -186,15 +324,18 @@ async function waitForFile(path: string): Promise<void> {
 function createExistingLaunchWorker(root: string, descriptorDir: string) {
 	const workerId = "existing-worker";
 	const now = new Date().toISOString();
+	const orphanProcessJournalPath = join(descriptorDir, `${workerId}.orphans.jsonl`);
+	writeFileSync(orphanProcessJournalPath, "");
 	return {
 		descriptor: {
 			version: 1 as const,
 			workerId,
 			pid: 999_999,
 			processStartId: undefined as string | undefined,
-			socketPath: join(root, `${workerId}.sock`),
+			socketPath: canonicalDaemonWorkerSocketPath(join(root, "supervisor.sock"), workerId),
 			recoveryJournalPath: join(descriptorDir, `${workerId}.recovery.jsonl`),
-			orphanProcessJournalPath: join(descriptorDir, `${workerId}.orphans.jsonl`),
+			orphanProcessJournalPath,
+			orphanProcessJournalGeneration: undefined as string | undefined,
 			supervisorSocketPath: join(root, "supervisor.sock"),
 			authenticationToken: "existing-worker-token",
 			rootActiveSessionId: "existing-root-session",
@@ -223,6 +364,10 @@ function createSupervisorSnapshotState() {
 		clients: new Set<object>(),
 		sessionInputPauses: new Map(),
 		pendingReplacementSnapshots: new WeakMap<object, Map<string, unknown>>(),
+		pendingRosterChanged: new Set<string>(),
+		publishedRosterIds: new Set<string>(),
+		pendingRosterRemoved: new Set<string>(),
+		rosterPushScheduled: false,
 	};
 }
 
@@ -277,8 +422,14 @@ function createHarness(canConnect: () => Promise<boolean>): SupervisorMonitorHar
 
 describe("daemon worker supervisor monitoring", () => {
 	afterEach(async () => {
-		for (const { child } of workerLaunchTestState.spawned) {
-			if (child.exitCode === null && child.signalCode === null) {
+		for (const { child, processStartId } of workerLaunchTestState.spawned) {
+			if (
+				child.pid &&
+				processStartId &&
+				child.exitCode === null &&
+				child.signalCode === null &&
+				matchesExactProcessIdentity(child.pid, processStartId)
+			) {
 				const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 				child.kill("SIGKILL");
 				await closed;
@@ -286,10 +437,17 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 		workerLaunchTestState.capture = false;
 		workerLaunchTestState.forceMissingProcessStartId = false;
+		workerLaunchTestState.processStartIdMissesRemaining = 0;
+		workerLaunchTestState.forcedProcessStartId = undefined;
+		workerLaunchTestState.processIdentityAuthority = undefined;
+		workerLaunchTestState.exactIdentityMatch = undefined;
+		workerLaunchTestState.assertExactSupervisorOwner = undefined;
+		workerLaunchTestState.assertLegacySupervisorOwner = undefined;
 		workerLaunchTestState.fixtureMode = "worker";
 		workerLaunchTestState.gateMarkerPath = "";
 		workerLaunchTestState.tsxCliPath = "";
 		workerLaunchTestState.cliEntrypoint = "";
+		workerLaunchTestState.spawnFailureCode = undefined;
 		workerLaunchTestState.spawned.length = 0;
 		vi.useRealTimers();
 		for (const registryDir of supervisorRegistryDirs) {
@@ -301,6 +459,40 @@ describe("daemon worker supervisor monitoring", () => {
 		} else {
 			process.env[supervisorRegistryDirEnv] = previousSupervisorRegistryDir;
 		}
+	});
+
+	it("launches worker-led replacement supervisors with an exact argv0 owner token", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-worker-supervisor-owner-token-"));
+		const registryDir = join(root, "registry");
+		mkdirSync(registryDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		process.env[supervisorRegistryDirEnv] = registryDir;
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "supervisor";
+		const canConnectToSupervisor = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
+			supervisorLaunchInProgress: false,
+			shuttingDown: false,
+			options: { worker: {}, defaultSessionConfig: { cwd: root, agentDir: root } },
+			canConnectToSupervisor,
+			log: vi.fn(),
+		}) as {
+			launchReplacementSupervisor(socketPath: string): Promise<void>;
+		};
+
+		await daemon.launchReplacementSupervisor(join(root, "supervisor.sock"));
+
+		expect(workerLaunchTestState.spawned).toHaveLength(1);
+		const { child, options } = workerLaunchTestState.spawned[0]!;
+		const argv0 = options.argv0;
+		expect(argv0).toMatch(/^prime-agent-owner-token=[0-9a-f]{64}$/);
+		if (!child.pid || typeof argv0 !== "string") throw new Error("Replacement supervisor spawn was incomplete");
+		const processStartId = `token:${argv0.slice("prime-agent-owner-token=".length)}`;
+		const deadline = Date.now() + 2_000;
+		while (!matchesExactProcessIdentity(child.pid, processStartId) && Date.now() < deadline) {
+			await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+		}
+		expect(matchesExactProcessIdentity(child.pid, processStartId)).toBe(true);
 	});
 
 	it("schedules recovery when the sole supervisor fails a fence check", async () => {
@@ -332,6 +524,7 @@ describe("daemon worker supervisor monitoring", () => {
 			internals.handleConnection(socket);
 			const client = [...internals.clients][0]!;
 			client.authenticated = true;
+			client.authenticationRole = "supervisor";
 			internals.supervisorClaims.set(client, {
 				claim: {},
 				ownerFingerprint: "old",
@@ -346,7 +539,10 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(internals.supervisorClaims.has(client)).toBe(false);
 			expect(client.authenticated).toBe(true);
 			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledOnce();
-			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledWith("/tmp/supervisor.sock", 100);
+			expect(internals.scheduleSupervisorAvailabilityCheck).toHaveBeenCalledWith(
+				normalizeSocketPath("/tmp/supervisor.sock"),
+				100,
+			);
 		} finally {
 			if (previousSocketPath === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSocketPath;
@@ -419,6 +615,7 @@ describe("daemon worker supervisor monitoring", () => {
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
 			supervisorClaims: new Map([[client, oldClaim]]),
+			peerClaims: new Map(),
 			updateRestart: transaction,
 			handleWorkerCommand: vi.fn(async () => undefined),
 			assertSupervisorClaimCurrent: vi.fn(async () => {
@@ -460,6 +657,17 @@ describe("daemon worker supervisor monitoring", () => {
 		const daemon = Object.assign(Object.create(AgentDaemon.prototype), {
 			options: { worker: { authenticationToken: "token" } },
 			supervisorClaims: new Map(),
+			peerClaims: new Map(),
+			clients: new Set(),
+			sessions: new Map(),
+			cronStore: { list: () => [] },
+			rosterReporter: {
+				lastComposed: new Map(),
+				lastComposedJson: new Map(),
+				queuedChildren: new Map(),
+				removedAgentIds: new Map(),
+				snapshotPending: false,
+			},
 			shuttingDown: false,
 			clearSupervisorAvailabilityCheck: vi.fn(),
 			scheduleSupervisorFenceCheck: vi.fn(),
@@ -491,6 +699,7 @@ describe("daemon worker supervisor monitoring", () => {
 				token: "token",
 				supervisorGeneration: generation,
 				supervisorPid: 123,
+				supervisorAuthorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:123",
 				supervisorSocketPath: "/tmp/supervisor.sock",
 			});
 		const oldClient = makeClient();
@@ -511,21 +720,140 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(handleWorkerCommand).not.toHaveBeenCalled();
 	});
 
+	it("routes mixed-version worker authentication through the correct authority namespace", async () => {
+		const makeClient = () =>
+			({
+				id: "supervisor",
+				authenticated: false,
+				socket: { destroyed: false, write: vi.fn(() => true), end: vi.fn() },
+				attachedActiveSessionIds: new Set(),
+				detachInput: vi.fn(),
+				supportsExtensionUi: false,
+				capabilities: new Set(),
+			}) as unknown as DaemonSocketClient;
+		const makeDaemon = () =>
+			Object.assign(Object.create(AgentDaemon.prototype), {
+				options: { worker: { authenticationToken: "token" } },
+				supervisorClaims: new Map(),
+				shuttingDown: false,
+				clearSupervisorAvailabilityCheck: vi.fn(),
+				scheduleSupervisorFenceCheck: vi.fn(),
+			}) as unknown as { handleLine(client: DaemonSocketClient, line: string): Promise<void> };
+		const auth = (identity: Record<string, string>) =>
+			JSON.stringify({
+				type: "worker_auth",
+				token: "token",
+				supervisorGeneration: "generation",
+				supervisorPid: 123,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+				...identity,
+			});
+		const lastResponse = (client: DaemonSocketClient) => {
+			const write = client.socket.write as unknown as ReturnType<typeof vi.fn>;
+			const payload = write.mock.calls.at(-1)?.[0];
+			return JSON.parse(String(payload).trim()) as { success: boolean; error?: string };
+		};
+
+		const exact = vi.fn(async () => "exact-fingerprint");
+		const legacy = vi.fn(async () => "legacy-fingerprint");
+		workerLaunchTestState.assertExactSupervisorOwner = exact;
+		workerLaunchTestState.assertLegacySupervisorOwner = legacy;
+
+		const oldLinuxClient = makeClient();
+		await makeDaemon().handleLine(oldLinuxClient, auth({ supervisorProcessStartId: "proc:123" }));
+		expect(oldLinuxClient.authenticated).toBe(true);
+		expect(legacy).toHaveBeenCalledOnce();
+		expect(exact).not.toHaveBeenCalled();
+		expect(lastResponse(oldLinuxClient)).toMatchObject({ success: true });
+
+		const windowsClient = makeClient();
+		await makeDaemon().handleLine(
+			windowsClient,
+			auth({ supervisorProcessStartId: "win:123", supervisorAuthorityProcessStartId: "win:123" }),
+		);
+		expect(windowsClient.authenticated).toBe(true);
+		expect(exact).toHaveBeenCalledOnce();
+		expect(lastResponse(windowsClient)).toMatchObject({ success: true });
+
+		workerLaunchTestState.assertLegacySupervisorOwner = vi.fn(async () => {
+			throw new Error("Darwin legacy identity is not boot-qualified");
+		});
+		const oldDarwinClient = makeClient();
+		await makeDaemon().handleLine(oldDarwinClient, auth({ supervisorProcessStartId: "ps:Mon Jan 01 00:00:00 2026" }));
+		expect(oldDarwinClient.authenticated).toBe(false);
+		expect(lastResponse(oldDarwinClient)).toMatchObject({
+			success: false,
+			error: "worker_auth_version_incompatible",
+		});
+
+		workerLaunchTestState.assertExactSupervisorOwner = vi.fn(async () => {
+			throw new Error("stale owner generation");
+		});
+		const staleClient = makeClient();
+		await makeDaemon().handleLine(
+			staleClient,
+			auth({ supervisorAuthorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:123" }),
+		);
+		expect(workerLaunchTestState.assertExactSupervisorOwner).toHaveBeenCalledOnce();
+		expect(lastResponse(staleClient)).toMatchObject({ success: false, error: "supervisor_generation_stale" });
+	});
+
+	it("projects new supervisor authority only into byte-compatible old-worker authentication", () => {
+		const claimFor = (authorityProcessStartId: string) => {
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				generation: "generation",
+				socketPath: "/tmp/supervisor.sock",
+				ownership: {
+					record: {
+						version: 1,
+						role: "supervisor",
+						pid: 123,
+						authorityProcessStartId,
+					},
+				},
+			}) as unknown as {
+				supervisorAuthenticationClaim(): {
+					supervisorProcessStartId?: string;
+					supervisorAuthorityProcessStartId: string;
+				};
+			};
+			return supervisor.supervisorAuthenticationClaim();
+		};
+		const linux = "proc:11111111-1111-1111-1111-111111111111:123";
+		expect(claimFor(linux)).toMatchObject({
+			supervisorProcessStartId: "proc:123",
+			supervisorAuthorityProcessStartId: linux,
+		});
+		expect(claimFor("win:123")).toMatchObject({
+			supervisorProcessStartId: "win:123",
+			supervisorAuthorityProcessStartId: "win:123",
+		});
+		const tokenClaim = claimFor(`token:${"a".repeat(64)}`);
+		expect(tokenClaim.supervisorAuthorityProcessStartId).toBe(`token:${"a".repeat(64)}`);
+		expect(tokenClaim.supervisorProcessStartId).toBeUndefined();
+	});
+
 	it.each([
 		{
 			name: "first post-spawn ownership check",
 			assertionCall: 3,
+			expectedAssertions: 6,
 			error: recoveryDeniedError("supervisor_generation_stale"),
 		},
 		{
 			name: "pre-publication ownership check",
 			assertionCall: 4,
+			expectedAssertions: 7,
 			error: recoveryDeniedError("supervisor_generation_stale"),
 		},
-		{ name: "descriptor persistence", persistFailure: true, error: new Error("descriptor persistence failed") },
-	] as const)("keeps unidentifiable workers gated after $name fails", async (scenario) => {
+		{
+			name: "descriptor persistence",
+			persistFailure: true,
+			expectedAssertions: 7,
+			error: new Error("descriptor persistence failed"),
+		},
+	] as const)("keeps workers gated after $name fails", async (scenario) => {
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
 		workerLaunchTestState.fixtureMode = "rollback-gate";
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-launch-gate-test-"));
 		const gateMarkerPath = join(root, "committed-gate");
@@ -566,9 +894,10 @@ describe("daemon worker supervisor monitoring", () => {
 			scenario.error,
 		);
 
-		expect(assertionCount).toBe("assertionCall" in scenario ? scenario.assertionCall : 4);
+		expect(assertionCount).toBe(scenario.expectedAssertions);
 		expect(workerLaunchTestState.spawned).toHaveLength(1);
-		const { child, args } = workerLaunchTestState.spawned[0]!;
+		const { child, args, options } = workerLaunchTestState.spawned[0]!;
+		expect(options.argv0).toMatch(/^prime-agent-owner-token=[0-9a-f]{64}$/);
 		const socketFlagIndex = args.indexOf("--daemon-socket");
 		expect(socketFlagIndex).toBeGreaterThanOrEqual(0);
 		const workerSocketPath = args[socketFlagIndex + 1];
@@ -582,13 +911,47 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.size).toBe(0);
 	});
 
+	it("never publishes or releases a worker whose exact platform identity cannot be observed", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-missing-worker-identity-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.forceMissingProcessStartId = true;
+		workerLaunchTestState.fixtureMode = "rollback-gate";
+		workerLaunchTestState.gateMarkerPath = join(root, "committed-gate");
+		const workers = new Map<string, unknown>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
+		};
+
+		await expect(supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } })).rejects.toThrow(
+			"exact process identity could not be observed",
+		);
+		expect(existsSync(workerLaunchTestState.gateMarkerPath)).toBe(false);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toEqual([]);
+		expect(workers.size).toBe(0);
+		expect(workerLaunchTestState.spawned).toHaveLength(1);
+		const failedChild = workerLaunchTestState.spawned[0]?.child;
+		if (!failedChild) throw new Error("Identity-timeout child was not captured");
+		await waitForCapturedChildClose(failedChild);
+		expect(failedChild.exitCode !== null || failedChild.signalCode !== null).toBe(true);
+		expect(workerLaunchTestState.spawned).toHaveLength(1);
+	});
 	it("rolls back promptly when the child closes its startup gate before commit", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-closed-gate-test-"));
 		const descriptorDir = join(root, "descriptors");
 		mkdirSync(descriptorDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
 		workerLaunchTestState.fixtureMode = "close-gate";
 		let assertionCount = 0;
 		const workers = new Map<string, unknown>();
@@ -611,7 +974,6 @@ describe("daemon worker supervisor monitoring", () => {
 				}
 			}),
 			connectWorker,
-			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 		}) as {
 			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
@@ -638,6 +1000,182 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(child?.exitCode !== null || child?.signalCode !== null).toBe(true);
 	});
 
+	it("fails the create with the spawn error when the worker process cannot be spawned", async () => {
+		workerLaunchTestState.spawnFailureCode = "EMFILE";
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-spawn-failure-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		const workers = new Map<string, unknown>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
+		};
+
+		await expect(supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } })).rejects.toThrow(
+			/EMFILE.*resident session workers.*ulimit -n/s,
+		);
+		expect(workers.size).toBe(0);
+		expect(readdirSync(descriptorDir).filter((name) => name.includes(".orphans.jsonl"))).toEqual([]);
+
+		workerLaunchTestState.spawnFailureCode = "ENOENT";
+		const enoentFailure = await supervisor
+			.launchWorker({ type: "create", config: { cwd: root, agentDir: root } })
+			.then(() => undefined)
+			.catch((error: Error) => error);
+		expect(enoentFailure?.message).toContain("ENOENT");
+		expect(enoentFailure?.message).not.toContain("ulimit");
+		expect(readdirSync(descriptorDir).filter((name) => name.includes(".orphans.jsonl"))).toEqual([]);
+	});
+
+	it("cleans a worker descriptor published just before persistence reports failure", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-post-publish-failure-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "rollback-gate";
+		workerLaunchTestState.gateMarkerPath = join(root, "committed-gate");
+		const persistenceError = new Error("directory fsync failed after descriptor publication");
+		const persistWorker = Reflect.get(DaemonSupervisor.prototype, "persistWorker");
+		if (typeof persistWorker !== "function") throw new Error("Could not access worker persistence");
+		const workers = new Map<string, unknown>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			persistWorker: vi.fn(function (this: object, worker: object, mutationGuard?: object) {
+				Reflect.apply(persistWorker, this, [worker, mutationGuard]);
+				throw persistenceError;
+			}),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
+		};
+
+		await expect(supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } })).rejects.toBe(
+			persistenceError,
+		);
+		expect(workers.size).toBe(0);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toEqual([]);
+		expect(readdirSync(descriptorDir).filter((name) => name.includes(".orphans.jsonl"))).toEqual([]);
+	});
+
+	it("keeps a published failed-launch descriptor resident when cleanup proof is unavailable", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-post-publish-retain-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "rollback-gate";
+		workerLaunchTestState.gateMarkerPath = join(root, "committed-gate");
+		const persistenceError = new Error("post-publication failure with malformed journal");
+		const persistWorker = Reflect.get(DaemonSupervisor.prototype, "persistWorker");
+		if (typeof persistWorker !== "function") throw new Error("Could not access worker persistence");
+		const workers = new Map<
+			string,
+			{
+				descriptor: DaemonWorkerDescriptor;
+				authorityBlockedReason?: string;
+			}
+		>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			persistWorker: vi.fn(function (
+				this: object,
+				worker: { descriptor: DaemonWorkerDescriptor },
+				mutationGuard?: object,
+			) {
+				Reflect.apply(persistWorker, this, [worker, mutationGuard]);
+				if (!worker.descriptor.orphanProcessJournalPath) throw new Error("Missing orphan journal fixture path");
+				writeFileSync(worker.descriptor.orphanProcessJournalPath, "{malformed}\n");
+				throw persistenceError;
+			}),
+			log: vi.fn(),
+		}) as {
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
+		};
+
+		await expect(supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } })).rejects.toBe(
+			persistenceError,
+		);
+		expect(workers.size).toBe(1);
+		const retained = [...workers.values()][0];
+		if (!retained) throw new Error("Retained failed launch was not registered");
+		const descriptorPath = readdirSync(descriptorDir)
+			.filter((name) => name.endsWith(".json"))
+			.map((name) => join(descriptorDir, name))[0];
+		if (!descriptorPath) throw new Error("Retained descriptor was not durable");
+		const durable = JSON.parse(readFileSync(descriptorPath, "utf8")) as DaemonWorkerDescriptor;
+		expect(retained.descriptor).toEqual(durable);
+		expect(retained.descriptor.stopRequestedAt).toBeTruthy();
+		expect(retained.descriptor.lifecycle).toBe("stopping");
+		expect(retained.authorityBlockedReason).toBeUndefined();
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".orphans.jsonl"))).toHaveLength(1);
+	});
+
+	it("durably binds a legacy orphan generation before cancellation and retries safely", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-legacy-generation-test-"));
+		const descriptorDir = join(root, "descriptors");
+		mkdirSync(descriptorDir, { recursive: true });
+		supervisorRegistryDirs.add(root);
+		const existing = createExistingLaunchWorker(root, descriptorDir);
+		const workers = new Map<string, object>([[existing.descriptor.workerId, existing]]);
+		const cancellation = new Error("cancel after legacy upgrade");
+		let assertions = 0;
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			...createSupervisorSnapshotState(),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			descriptorDir,
+			socketPath: join(root, "supervisor.sock"),
+			workers,
+			shuttingDown: false,
+			assertRecoveryAllowed: vi.fn(async () => {
+				assertions++;
+				if (assertions === 2) throw cancellation;
+			}),
+			log: vi.fn(),
+		}) as {
+			launchWorker(
+				command: { type: "create"; config: { cwd: string; agentDir: string } },
+				existing: ReturnType<typeof createExistingLaunchWorker>,
+			): Promise<unknown>;
+		};
+
+		await expect(
+			supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }, existing),
+		).rejects.toBe(cancellation);
+		const durable = JSON.parse(readFileSync(existing.descriptorPath, "utf8")) as {
+			orphanProcessJournalGeneration?: string;
+		};
+		expect(durable.orphanProcessJournalGeneration).toBeTruthy();
+		expect(existing.descriptor.orphanProcessJournalGeneration).toBe(durable.orphanProcessJournalGeneration);
+		expect(readFileSync(existing.descriptor.orphanProcessJournalPath, "utf8")).toContain(
+			durable.orphanProcessJournalGeneration,
+		);
+
+		workerLaunchTestState.spawnFailureCode = "ENOENT";
+		await expect(
+			supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }, existing),
+		).rejects.toThrow("ENOENT");
+		expect(existing.descriptor.orphanProcessJournalGeneration).toBe(durable.orphanProcessJournalGeneration);
+	});
+
 	it("commits the startup marker after durable worker publication", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-committed-gate-test-"));
 		const descriptorDir = join(root, "descriptors");
@@ -645,7 +1183,7 @@ describe("daemon worker supervisor monitoring", () => {
 		mkdirSync(descriptorDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
+		workerLaunchTestState.processStartIdMissesRemaining = 2;
 		workerLaunchTestState.fixtureMode = "successful-gate";
 		workerLaunchTestState.gateMarkerPath = markerPath;
 		const workers = new Map<string, unknown>();
@@ -674,13 +1212,11 @@ describe("daemon worker supervisor monitoring", () => {
 			connectWorker,
 			subscribeWorker: vi.fn(async () => undefined),
 			refreshWorkerSummaries: vi.fn(async () => undefined),
-			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 		}) as {
-			launchWorker(command: {
-				type: "create";
-				config: { cwd: string; agentDir: string };
-			}): Promise<{ descriptor: { lifecycle: string } }>;
+			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<{
+				descriptor: { lifecycle: string; processStartId?: string; authorityProcessStartId?: string };
+			}>;
 		};
 
 		const worker = await supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } });
@@ -690,11 +1226,29 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.descriptor.lifecycle).toBe("ready");
 		expect(workers.size).toBe(1);
 		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
-		const child = workerLaunchTestState.spawned.at(-1)?.child;
-		if (!child) {
+		const spawned = workerLaunchTestState.spawned.at(-1);
+		const child = spawned?.child;
+		if (!child?.pid || !spawned) {
 			throw new Error("Worker child was not captured");
 		}
+		const observedProcessStartId = getProcessStartId(child.pid);
+		expect(worker.descriptor.authorityProcessStartId).toBe(observedProcessStartId);
+		expect(worker.descriptor.authorityProcessStartId).toMatch(
+			process.platform === "darwin" ? /^token:[0-9a-f]{64}$/ : /^(?:proc|win):/,
+		);
+		expect(worker.descriptor.processStartId).toBe(process.platform === "win32" ? observedProcessStartId : undefined);
+		if (process.platform === "darwin" && typeof spawned.options.argv0 === "string") {
+			expect(worker.descriptor.authorityProcessStartId).toBe(
+				`token:${spawned.options.argv0.slice("prime-agent-owner-token=".length)}`,
+			);
+		}
 		const closed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
+		if (
+			!worker.descriptor.authorityProcessStartId ||
+			!matchesExactProcessIdentity(child.pid, worker.descriptor.authorityProcessStartId)
+		) {
+			throw new Error("Worker identity changed before test teardown");
+		}
 		child.kill("SIGKILL");
 		await closed;
 	});
@@ -706,7 +1260,6 @@ describe("daemon worker supervisor monitoring", () => {
 		mkdirSync(descriptorDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
 		workerLaunchTestState.fixtureMode = "successful-gate";
 		workerLaunchTestState.gateMarkerPath = markerPath;
 		const cancellation = recoveryDeniedError("supervisor_recovery_cancelled");
@@ -730,14 +1283,13 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
-			persistWorker: vi.fn(function (this: object, worker: object) {
+			persistWorker: vi.fn(function (this: object, worker: object, mutationGuard?: object) {
 				persistenceCalls++;
-				if (persistenceCalls === 2) {
+				if (persistenceCalls >= 2) {
 					throw rollbackPersistenceError;
 				}
-				Reflect.apply(persistWorker, this, [worker]);
+				Reflect.apply(persistWorker, this, [worker, mutationGuard]);
 			}),
-			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 		}) as {
 			launchWorker(command: { type: "create"; config: { cwd: string; agentDir: string } }): Promise<unknown>;
@@ -749,9 +1301,10 @@ describe("daemon worker supervisor monitoring", () => {
 
 		expect(readFileSync(markerPath, "utf8")).toBe("start\n");
 		expect(connectWorker).toHaveBeenCalledOnce();
-		expect(persistenceCalls).toBe(2);
-		expect(workers.size).toBe(0);
-		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toEqual([]);
+		expect(persistenceCalls).toBeGreaterThanOrEqual(2);
+		expect(workers.size).toBe(1);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
+		expect(readdirSync(descriptorDir).filter((name) => name.endsWith(".orphans.jsonl"))).toHaveLength(1);
 		const child = workerLaunchTestState.spawned.at(-1)?.child;
 		expect(child?.exitCode !== null || child?.signalCode !== null).toBe(true);
 	});
@@ -763,7 +1316,6 @@ describe("daemon worker supervisor monitoring", () => {
 		mkdirSync(descriptorDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
 		workerLaunchTestState.fixtureMode = "successful-gate";
 		workerLaunchTestState.gateMarkerPath = markerPath;
 		const cancellation = recoveryDeniedError("supervisor_recovery_cancelled");
@@ -790,15 +1342,14 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 			connectWorker,
-			persistWorker: vi.fn(function (this: object, worker: object) {
+			persistWorker: vi.fn(function (this: object, worker: object, mutationGuard?: object) {
 				persistenceCalls++;
-				if (persistenceCalls === 3) {
+				if (persistenceCalls === 4) {
 					throw restorationError;
 				}
-				Reflect.apply(persistWorker, this, [worker]);
+				Reflect.apply(persistWorker, this, [worker, mutationGuard]);
 			}),
 			deferWorkerRecovery,
-			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 		}) as {
 			launchWorker(
@@ -811,8 +1362,9 @@ describe("daemon worker supervisor monitoring", () => {
 			supervisor.launchWorker({ type: "create", config: { cwd: root, agentDir: root } }, existing),
 		).rejects.toBe(cancellation);
 
-		expect(persistenceCalls).toBe(3);
-		expect(existing.descriptor).toBe(previousDescriptor);
+		expect(persistenceCalls).toBe(4);
+		expect(existing.descriptor).not.toBe(previousDescriptor);
+		expect(existing.descriptor.orphanProcessJournalGeneration).toBeTruthy();
 		expect(workers.get(existing.descriptor.workerId)).toBe(existing);
 		expect(deferWorkerRecovery).toHaveBeenCalledOnce();
 		expect(deferWorkerRecovery).toHaveBeenCalledWith(existing, cancellation);
@@ -827,7 +1379,6 @@ describe("daemon worker supervisor monitoring", () => {
 		mkdirSync(descriptorDir, { recursive: true });
 		supervisorRegistryDirs.add(root);
 		workerLaunchTestState.capture = true;
-		workerLaunchTestState.forceMissingProcessStartId = true;
 		workerLaunchTestState.fixtureMode = "successful-gate";
 		workerLaunchTestState.gateMarkerPath = markerPath;
 		const cancellation = recoveryDeniedError("supervisor_recovery_cancelled");
@@ -884,7 +1435,6 @@ describe("daemon worker supervisor monitoring", () => {
 			connectWorker,
 			stopWorker: controlledStopWorker,
 			deferWorkerRecovery,
-			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 		}) as {
 			shuttingDown: boolean;
@@ -892,7 +1442,14 @@ describe("daemon worker supervisor monitoring", () => {
 				command: { type: "create"; config: { cwd: string; agentDir: string } },
 				existing: object,
 			): Promise<unknown>;
-			stopWorker(worker: object, removeDescriptor: boolean, force: boolean): Promise<void>;
+			stopWorker(
+				worker: object,
+				removeDescriptor: boolean,
+				force: boolean,
+				archiveSession?: boolean,
+				recoveryCleanup?: boolean,
+				directChild?: { child: ChildProcess; closed: Promise<void> },
+			): Promise<void>;
 		};
 
 		const launchResult = supervisor
@@ -903,20 +1460,64 @@ describe("daemon worker supervisor monitoring", () => {
 			);
 		await rollbackStarted;
 		supervisor.shuttingDown = true;
-		workerLaunchTestState.forceMissingProcessStartId = false;
-		existing.descriptor.processStartId = getProcessStartId(existing.descriptor.pid);
-		if (existing.descriptor.processStartId === undefined) {
-			throw new Error("Could not identify launched worker before shutdown");
-		}
-		await supervisor.stopWorker(existing, true, true);
+		const launchedChild = workerLaunchTestState.spawned.at(-1)?.child;
+		if (!launchedChild) throw new Error("Could not find launched worker before shutdown");
+		const launchedChildClosed = new Promise<void>((resolveClose) =>
+			launchedChild.once("close", () => resolveClose()),
+		);
 		releaseRollback();
-
 		expect(await launchResult).toBe(cancellation);
+		await supervisor.stopWorker(existing, true, true, false, false, {
+			child: launchedChild,
+			closed: launchedChildClosed,
+		});
+
 		expect(existing.stopRevision).toBe(1);
 		expect(existing.descriptor.stopRequestedAt).toBeDefined();
 		expect(workers.size).toBe(0);
 		expect(existsSync(existing.descriptorPath)).toBe(false);
 		expect(deferWorkerRecovery).not.toHaveBeenCalled();
+	});
+
+	it("relaunches supervisors with an exact argv0 owner token", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-restart-owner-token-"));
+		supervisorRegistryDirs.add(root);
+		workerLaunchTestState.capture = true;
+		workerLaunchTestState.fixtureMode = "supervisor";
+		const exit = vi.spyOn(process, "exit").mockImplementation(((code?: string | number | null) => {
+			throw new Error(`exit ${code}`);
+		}) as typeof process.exit);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: false,
+			signalCleanupHandlers: [],
+			workers: new Map(),
+			clients: new Set(),
+			catalog: { stop: vi.fn(async () => undefined) },
+			socketPath: join(root, "supervisor.sock"),
+			defaultSessionConfig: { cwd: root, agentDir: root },
+			snapshotCacheRoot: join(root, "cache"),
+			ownsSocketPath: false,
+			log: vi.fn(),
+		}) as {
+			shutdown(exitCode: number, stopWorkers: boolean, relaunch?: boolean, forceWorkers?: boolean): Promise<never>;
+		};
+
+		try {
+			await expect(supervisor.shutdown(0, false, true)).rejects.toThrow("exit 0");
+			expect(workerLaunchTestState.spawned).toHaveLength(1);
+			const { child, options } = workerLaunchTestState.spawned[0]!;
+			const argv0 = options.argv0;
+			expect(argv0).toMatch(/^prime-agent-owner-token=[0-9a-f]{64}$/);
+			if (!child.pid || typeof argv0 !== "string") throw new Error("Replacement supervisor spawn was incomplete");
+			const processStartId = `token:${argv0.slice("prime-agent-owner-token=".length)}`;
+			const deadline = Date.now() + 2_000;
+			while (!matchesExactProcessIdentity(child.pid, processStartId) && Date.now() < deadline) {
+				await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+			}
+			expect(matchesExactProcessIdentity(child.pid, processStartId)).toBe(true);
+		} finally {
+			exit.mockRestore();
+		}
 	});
 
 	it("attempts every shutdown cleanup step before exiting", async () => {
@@ -994,6 +1595,8 @@ describe("daemon worker supervisor monitoring", () => {
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
+		workerLaunchTestState.processIdentityAuthority = () => "retained";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		const catalogStop = vi.fn(async () => undefined);
 		const log = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -1030,6 +1633,107 @@ describe("daemon worker supervisor monitoring", () => {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 		}
+	});
+
+	it("fences the startup socket and leaves resource cleanup to the startup failure path after lease compromise", () => {
+		const cleanupSupervisorResources = vi.fn(async () => {});
+		const fenceSupervisorSocket = vi.fn();
+		let leaseFailure: Error | undefined;
+		const lease = new DaemonSocketPathLease("/tmp/daemon.sock", {
+			assertCurrent() {
+				if (leaseFailure) throw leaseFailure;
+			},
+			release() {},
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: false,
+			startupComplete: false,
+			socketLease: lease,
+			cleanupSupervisorResources,
+			fenceSupervisorSocket,
+			log: vi.fn(),
+		}) as {
+			shuttingDown: boolean;
+			assertSocketLeaseHeld(): void;
+			handleSocketLeaseCompromised(error: Error): void;
+		};
+		lease.onCompromised((error) => supervisor.handleSocketLeaseCompromised(error));
+
+		leaseFailure = new Error("lock refresh failed");
+		expect(() => lease.assertSocketLease()).toThrow(leaseFailure);
+
+		expect(supervisor.shuttingDown).toBe(true);
+		expect(fenceSupervisorSocket).toHaveBeenCalledOnce();
+		expect(cleanupSupervisorResources).not.toHaveBeenCalled();
+		expect(() => supervisor.assertSocketLeaseHeld()).toThrow(/lease was compromised/);
+	});
+
+	it("relinquishes supervisor resources after socket lease compromise even when logging fails", async () => {
+		const cleanupSupervisorResources = vi.fn(async () => {});
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: false,
+			startupComplete: true,
+			cleanupSupervisorResources,
+			fenceSupervisorSocket: vi.fn(),
+			log: vi.fn(() => {
+				throw new Error("log failed");
+			}),
+			reportCleanupFailure: vi.fn(),
+		}) as {
+			shuttingDown: boolean;
+			handleSocketLeaseCompromised(error: Error): void;
+		};
+		let leaseFailure: Error | undefined;
+		const lease = new DaemonSocketPathLease("/tmp/daemon.sock", {
+			assertCurrent() {
+				if (leaseFailure) throw leaseFailure;
+			},
+			release() {},
+		});
+		lease.onCompromised((error) => supervisor.handleSocketLeaseCompromised(error));
+
+		try {
+			leaseFailure = new Error("lock refresh failed");
+			expect(() => lease.assertSocketLease()).toThrow(leaseFailure);
+			await Promise.resolve();
+
+			expect(supervisor.shuttingDown).toBe(true);
+			expect(cleanupSupervisorResources).toHaveBeenCalledOnce();
+		} finally {
+			consoleError.mockRestore();
+		}
+	});
+
+	it("rejects commands immediately after the supervisor is fenced", async () => {
+		const writes: string[] = [];
+		const client = {
+			id: "client-fenced",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const handleCommand = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			shuttingDown: true,
+			generation: "fenced-generation",
+			socketPath: "/tmp/fenced.sock",
+			handleCommand,
+		}) as {
+			handleLine(target: DaemonSocketClient, line: string): Promise<void>;
+		};
+
+		await supervisor.handleLine(
+			client,
+			JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "command-fenced", "client-fenced")),
+		);
+
+		expect(writes.join(" ")).toContain("is shutting down");
+		expect(handleCommand).not.toHaveBeenCalled();
 	});
 
 	it("does not poll a healthy supervisor after the startup check", async () => {
@@ -1125,7 +1829,6 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			assertRecoveryAllowed,
 			persistWorker,
-			syncAgentPeers: vi.fn(async () => undefined),
 			recoverWorker,
 		}) as DeferredRecoveryHarness;
 
@@ -1184,7 +1887,6 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			assertRecoveryAllowed,
 			persistWorker,
-			syncAgentPeers: vi.fn(async () => undefined),
 			recoverWorker,
 		}) as DeferredRecoveryHarness;
 
@@ -1255,7 +1957,6 @@ describe("daemon worker supervisor monitoring", () => {
 			shuttingDown: false,
 			assertRecoveryAllowed,
 			persistWorker,
-			syncAgentPeers: vi.fn(async () => undefined),
 			recoverWorker,
 		}) as DeferredRecoveryHarness;
 
@@ -1300,7 +2001,6 @@ describe("daemon worker supervisor monitoring", () => {
 				resolveAssertion = resolve;
 			});
 			const persistWorker = vi.fn();
-			const syncAgentPeers = vi.fn(async () => undefined);
 			const recoverWorker = vi.fn(async () => undefined);
 			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 				...createSupervisorSnapshotState(),
@@ -1308,7 +2008,6 @@ describe("daemon worker supervisor monitoring", () => {
 				shuttingDown: false,
 				assertRecoveryAllowed: vi.fn(() => assertion),
 				persistWorker,
-				syncAgentPeers,
 				recoverWorker,
 			}) as DeferredRecoveryHarness;
 
@@ -1320,7 +2019,6 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(worker.descriptor.lifecycle).toBe("ready");
 			expect(worker.descriptor.lastError).toBeUndefined();
 			expect(persistWorker).not.toHaveBeenCalled();
-			expect(syncAgentPeers).not.toHaveBeenCalled();
 			expect(recoverWorker).not.toHaveBeenCalled();
 		},
 	);
@@ -1486,7 +2184,12 @@ describe("daemon worker supervisor monitoring", () => {
 		const waitForHello = vi.spyOn(DaemonWorkerClient.prototype, "waitForHello").mockResolvedValue({
 			type: "daemon_hello",
 		} as Awaited<ReturnType<DaemonWorkerClient["waitForHello"]>>);
-		const authenticate = vi.spyOn(DaemonWorkerClient.prototype, "authenticateWorker").mockResolvedValue();
+		const authenticate = vi.spyOn(DaemonWorkerClient.prototype, "authenticateWorker").mockResolvedValue({
+			id: undefined,
+			type: "response",
+			command: "worker_auth",
+			success: true,
+		});
 		const close = vi.spyOn(DaemonWorkerClient.prototype, "close").mockImplementation(() => undefined);
 		const recoverWorker = vi.fn(async () => undefined);
 		const subscribeWorker = vi.fn(async () => undefined);
@@ -1570,7 +2273,6 @@ describe("daemon worker supervisor monitoring", () => {
 			recoverUncertainWorkerOperations,
 			launchWorker,
 			persistWorker,
-			syncAgentPeers: vi.fn(async () => undefined),
 			log: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => undefined),
 		}) as {
@@ -1595,7 +2297,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-root-kill",
 				pid: 123_456,
-				processStartId: "proc:entry",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:456",
 				rootActiveSessionId: "root-active",
 				lifecycle: "ready" as const,
 			},
@@ -1629,7 +2331,6 @@ describe("daemon worker supervisor monitoring", () => {
 			streamReconstructor: { observe: vi.fn() },
 			invalidateWorkerSnapshot: vi.fn(),
 			refreshWorkerSummaries: vi.fn(async () => undefined),
-			syncAgentPeers: vi.fn(async () => undefined),
 			persistWorkerStopTombstone: vi.fn(),
 			deleteWorkerDescriptor,
 			broadcastHeartbeatsChanged: vi.fn(),
@@ -1665,6 +2366,56 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(workers.has(worker.descriptor.workerId)).toBe(false);
 		expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker);
 		expect(supervisor.workerStopCounts.has(worker)).toBe(false);
+	});
+
+	it("defers root-session shutdown deletion to proof-gated finalization", () => {
+		const worker = {
+			descriptor: {
+				workerId: "worker-root-shutdown",
+				rootActiveSessionId: "root-active",
+			},
+			summaries: new Map<string, SessionSummary>([
+				[
+					"root-active",
+					{ id: "root-active", sessionId: "root-session", activeSessionId: "root-active" } as SessionSummary,
+				],
+			]),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			incomingTranscriptActiveSessionIds: new Set<string>(),
+			duplicateIncomingTranscriptChunkIndexes: new Map<string, number>(),
+			client: { close: vi.fn() },
+			intentionalStop: false,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const persistWorkerStopTombstone = vi.fn();
+		const scheduleWorkerStopFinalization = vi.fn();
+		const deleteWorkerDescriptor = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			workerStopCounts: new Map(),
+			clients: new Set(),
+			streamReconstructor: { observe: vi.fn() },
+			invalidateWorkerSnapshot: vi.fn(),
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			broadcastHeartbeatsChanged: vi.fn(),
+			persistWorkerStopTombstone,
+			scheduleWorkerStopFinalization,
+			deleteWorkerDescriptor,
+		}) as {
+			handleWorkerFrame(target: typeof worker, frame: PrivateFrame<DaemonWorkerFrameHeader>): void;
+		};
+
+		supervisor.handleWorkerFrame(worker, {
+			header: { kind: "outbound", outboundType: "session_closed", activeSessionId: "root-active" },
+			payload: Buffer.from(JSON.stringify({ type: "session_closed", reason: "shutdown" })),
+		});
+
+		expect(persistWorkerStopTombstone).toHaveBeenCalledWith(worker);
+		expect(scheduleWorkerStopFinalization).toHaveBeenCalledWith(worker);
+		expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
+		expect(workers.get(worker.descriptor.workerId)).toBe(worker);
 	});
 
 	it("cancels an in-flight recovery after an intentional stop tombstone", async () => {
@@ -1704,11 +2455,13 @@ describe("daemon worker supervisor monitoring", () => {
 
 	it("fails closed after pid reuse without fresh runtime context", async () => {
 		vi.useFakeTimers();
+		workerLaunchTestState.processIdentityAuthority = () => "exact-dead";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		type RecoveryWorker = {
 			descriptor: {
 				workerId: string;
 				pid: number;
-				processStartId: string;
+				authorityProcessStartId: string;
 				rootActiveSessionId: string;
 				ownerClientId?: string;
 				lifecycle?: string;
@@ -1726,7 +2479,6 @@ describe("daemon worker supervisor monitoring", () => {
 			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
 			launchWorker: ReturnType<typeof vi.fn>;
 			persistWorker: ReturnType<typeof vi.fn>;
-			syncAgentPeers: ReturnType<typeof vi.fn>;
 			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
 			recoverWorker(worker: RecoveryWorker): Promise<void>;
 		};
@@ -1734,7 +2486,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-reused-pid",
 				pid: process.pid,
-				processStartId: "different-process-start",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:2185",
 				rootActiveSessionId: "active-1",
 				consecutiveFailures: 0,
 			},
@@ -1745,10 +2497,10 @@ describe("daemon worker supervisor monitoring", () => {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
 			connectWorker: vi.fn(),
+			processIdentity: vi.fn(() => "replaced"),
 			recoverUncertainWorkerOperations: vi.fn(async () => {}),
 			launchWorker: vi.fn(async () => worker),
 			persistWorker: vi.fn(),
-			syncAgentPeers: vi.fn(async () => {}),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 		}) as RecoveryHarness;
 
@@ -1757,13 +2509,13 @@ describe("daemon worker supervisor monitoring", () => {
 		await recovery;
 
 		expect(supervisor.connectWorker).not.toHaveBeenCalled();
-		expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, false);
+		expect(supervisor.recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker);
 		expect(supervisor.launchWorker).not.toHaveBeenCalled();
 		expect(worker.descriptor.lifecycle).toBe("failed");
 		expect(supervisor.persistWorker).toHaveBeenCalledWith(worker);
 	});
 
-	it("rejects create reuse when a failed worker cannot be safely reclaimed", () => {
+	it("rejects create reuse when a failed worker cannot be safely reclaimed", async () => {
 		const worker = {
 			descriptor: {
 				workerId: "failed-unreclaimed",
@@ -1772,10 +2524,176 @@ describe("daemon worker supervisor monitoring", () => {
 			},
 		};
 		const supervisor = Object.create(DaemonSupervisor.prototype) as {
-			reuseWorkerForCreate(target: typeof worker, ownerClientId: undefined, sessionPath: string): typeof worker;
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+			): Promise<typeof worker>;
 		};
 
-		expect(() => supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/failed.jsonl")).toThrow(/failed worker/);
+		await expect(supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/failed.jsonl")).rejects.toThrow(
+			/failed worker/,
+		);
+	});
+
+	it("waits for worker recovery before reusing a saved session", async () => {
+		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
+		const recovery = createDeferred<void>();
+		const worker = {
+			descriptor: {
+				workerId: "recovering-worker",
+				rootActiveSessionId: root.activeSessionId,
+				lifecycle: "recovering",
+			},
+			client: undefined as object | undefined,
+			summaries: new Map<string, SessionSummary>(),
+			recovery: recovery.promise,
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+		}) as {
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+			): Promise<typeof worker>;
+		};
+
+		let settled = false;
+		const reused = supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/session.jsonl").finally(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		worker.descriptor.lifecycle = "ready";
+		worker.client = {};
+		worker.summaries.set(root.activeSessionId, root as SessionSummary);
+		seedSupervisorRoster(supervisor, worker);
+		recovery.resolve();
+
+		await expect(reused).resolves.toBe(worker);
+	});
+
+	it("starts recovery before reusing a persisted recovering worker", async () => {
+		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
+		const worker = {
+			descriptor: {
+				workerId: "persisted-recovering-worker",
+				rootActiveSessionId: root.activeSessionId,
+				lifecycle: "recovering",
+			},
+			client: undefined as object | undefined,
+			summaries: new Map<string, SessionSummary>(),
+			intentionalStop: false,
+		};
+		const recoverWorker = vi.fn(async () => {
+			worker.descriptor.lifecycle = "ready";
+			worker.client = {};
+			worker.summaries.set(root.activeSessionId, root as SessionSummary);
+			seedSupervisorRoster(supervisor, worker);
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			recoverWorker,
+		}) as {
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+			): Promise<typeof worker>;
+		};
+
+		await expect(supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/session.jsonl")).resolves.toBe(worker);
+		expect(recoverWorker).toHaveBeenCalledOnce();
+	});
+
+	it("starts recovery for a disconnected worker still marked ready", async () => {
+		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
+		const worker = {
+			descriptor: {
+				workerId: "disconnected-ready-worker",
+				rootActiveSessionId: root.activeSessionId,
+				lifecycle: "ready",
+			},
+			client: undefined as object | undefined,
+			summaries: new Map([[root.activeSessionId, root as SessionSummary]]),
+			intentionalStop: false,
+		};
+		const recoverWorker = vi.fn(async () => {
+			worker.client = {};
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			recoverWorker,
+		}) as {
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+			): Promise<typeof worker>;
+		};
+		seedSupervisorRoster(supervisor, worker);
+
+		await expect(supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/session.jsonl")).resolves.toBe(worker);
+		expect(recoverWorker).toHaveBeenCalledOnce();
+	});
+
+	it("rejects recovered workers whose assigned root is still missing", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "rootless-worker",
+				rootActiveSessionId: "active-root",
+				lifecycle: "ready",
+			},
+			client: {},
+			summaries: new Map<string, SessionSummary>(),
+			recovery: Promise.resolve(),
+			intentionalStop: false,
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+		}) as {
+			reuseWorkerForCreate(
+				target: typeof worker,
+				ownerClientId: undefined,
+				sessionPath: string,
+			): Promise<typeof worker>;
+		};
+
+		await expect(supervisor.reuseWorkerForCreate(worker, undefined, "/tmp/session.jsonl")).rejects.toThrow(
+			"assigned root session is missing",
+		);
+	});
+
+	it("preserves cached summaries when recovery omits the assigned root", async () => {
+		const root = { id: "active-root", activeSessionId: "active-root", sessionId: "session-root", cwd: "/tmp" };
+		const worker = {
+			descriptor: {
+				workerId: "root-omitting-worker",
+				rootActiveSessionId: root.activeSessionId,
+			},
+			client: {
+				request: vi.fn(async () =>
+					success(undefined, "list", {
+						sessions: [{ id: "other", activeSessionId: "other", sessionId: "session-other", cwd: "/tmp" }],
+					}),
+				),
+			},
+			summaries: new Map([[root.activeSessionId, root as SessionSummary]]),
+			intentionalStop: false,
+		};
+		const supervisor = Object.create(DaemonSupervisor.prototype) as {
+			refreshWorkerSummaries(target: typeof worker, recovery: boolean): Promise<void>;
+		};
+
+		await expect(supervisor.refreshWorkerSummaries(worker, true)).rejects.toThrow(
+			"Session worker omitted its root session during recovery",
+		);
+		expect(worker.summaries.get(root.activeSessionId)).toBe(root);
 	});
 
 	it("ignores conflicting paths on workers unrelated to a session lookup", () => {
@@ -1819,17 +2737,55 @@ describe("daemon worker supervisor monitoring", () => {
 			workers,
 			sessionInputPauses: new Map(),
 			processIdentity: vi.fn(() => "gone"),
+			persistWorkerStopTombstone: vi.fn((target: typeof worker) => {
+				target.intentionalStop = true;
+			}),
+			invalidateWorkerSessionInputPauses: vi.fn(),
 			recoverUncertainWorkerOperations,
 			deleteWorkerDescriptor,
-			syncAgentPeers: vi.fn(async () => {}),
 		}) as {
 			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
 		};
 
 		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
-		expect(recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, false);
+		expect(recoverUncertainWorkerOperations).toHaveBeenCalledWith(worker, true);
 		expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker);
 		expect(workers.has(worker.descriptor.workerId)).toBe(false);
+	});
+
+	it("retains a stale failed resident when strict cleanup cannot be proved", async () => {
+		const worker = {
+			descriptor: {
+				workerId: "failed-resident-unverified",
+				pid: 42,
+				processStartId: "missing-start",
+				lifecycle: "failed" as const,
+			},
+			intentionalStop: false,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const cleanupFailure = new Error("child process cleanup is unverified");
+		const recoverUncertainWorkerOperations = vi.fn(async () => {
+			throw cleanupFailure;
+		});
+		const deleteWorkerDescriptor = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			sessionInputPauses: new Map(),
+			processIdentity: vi.fn(() => "gone"),
+			persistWorkerStopTombstone: vi.fn((target: typeof worker) => {
+				target.intentionalStop = true;
+			}),
+			invalidateWorkerSessionInputPauses: vi.fn(),
+			recoverUncertainWorkerOperations,
+			deleteWorkerDescriptor,
+		}) as {
+			reclaimStaleWorkerRegistration(target: typeof worker): Promise<boolean>;
+		};
+
+		await expect(supervisor.reclaimStaleWorkerRegistration(worker)).rejects.toBe(cleanupFailure);
+		expect(deleteWorkerDescriptor).not.toHaveBeenCalled();
+		expect(workers.get(worker.descriptor.workerId)).toBe(worker);
 	});
 
 	it("stops only an identity-verified failed resident when a fresh create arrives", async () => {
@@ -1837,7 +2793,8 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "failed-live-resident",
 				pid: 42,
-				processStartId: "verified-start",
+				// Historical exact old-field records remain compatible.
+				processStartId: `token:${"a".repeat(64)}`,
 				lifecycle: "failed" as const,
 			},
 			intentionalStop: false,
@@ -1857,12 +2814,14 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(stopWorker).toHaveBeenCalledWith(worker, true, true);
 	});
 
-	it("does not relaunch a live worker whose process identity is unknown", async () => {
+	it("retains a live worker with a numeric bare-proc legacy identity", async () => {
 		vi.useFakeTimers();
+		workerLaunchTestState.processIdentityAuthority = () => "retained";
 		type RecoveryWorker = {
 			descriptor: {
 				workerId: string;
 				pid: number;
+				processStartId?: string;
 				rootActiveSessionId: string;
 				createCommand: { type: "create" };
 				lifecycle?: string;
@@ -1882,7 +2841,6 @@ describe("daemon worker supervisor monitoring", () => {
 			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
 			launchWorker: ReturnType<typeof vi.fn>;
 			persistWorker: ReturnType<typeof vi.fn>;
-			syncAgentPeers: ReturnType<typeof vi.fn>;
 			broadcastHeartbeatsChanged: ReturnType<typeof vi.fn>;
 			log: ReturnType<typeof vi.fn>;
 			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
@@ -1892,6 +2850,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-unknown-identity",
 				pid: process.pid,
+				processStartId: "proc:42",
 				rootActiveSessionId: "active-1",
 				createCommand: { type: "create" },
 				consecutiveFailures: 0,
@@ -1908,7 +2867,6 @@ describe("daemon worker supervisor monitoring", () => {
 			recoverUncertainWorkerOperations: vi.fn(async () => {}),
 			launchWorker: vi.fn(async () => worker),
 			persistWorker: vi.fn(),
-			syncAgentPeers: vi.fn(async () => {}),
 			log: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 		}) as RecoveryHarness;
@@ -1923,49 +2881,138 @@ describe("daemon worker supervisor monitoring", () => {
 		expect(worker.descriptor.lifecycle).toBe("failed");
 	});
 
-	it("coalesces peer-sync bursts into one active pass and one dirty follow-up", async () => {
-		let releaseFirst!: (response: { success: true; type: "response"; command: string }) => void;
-		const firstPass = new Promise<{ success: true; type: "response"; command: string }>((resolve) => {
-			releaseFirst = resolve;
-		});
-		const requestWorker = vi
-			.fn()
-			.mockImplementationOnce(() => firstPass)
-			.mockResolvedValue({ success: true, type: "response", command: "worker_sync_agent_peers" });
-		const worker = {
+	it("continues startup recovery after live workers time out during adoption", async () => {
+		type AdoptionWorker = {
 			descriptor: {
-				workerId: "peer-worker",
-				rootActiveSessionId: "peer-root",
-				lifecycle: "ready",
+				workerId: string;
+				pid: number;
+				processStartId?: string;
+				rootActiveSessionId: string;
+				lifecycle?: string;
+				consecutiveFailures: number;
+				lastError?: string;
+			};
+		};
+		const processStartId = getProcessStartId(process.pid);
+		expect(processStartId).toBeDefined();
+		const workers: AdoptionWorker[] = ["slow-verified", "slow-unverified", "healthy"].map((workerId) => ({
+			descriptor: {
+				workerId,
+				pid: process.pid,
+				...(workerId === "slow-unverified" ? {} : { processStartId: processStartId! }),
+				rootActiveSessionId: `${workerId}-active`,
+				consecutiveFailures: 0,
 			},
-			intentionalStop: false,
-			summaries: new Map(),
-			client: { requestWorker },
-		};
-		type PeerSyncHarness = {
-			syncAgentPeers(): Promise<void>;
-		};
+		}));
+		const pendingRecovery = new Promise<void>(() => {});
+		const recoverWorker = vi.fn(() => pendingRecovery);
+		const persistWorker = vi.fn();
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			workers: new Map([[worker.descriptor.workerId, worker]]),
-			agentPeerSyncDirty: false,
-			agentPeerSyncInFlight: undefined,
-		}) as PeerSyncHarness;
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			connectWorker: vi.fn(async () => {}),
+			subscribeWorker: vi.fn(async () => {}),
+			refreshWorkerSummaries: vi.fn(async (worker: AdoptionWorker) => {
+				if (worker.descriptor.workerId.startsWith("slow")) {
+					throw new DaemonWorkerProbeTimeoutError("Timed out waiting for daemon worker response to list");
+				}
+			}),
+			recoverWorker,
+			persistWorker,
+			broadcastHeartbeatsChanged: vi.fn(),
+			log: vi.fn(),
+		}) as {
+			adoptOrRecoverWorker(worker: AdoptionWorker): Promise<void>;
+		};
 
-		const first = supervisor.syncAgentPeers();
-		await vi.waitFor(() => expect(requestWorker).toHaveBeenCalledTimes(1));
-		const second = supervisor.syncAgentPeers();
-		const third = supervisor.syncAgentPeers();
-		expect(second).toBe(first);
-		expect(third).toBe(first);
-		expect(requestWorker).toHaveBeenCalledTimes(1);
+		await expect(
+			Promise.all(workers.map((worker) => supervisor.adoptOrRecoverWorker(worker))),
+		).resolves.toBeDefined();
 
-		releaseFirst({ success: true, type: "response", command: "worker_sync_agent_peers" });
-		await Promise.all([first, second, third]);
-		expect(requestWorker).toHaveBeenCalledTimes(2);
+		expect(recoverWorker).toHaveBeenCalledTimes(2);
+		expect(workers.map((worker) => worker.descriptor.lifecycle)).toEqual(["recovering", "recovering", "ready"]);
+		expect(persistWorker).toHaveBeenCalledTimes(3);
 	});
 
-	it("keeps a recovered worker ready when peer synchronization fails", async () => {
+	it("preserves authentication rejection outside the probe-timeout recovery path", async () => {
+		const processStartId = getProcessStartId(process.pid);
+		expect(processStartId).toBeDefined();
+		const worker = {
+			descriptor: {
+				workerId: "worker-auth-rejected",
+				pid: process.pid,
+				processStartId: processStartId!,
+				rootActiveSessionId: "active-auth",
+				consecutiveFailures: 0,
+				socketPath: "/tmp/worker-auth-rejected.sock",
+				authenticationToken: "stale-token",
+			},
+			client: undefined,
+		};
+		const authError = new DaemonWorkerAuthenticationError(
+			"Timed out connecting to daemon session worker: invalid token",
+		);
+		const connect = vi.spyOn(DaemonWorkerClient.prototype, "connect").mockResolvedValue(undefined);
+		const hello = vi.spyOn(DaemonWorkerClient.prototype, "waitForHello").mockResolvedValue({} as never);
+		const authenticate = vi.spyOn(DaemonWorkerClient.prototype, "authenticateWorker").mockRejectedValue(authError);
+		const close = vi.spyOn(DaemonWorkerClient.prototype, "close").mockImplementation(() => undefined);
+		const recoverWorker = vi.fn(async () => undefined);
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			supervisorAuthenticationClaim: vi.fn(() => ({
+				supervisorGeneration: "generation",
+				supervisorPid: process.pid,
+				supervisorSocketPath: "/tmp/supervisor.sock",
+			})),
+			recoverWorker,
+			persistWorker,
+			log: vi.fn(),
+		}) as {
+			adoptOrRecoverWorker(target: typeof worker): Promise<void>;
+		};
+
+		try {
+			await supervisor.adoptOrRecoverWorker(worker);
+
+			expect(authenticate).toHaveBeenCalledOnce();
+			expect(recoverWorker).toHaveBeenCalledWith(worker);
+			expect(persistWorker).not.toHaveBeenCalled();
+			expect(worker.descriptor).not.toHaveProperty("lifecycle", "recovering");
+		} finally {
+			connect.mockRestore();
+			hello.mockRestore();
+			authenticate.mockRestore();
+			close.mockRestore();
+		}
+	});
+
+	it("parks an unresponsive worker failed after the bounded probe rounds", () => {
+		const worker = {
+			descriptor: { workerId: "worker-stuck", pid: process.pid, rootActiveSessionId: "active-1" },
+			deferredRecoveryRounds: 10,
+		};
+		const persistWorker = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			persistWorker,
+			markWorkerRosterEntries: vi.fn(),
+			log: vi.fn(),
+		}) as { deferWorkerRecovery(target: typeof worker, error: Error): void };
+
+		supervisor.deferWorkerRecovery(worker, new Error("still silent"));
+
+		expect(worker.descriptor).toMatchObject({ lifecycle: "failed" });
+		expect((worker as { deferredRecovery?: unknown }).deferredRecovery).toBeUndefined();
+		expect(persistWorker).toHaveBeenCalled();
+	});
+
+	it.each([
+		{ name: "verified", hasProcessIdentity: true, error: "Timed out waiting for daemon worker hello" },
+		{ name: "identity-unavailable", hasProcessIdentity: false, error: "worker socket unavailable" },
+	])("defers recovery without replacing a live $name worker", async ({ hasProcessIdentity, error }) => {
 		vi.useFakeTimers();
+		const processStartId = hasProcessIdentity ? getProcessStartId(process.pid) : undefined;
+		if (hasProcessIdentity) expect(processStartId).toBeDefined();
 		type RecoveryWorker = {
 			descriptor: {
 				workerId: string;
@@ -1978,29 +3025,15 @@ describe("daemon worker supervisor monitoring", () => {
 			};
 			intentionalStop: boolean;
 			stopRevision: number;
-			recovery?: Promise<void>;
-		};
-		type RecoveryHarness = {
-			workers: Map<string, RecoveryWorker>;
-			shuttingDown: boolean;
-			connectWorker: ReturnType<typeof vi.fn>;
-			subscribeWorker: ReturnType<typeof vi.fn>;
-			refreshWorkerSummaries: ReturnType<typeof vi.fn>;
-			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
-			launchWorker: ReturnType<typeof vi.fn>;
-			persistWorker: ReturnType<typeof vi.fn>;
-			syncAgentPeers: ReturnType<typeof vi.fn>;
-			log: ReturnType<typeof vi.fn>;
-			assertRecoveryAllowed: ReturnType<typeof vi.fn>;
-			recoverWorker(worker: RecoveryWorker): Promise<void>;
 		};
 		const worker: RecoveryWorker = {
 			descriptor: {
-				workerId: "worker-peer-sync-failure",
+				workerId: `worker-${hasProcessIdentity ? "verified" : "unknown"}-identity`,
 				pid: process.pid,
+				...(processStartId ? { processStartId } : {}),
 				rootActiveSessionId: "active-1",
 				createCommand: { type: "create" },
-				consecutiveFailures: 1,
+				consecutiveFailures: 0,
 			},
 			intentionalStop: false,
 			stopRevision: 0,
@@ -2008,29 +3041,33 @@ describe("daemon worker supervisor monitoring", () => {
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
 			workers: new Map([[worker.descriptor.workerId, worker]]),
 			shuttingDown: false,
-			connectWorker: vi.fn(async () => ({})),
-			subscribeWorker: vi.fn(async () => {}),
-			refreshWorkerSummaries: vi.fn(async () => {}),
+			connectWorker: vi.fn(async () => {
+				throw hasProcessIdentity ? new DaemonWorkerProbeTimeoutError(error) : new Error(error);
+			}),
 			recoverUncertainWorkerOperations: vi.fn(async () => {}),
 			launchWorker: vi.fn(async () => worker),
 			persistWorker: vi.fn(),
-			syncAgentPeers: vi.fn(async () => {
-				throw new Error("peer unavailable");
-			}),
 			broadcastHeartbeatsChanged: vi.fn(),
+			deferWorkerRecovery: vi.fn(),
 			log: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
-		}) as RecoveryHarness;
+		}) as {
+			recoverWorker(target: RecoveryWorker): Promise<void>;
+			connectWorker: ReturnType<typeof vi.fn>;
+			recoverUncertainWorkerOperations: ReturnType<typeof vi.fn>;
+			launchWorker: ReturnType<typeof vi.fn>;
+			deferWorkerRecovery: ReturnType<typeof vi.fn>;
+		};
 
 		const recovery = supervisor.recoverWorker(worker);
-		await vi.advanceTimersByTimeAsync(250);
+		await vi.advanceTimersByTimeAsync(6250);
 		await recovery;
 
-		expect(supervisor.connectWorker).toHaveBeenCalledOnce();
+		expect(supervisor.connectWorker).toHaveBeenCalledTimes(3);
 		expect(supervisor.recoverUncertainWorkerOperations).not.toHaveBeenCalled();
 		expect(supervisor.launchWorker).not.toHaveBeenCalled();
-		expect(worker.descriptor.lifecycle).toBe("ready");
-		expect(worker.descriptor.consecutiveFailures).toBe(0);
+		expect(supervisor.deferWorkerRecovery).toHaveBeenCalledWith(worker, expect.any(Error));
+		expect(worker.descriptor.lifecycle).toBe("recovering");
 	});
 
 	it("reports a stop-tombstoned worker as stopping, not ready", () => {
@@ -2109,7 +3146,6 @@ describe("daemon worker supervisor monitoring", () => {
 			]),
 			clients: new Set(),
 			refreshWorkerSummaries: vi.fn(async () => {}),
-			syncAgentPeers: vi.fn(async () => {}),
 			log: vi.fn(),
 		}) as {
 			handleList(
@@ -2120,6 +3156,7 @@ describe("daemon worker supervisor monitoring", () => {
 				data?: { sessions: Array<{ activeSessionId?: string; id: string; workerState?: string }> };
 			}>;
 		};
+		seedSupervisorRoster(supervisor, liveWorker, stoppingWorker);
 
 		const response = await supervisor.handleList({}, { id: "list-1", type: "list" });
 
@@ -2136,7 +3173,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-adopted-stop",
 				pid: 111_123,
-				processStartId: "proc:original",
+				processStartId: "proc:123",
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: true,
 			},
@@ -2160,14 +3197,14 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
-	it("captures the live process identity before an adoption stop when the descriptor has none", async () => {
+	it("persists exact authority after authentication before an adoption stop", async () => {
 		const worker = {
 			descriptor: {
 				workerId: "worker-adopted-legacy",
 				pid: process.pid,
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: false,
-			} as { processStartId?: string },
+			} as { processStartId?: string; authorityProcessStartId?: string },
 		};
 		const stopOrder: string[] = [];
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
@@ -2175,8 +3212,10 @@ describe("daemon worker supervisor monitoring", () => {
 			connectWorker: vi.fn(async () => {
 				stopOrder.push("connect");
 			}),
-			persistWorker: vi.fn(() => {
+			upgradeAuthenticatedWorkerProcessAuthority: vi.fn(async () => {
+				worker.descriptor.authorityProcessStartId = getProcessStartId(process.pid);
 				stopOrder.push("persist");
+				return true;
 			}),
 			stopWorker: vi.fn(async () => {
 				stopOrder.push("stop");
@@ -2188,9 +3227,9 @@ describe("daemon worker supervisor monitoring", () => {
 
 		await supervisor.adoptOrRecoverWorker(worker);
 
-		// Identity is captured and persisted before the stop runs, so stopWorker
-		// and its finalizer can signal the live process instead of waiting forever.
-		expect(worker.descriptor.processStartId).toBe(getProcessStartId(process.pid));
+		const observedIdentity = getProcessStartId(process.pid);
+		expect(worker.descriptor.authorityProcessStartId).toBe(observedIdentity);
+		expect(worker.descriptor.processStartId).toBeUndefined();
 		expect(stopOrder).toEqual(["connect", "persist", "stop"]);
 	});
 
@@ -2201,7 +3240,7 @@ describe("daemon worker supervisor monitoring", () => {
 				pid: process.pid,
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: false,
-			} as { processStartId?: string },
+			} as { processStartId?: string; authorityProcessStartId?: string },
 		};
 		const persistWorker = vi.fn();
 		const stopWorker = vi.fn(async () => {});
@@ -2222,6 +3261,7 @@ describe("daemon worker supervisor monitoring", () => {
 		// The pid could belong to anything; never adopt an identity the socket
 		// handshake did not confirm.
 		expect(worker.descriptor.processStartId).toBeUndefined();
+		expect(worker.descriptor.authorityProcessStartId).toBeUndefined();
 		expect(persistWorker).not.toHaveBeenCalled();
 		expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
 	});
@@ -2252,6 +3292,7 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockImplementation(() => alive);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockImplementation(() => alive);
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
@@ -2268,21 +3309,26 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
 			expect(worker.stopFinalization).toBeUndefined();
 		} finally {
+			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 		}
 	});
 
 	it("escalates a stuck stop to SIGKILL before finalizing", async () => {
+		const identity = createProcessIdentityOwnerToken();
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", identity.argument], {
+			detached: true,
+			stdio: "ignore",
+		});
+		if (!child.pid) throw new Error("Could not start exact-identity test process");
+		const childProcessStartId = await waitForExactChildProcessStartId(child.pid);
+		const childClosed = new Promise<void>((resolveClose) => child.once("close", () => resolveClose()));
 		vi.useFakeTimers();
-		const processStartId = getProcessStartId(process.pid);
-		if (processStartId === undefined) {
-			throw new Error("Could not identify test process");
-		}
 		const worker = {
 			descriptor: {
 				workerId: "worker-stuck-stop",
-				pid: process.pid,
-				processStartId,
+				pid: child.pid,
+				authorityProcessStartId: childProcessStartId,
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 				archiveOnStop: true,
@@ -2306,10 +3352,10 @@ describe("daemon worker supervisor monitoring", () => {
 		const childProcessModule = await import("../src/utils/child-process.js");
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockImplementation(() => alive);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation((_pid, signal) => {
-			if (signal === "SIGKILL") {
-				alive = false;
-			}
+			if (signal === "SIGKILL") alive = false;
 		});
+		workerLaunchTestState.processIdentityAuthority = () => (alive ? "exact-live" : "exact-dead");
+		workerLaunchTestState.exactIdentityMatch = () => alive;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2322,6 +3368,16 @@ describe("daemon worker supervisor monitoring", () => {
 		} finally {
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
+			workerLaunchTestState.exactIdentityMatch = undefined;
+			workerLaunchTestState.processIdentityAuthority = undefined;
+			if (matchesExactProcessIdentity(child.pid, childProcessStartId)) {
+				try {
+					process.kill(-child.pid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+			await childClosed;
 		}
 	});
 
@@ -2352,6 +3408,8 @@ describe("daemon worker supervisor monitoring", () => {
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		workerLaunchTestState.processIdentityAuthority = () => "retained";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2384,7 +3442,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-recycled-pid",
 				pid: 111_112,
-				processStartId: "proc:original",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:100",
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 			},
@@ -2404,12 +3462,12 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
-		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		// The pid is alive, but it now belongs to an unrelated process.
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
-		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:recycled");
+		workerLaunchTestState.processIdentityAuthority = () => "exact-dead";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2425,7 +3483,6 @@ describe("daemon worker supervisor monitoring", () => {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
-			startIdSpy.mockRestore();
 		}
 	});
 
@@ -2460,7 +3517,6 @@ describe("daemon worker supervisor monitoring", () => {
 				worker.descriptor.stopRequestedAt = undefined;
 			}),
 			deleteWorkerDescriptor: vi.fn(),
-			syncAgentPeers: vi.fn(async () => {}),
 			broadcastHeartbeatsChanged: vi.fn(),
 			log: vi.fn(),
 			reportCleanupFailure: vi.fn(),
@@ -2519,7 +3575,6 @@ describe("daemon worker supervisor monitoring", () => {
 				worker.descriptor.stopRequestedAt = undefined;
 			}),
 			deleteWorkerDescriptor: vi.fn(),
-			syncAgentPeers: vi.fn(async () => {}),
 			broadcastHeartbeatsChanged: vi.fn(),
 			log: vi.fn(),
 			reportCleanupFailure: vi.fn(),
@@ -2571,7 +3626,6 @@ describe("daemon worker supervisor monitoring", () => {
 			persistWorker: vi.fn(),
 			persistWorkerStopTombstone: vi.fn(),
 			scheduleWorkerStopFinalization: vi.fn(),
-			syncAgentPeers: vi.fn(async () => {}),
 			broadcastHeartbeatsChanged: vi.fn(),
 		}) as unknown as {
 			stopWorker(target: object, removeDescriptor: boolean, force?: boolean): Promise<void>;
@@ -2580,6 +3634,8 @@ describe("daemon worker supervisor monitoring", () => {
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
+		workerLaunchTestState.processIdentityAuthority = () => "retained";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		try {
 			const stopping = supervisor.stopWorker(worker, true, true).then(
 				() => undefined,
@@ -2605,7 +3661,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-kill-window-recycle",
 				pid: 111_118,
-				processStartId: "proc:original",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:118",
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 			},
@@ -2628,17 +3684,18 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
-		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		// The worker is current on the throttled polls, but the pid is recycled
 		// by the time the SIGKILL deadline arrives.
-		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:original");
+		let recycled = false;
+		workerLaunchTestState.processIdentityAuthority = () => (recycled ? "exact-dead" : "exact-live");
+		workerLaunchTestState.exactIdentityMatch = () => !recycled;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			await vi.advanceTimersByTimeAsync(4900);
-			startIdSpy.mockReturnValue("proc:recycled");
+			recycled = true;
 			await vi.advanceTimersByTimeAsync(2000);
 
 			// The fresh check at signal time sees the recycled pid and holds fire.
@@ -2647,7 +3704,6 @@ describe("daemon worker supervisor monitoring", () => {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
-			startIdSpy.mockRestore();
 		}
 	});
 
@@ -2657,7 +3713,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-kill-retry",
 				pid: 111_119,
-				processStartId: "proc:original",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:119",
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 			},
@@ -2680,17 +3736,16 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
-		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		let alive = true;
+		let identityObservable = false;
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockImplementation(() => alive);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation((_pid, signal) => {
-			if (signal === "SIGKILL") {
-				alive = false;
-			}
+			if (signal === "SIGKILL") alive = false;
 		});
-		// Identity observation is down when the SIGKILL deadline passes...
-		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue(undefined);
+		workerLaunchTestState.processIdentityAuthority = () =>
+			!alive ? "exact-dead" : identityObservable ? "exact-live" : "retained";
+		workerLaunchTestState.exactIdentityMatch = () => alive && identityObservable;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 			const finalization = worker.stopFinalization;
@@ -2699,7 +3754,7 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(killSpy).not.toHaveBeenCalled();
 
 			// ...but once identity is observable again, escalation still fires.
-			startIdSpy.mockReturnValue("proc:original");
+			identityObservable = true;
 			await vi.advanceTimersByTimeAsync(5000);
 			await finalization;
 			expect(killSpy).toHaveBeenCalledWith(worker.descriptor.pid, "SIGKILL");
@@ -2708,7 +3763,6 @@ describe("daemon worker supervisor monitoring", () => {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
-			startIdSpy.mockRestore();
 		}
 	});
 
@@ -2718,7 +3772,7 @@ describe("daemon worker supervisor monitoring", () => {
 			descriptor: {
 				workerId: "worker-unknown-identity-stop",
 				pid: 111_114,
-				processStartId: "proc:original",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:114",
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 			},
@@ -2738,12 +3792,12 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
-		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
 		// Identity observation fails transiently (e.g. ps unavailable).
-		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue(undefined);
+		workerLaunchTestState.processIdentityAuthority = () => "retained";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 
@@ -2757,7 +3811,6 @@ describe("daemon worker supervisor monitoring", () => {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
-			startIdSpy.mockRestore();
 		}
 	});
 
@@ -2786,11 +3839,11 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
-		const sessionLeaseModule = await import("../src/core/session-lease.js");
 		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
 		const killSpy = vi.spyOn(childProcessModule, "signalProcessGroupOrProcess").mockImplementation(() => {});
-		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:unrelated");
+		workerLaunchTestState.processIdentityAuthority = () => "retained";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
 
@@ -2803,7 +3856,6 @@ describe("daemon worker supervisor monitoring", () => {
 			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 			killSpy.mockRestore();
-			startIdSpy.mockRestore();
 		}
 	});
 
@@ -2839,6 +3891,7 @@ describe("daemon worker supervisor monitoring", () => {
 			scheduleWorkerStopFinalization(target: object): void;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
 			supervisor.scheduleWorkerStopFinalization(worker);
@@ -2852,6 +3905,7 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(stopWorker).toHaveBeenCalledTimes(2);
 			expect(workers.size).toBe(0);
 		} finally {
+			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 		}
 	});
@@ -2926,21 +3980,23 @@ describe("daemon worker supervisor monitoring", () => {
 			reclaimStaleWorkerRegistration(target: object): Promise<boolean>;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
 			await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
 		} finally {
+			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 		}
 	});
 
-	it("reclaims a stale registration whose pid was recycled by another process", async () => {
+	it("reclaims a stale registration with a distinguishable replacement generation by another process", async () => {
 		const worker = {
 			descriptor: {
 				workerId: "worker-recycled-registration",
 				pid: 111_113,
-				processStartId: "proc:original",
+				authorityProcessStartId: "proc:11111111-1111-1111-1111-111111111111:113",
 				rootActiveSessionId: "active-1",
 				stopRequestedAt: new Date().toISOString(),
 			},
@@ -2962,16 +4018,17 @@ describe("daemon worker supervisor monitoring", () => {
 			reclaimStaleWorkerRegistration(target: object): Promise<boolean>;
 		};
 		const childProcessModule = await import("../src/utils/child-process.js");
-		const sessionLeaseModule = await import("../src/core/session-lease.js");
-		// The pid is alive, but it belongs to an unrelated process now.
+		// The pid is alive, but a distinguishable generation owns it now.
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(true);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(true);
-		const startIdSpy = vi.spyOn(sessionLeaseModule, "getProcessStartId").mockReturnValue("proc:recycled");
+		workerLaunchTestState.processIdentityAuthority = () => "exact-dead";
+		workerLaunchTestState.exactIdentityMatch = () => false;
 		try {
 			await expect(supervisor.reclaimStaleWorkerRegistration(worker)).resolves.toBe(true);
 			expect(stopWorker).toHaveBeenCalledWith(worker, true, true, false);
 		} finally {
+			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
-			startIdSpy.mockRestore();
 		}
 	});
 
@@ -3008,6 +4065,7 @@ describe("daemon worker supervisor monitoring", () => {
 		};
 
 		const childProcessModule = await import("../src/utils/child-process.js");
+		const existsSpy = vi.spyOn(childProcessModule, "processIdExists").mockReturnValue(false);
 		const aliveSpy = vi.spyOn(childProcessModule, "isProcessAlive").mockReturnValue(false);
 		try {
 			const reclaim = supervisor.reclaimStaleWorkerRegistration(worker);
@@ -3017,6 +4075,7 @@ describe("daemon worker supervisor monitoring", () => {
 			await expect(reclaim).resolves.toBe(true);
 			expect(stopWorker).not.toHaveBeenCalled();
 		} finally {
+			existsSpy.mockRestore();
 			aliveSpy.mockRestore();
 		}
 	});
@@ -3244,7 +4303,7 @@ describe("daemon worker supervisor monitoring", () => {
 					version: 1,
 					workerId: "worker-v1",
 					pid: 42,
-					socketPath: "/tmp/worker-v1.sock",
+					socketPath: canonicalDaemonWorkerSocketPath("/tmp/supervisor.sock", "worker-v1"),
 					recoveryJournalPath: join(descriptorDir, "worker-v1.recovery.jsonl"),
 					supervisorSocketPath: "/tmp/supervisor.sock",
 					authenticationToken: "local-token",
@@ -3306,6 +4365,99 @@ describe("daemon worker supervisor monitoring", () => {
 		}
 	});
 
+	it("adopts a legacy lexical-hash worker root through physical supervisor socket identity", () => {
+		if (process.platform === "win32") return;
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-legacy-root-"));
+		const agentDir = join(root, "agent");
+		const physicalSocketDir = join(root, "physical-sockets");
+		const lexicalSocketDir = join(root, "socket-alias");
+		mkdirSync(agentDir, { recursive: true });
+		mkdirSync(physicalSocketDir, { recursive: true });
+		symlinkSync(physicalSocketDir, lexicalSocketDir, "dir");
+		const lexicalSupervisorSocket = join(lexicalSocketDir, "supervisor.sock");
+		const physicalSupervisorSocket = normalizeSocketPath(lexicalSupervisorSocket);
+		const legacyKey = createHash("sha256").update(resolve(lexicalSupervisorSocket)).digest("hex").slice(0, 12);
+		const legacyDir = join(agentDir, "daemon-workers", legacyKey);
+		const canonicalDir = defaultDaemonWorkerDescriptorDir(agentDir, lexicalSupervisorSocket);
+		expect(legacyDir).not.toBe(canonicalDir);
+		mkdirSync(legacyDir, { recursive: true });
+		mkdirSync(canonicalDir, { recursive: true });
+		const now = new Date().toISOString();
+		const workerId = "worker-legacy";
+		const orphanPath = join(legacyDir, `${workerId}.orphans.jsonl`);
+		const orphanAuthority = initializeOrphanProcessJournal(orphanPath);
+		const descriptorPath = join(legacyDir, `${workerId}.json`);
+		writeFileSync(
+			descriptorPath,
+			`${JSON.stringify({
+				version: 2,
+				workerId,
+				pid: 999_999,
+				socketPath: join(physicalSocketDir, `worker-${legacyKey}-${workerId.slice(0, 12)}.sock`),
+				recoveryJournalPath: join(legacyDir, `${workerId}.recovery.jsonl`),
+				orphanProcessJournalPath: orphanPath,
+				orphanProcessJournalGeneration: orphanAuthority.generation,
+				supervisorSocketPath: lexicalSupervisorSocket,
+				authenticationToken: "token-legacy",
+				rootActiveSessionId: "active-legacy",
+				createdAt: now,
+				updatedAt: now,
+				lifecycle: "ready",
+				createCommand: { type: "create" },
+				consecutiveFailures: 0,
+			})}\n`,
+		);
+		const workers = new Map<string, { descriptorPath: string; descriptor: DaemonWorkerDescriptor }>();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			descriptorDir: canonicalDir,
+			defaultSessionConfig: { agentDir },
+			socketPath: physicalSupervisorSocket,
+			workers,
+			log: vi.fn(),
+		}) as { loadWorkerDescriptors(): void };
+
+		try {
+			supervisor.loadWorkerDescriptors();
+			expect(workers.get(workerId)?.descriptorPath).toBe(descriptorPath);
+			expect(workers.get(workerId)?.descriptor.supervisorSocketPath).toBe(lexicalSupervisorSocket);
+			expect(readdirSync(canonicalDir).filter((name) => name.endsWith(".json"))).toEqual([]);
+			expect(JSON.parse(readFileSync(descriptorPath, "utf8"))).toMatchObject({
+				workerId,
+				supervisorSocketPath: lexicalSupervisorSocket,
+				lifecycle: "recovering",
+			});
+
+			const exact = `token:${"a".repeat(64)}`;
+			const oldOnly = {
+				...JSON.parse(readFileSync(descriptorPath, "utf8")),
+				processStartId: exact,
+			};
+			delete oldOnly.authorityProcessStartId;
+			writeFileSync(descriptorPath, `${JSON.stringify(oldOnly)}\n`);
+			const duplicatePath = join(canonicalDir, `${workerId}.json`);
+			for (const authorityProcessStartId of [exact, `token:${"b".repeat(64)}`]) {
+				const duplicate = { ...oldOnly, authorityProcessStartId };
+				delete duplicate.processStartId;
+				writeFileSync(duplicatePath, `${JSON.stringify(duplicate)}\n`);
+				const oldBytes = readFileSync(descriptorPath);
+				const duplicateBytes = readFileSync(duplicatePath);
+				const splitWorkers = new Map();
+				const splitSupervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+					descriptorDir: canonicalDir,
+					defaultSessionConfig: { agentDir },
+					socketPath: physicalSupervisorSocket,
+					workers: splitWorkers,
+					log: vi.fn(),
+				}) as { loadWorkerDescriptors(): void };
+				expect(() => splitSupervisor.loadWorkerDescriptors()).toThrow("Split worker authority");
+				expect(splitWorkers.size).toBe(0);
+				expect(readFileSync(descriptorPath)).toEqual(oldBytes);
+				expect(readFileSync(duplicatePath)).toEqual(duplicateBytes);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 	it("adopts persisted worker descriptors recorded with a non-canonical supervisor socket path", () => {
 		if (process.platform === "win32") {
 			return;
@@ -3320,12 +4472,13 @@ describe("daemon worker supervisor monitoring", () => {
 					workerId: "worker-1",
 					pid: 999_999,
 					socketPath: join(descriptorDir, "worker-1.sock"),
+					recoveryJournalPath: join(descriptorDir, "worker-1.recovery.jsonl"),
 					supervisorSocketPath: "/tmp//supervisor.sock",
 					authenticationToken: "token-1",
 					rootActiveSessionId: "active-1",
 					createdAt: now,
 					updatedAt: now,
-					lifecycle: "running",
+					lifecycle: "ready",
 					sessionDir: "/safe/sessions",
 					telemetryDisabled: true,
 					createCommand: {
@@ -3355,7 +4508,7 @@ describe("daemon worker supervisor monitoring", () => {
 			};
 			expect(loaded.descriptor).toMatchObject({
 				version: 2,
-				supervisorSocketPath: "/tmp/supervisor.sock",
+				supervisorSocketPath: normalizeSocketPath("/tmp/supervisor.sock"),
 				sessionDir: "/safe/sessions",
 				telemetryDisabled: true,
 			});
@@ -3364,7 +4517,7 @@ describe("daemon worker supervisor monitoring", () => {
 			expect(persisted).not.toContain("secret-");
 			expect(JSON.parse(persisted)).toMatchObject({
 				version: 2,
-				supervisorSocketPath: "/tmp/supervisor.sock",
+				supervisorSocketPath: normalizeSocketPath("/tmp/supervisor.sock"),
 			});
 		} finally {
 			rmSync(descriptorDir, { recursive: true, force: true });
@@ -3461,6 +4614,7 @@ describe("daemon worker supervisor monitoring", () => {
 				command: { type: "attach"; activeSessionId: string },
 			): Promise<unknown>;
 		};
+		seedSupervisorRoster(supervisor, worker);
 
 		await supervisor.attachClient(client, { type: "attach", activeSessionId });
 
@@ -3574,6 +4728,7 @@ describe("daemon worker supervisor monitoring", () => {
 				command: { type: "attach"; activeSessionId: string; telemetryDisabled?: true },
 			): Promise<unknown>;
 		};
+		seedSupervisorRoster(supervisor, worker);
 
 		await expect(
 			supervisor.attachClient(client, { type: "attach", activeSessionId, telemetryDisabled: true }),
@@ -3781,11 +4936,318 @@ describe("daemon worker supervisor monitoring", () => {
 		}) as {
 			attachClient(client: AttachClient, command: { type: "attach"; activeSessionId: string }): Promise<unknown>;
 		};
+		seedSupervisorRoster(supervisor, worker);
 
 		await expect(supervisor.attachClient(client, { type: "attach", activeSessionId })).rejects.toThrow(
 			"snapshot failed",
 		);
 		expect(client.attachedActiveSessionIds).toEqual(new Set());
+	});
+
+	it.each(["malformed", "unreadable", "missing"] as const)(
+		"blocks supervisor recovery when strict orphan authority is %s",
+		async (authorityState) => {
+			const root = mkdtempSync(join(tmpdir(), "prime-supervisor-strict-authority-"));
+			const orphanProcessJournalPath = join(root, "worker.orphans.jsonl");
+			const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+			const descriptorPath = join(root, "worker.json");
+			writeFileSync(descriptorPath, "descriptor\n");
+			writeFileSync(recoveryJournalPath, "recovery\n");
+			if (authorityState === "malformed") {
+				writeFileSync(orphanProcessJournalPath, "{not-json}\n");
+			} else if (authorityState === "unreadable") {
+				mkdirSync(orphanProcessJournalPath);
+			}
+			const worker = {
+				descriptor: {
+					workerId: "strict-authority-worker",
+					pid: 2_000_000_000,
+					processStartId: "missing-process",
+					rootActiveSessionId: "root-active",
+					recoveryJournalPath,
+					orphanProcessJournalPath,
+				},
+				descriptorPath,
+			};
+			const markInterrupted = vi.fn(async () => undefined);
+			const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+				catalog: { markInterrupted },
+				assertRecoveryAllowed: vi.fn(async () => undefined),
+			}) as {
+				recoverUncertainWorkerOperations(target: typeof worker, requireWorkerDeath: boolean): Promise<void>;
+			};
+
+			try {
+				await expect(supervisor.recoverUncertainWorkerOperations(worker, true)).rejects.toThrow(
+					"child process cleanup is unverified",
+				);
+				expect(markInterrupted).not.toHaveBeenCalled();
+				expect(existsSync(descriptorPath)).toBe(true);
+				expect(existsSync(recoveryJournalPath)).toBe(true);
+				expect(existsSync(orphanProcessJournalPath)).toBe(authorityState !== "missing");
+			} finally {
+				rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it("rejects Windows PID-only orphan authority before supervisor recovery", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-windows-authority-"));
+		const orphanProcessJournalPath = join(root, "worker.orphans.jsonl");
+		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+		writeFileSync(
+			orphanProcessJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: 2_000_000_001,
+				ownerPid: 2_000_000_002,
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+		const worker = {
+			descriptor: {
+				workerId: "windows-pid-only-worker",
+				pid: 2_000_000_000,
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath,
+				orphanProcessJournalPath,
+			},
+		};
+		const platform = vi.spyOn(process, "platform", "get").mockReturnValue("win32");
+		const markInterrupted = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			catalog: { markInterrupted },
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			recoverUncertainWorkerOperations(target: typeof worker, requireWorkerDeath: boolean): Promise<void>;
+		};
+
+		try {
+			await expect(supervisor.recoverUncertainWorkerOperations(worker, false)).rejects.toThrow(
+				"child process cleanup is unverified",
+			);
+			expect(markInterrupted).not.toHaveBeenCalled();
+			expect(readFileSync(orphanProcessJournalPath, "utf8")).toContain('"active":true');
+		} finally {
+			platform.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reaps prior-generation orphan trees before marking recovery operations interrupted", async () => {
+		if (process.platform === "win32") return;
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-prior-generation-"));
+		const orphanProcessJournalPath = join(root, "worker.orphans.jsonl");
+		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+		const childIdentity = createProcessIdentityOwnerToken();
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", childIdentity.argument], {
+			detached: true,
+			stdio: "ignore",
+		});
+		const childPid = child.pid;
+		if (!childPid) throw new Error("Prior-generation fixture did not start");
+		const childStartId = await waitForExactChildProcessStartId(childPid);
+		writeFileSync(
+			orphanProcessJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: childPid,
+				ownerPid: 2_000_000_002,
+				processStartId: childStartId,
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+		new WorkerRecoveryJournal(recoveryJournalPath).record({
+			activeSessionId: "root-active",
+			sessionId: "root-session",
+			sessionFile: "/tmp/root.jsonl",
+			busy: true,
+			operation: "model_stream",
+		});
+		const worker = {
+			descriptor: {
+				workerId: "prior-generation-worker",
+				pid: 2_000_000_000,
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath,
+				orphanProcessJournalPath,
+			},
+		};
+		const markInterrupted = vi.fn(async () => undefined);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			catalog: { markInterrupted },
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			log: vi.fn(),
+		}) as {
+			recoverUncertainWorkerOperations(target: typeof worker, requireWorkerDeath: boolean): Promise<void>;
+		};
+
+		try {
+			await expect(supervisor.recoverUncertainWorkerOperations(worker, false)).resolves.toBeUndefined();
+			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"]);
+			await new Promise<void>((resolveClose) => {
+				if (child.exitCode !== null || child.signalCode !== null) resolveClose();
+				else child.once("close", () => resolveClose());
+			});
+		} finally {
+			if (matchesExactProcessIdentity(childPid, childStartId)) {
+				try {
+					process.kill(-childPid, "SIGKILL");
+				} catch {
+					// Already reaped.
+				}
+			}
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not launch a replacement after strict recovery cleanup fails", async () => {
+		vi.useFakeTimers();
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-replacement-gate-"));
+		const orphanProcessJournalPath = join(root, "worker.orphans.jsonl");
+		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+		const descriptorPath = join(root, "worker.json");
+		writeFileSync(orphanProcessJournalPath, "{not-json}\n");
+		writeFileSync(recoveryJournalPath, "recovery\n");
+		writeFileSync(descriptorPath, "descriptor\n");
+		const worker = {
+			descriptor: {
+				workerId: "replacement-gated-worker",
+				pid: 2_000_000_000,
+				processStartId: "missing-process",
+				rootActiveSessionId: "root-active",
+				rootSessionId: "root-session",
+				socketPath: join(root, "worker.sock"),
+				recoveryJournalPath,
+				orphanProcessJournalPath,
+				ownerClientId: "owner-client",
+				lifecycle: "recovering" as const,
+				consecutiveFailures: 0,
+			},
+			descriptorPath,
+			intentionalStop: false,
+			stopRevision: 0,
+			transientCreateCommand: { type: "create" as const, config: {} },
+			launchEnv: {},
+		};
+		const launchWorker = vi.fn(async () => worker);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			socketPath: join(root, "supervisor.sock"),
+			catalog: { markInterrupted: vi.fn(async () => undefined) },
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+			launchWorker,
+			persistWorker: vi.fn(),
+			log: vi.fn(),
+		}) as {
+			recoverWorker(target: typeof worker): Promise<void>;
+		};
+
+		try {
+			const recovery = supervisor.recoverWorker(worker);
+			await vi.runAllTimersAsync();
+			await recovery;
+			expect(launchWorker).not.toHaveBeenCalled();
+			expect(worker.descriptor.lifecycle).toBe("failed");
+			expect(worker.descriptor.consecutiveFailures).toBe(3);
+			for (const path of [descriptorPath, recoveryJournalPath, orphanProcessJournalPath]) {
+				expect(existsSync(path)).toBe(true);
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("retains resident and durable stop artifacts when a failed group remains live", async () => {
+		if (process.platform === "win32") return;
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-stop-proof-"));
+		const descriptorPath = join(root, "worker.json");
+		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+		const orphanProcessJournalPath = join(root, "worker.orphans.jsonl");
+		writeFileSync(descriptorPath, "descriptor\n");
+		writeFileSync(recoveryJournalPath, "recovery\n");
+		const childIdentity = createProcessIdentityOwnerToken();
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", childIdentity.argument], {
+			detached: true,
+			stdio: "ignore",
+		});
+		const childPid = child.pid;
+		if (!childPid) throw new Error("Live-group fixture did not start");
+		const childStartId = await waitForExactChildProcessStartId(childPid);
+		writeFileSync(
+			orphanProcessJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: childPid,
+				ownerPid: 2_000_000_002,
+				processStartId: "mismatched-process-identity",
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}\n`,
+		);
+		const worker = {
+			descriptor: {
+				workerId: "forced-stop-proof-worker",
+				pid: 2_000_000_000,
+				processStartId: "missing-process",
+				rootActiveSessionId: "root-active",
+				lifecycle: "ready" as const,
+				recoveryJournalPath,
+				orphanProcessJournalPath,
+			},
+			descriptorPath,
+			summaries: new Map<string, SessionSummary>(),
+			snapshotCache: new Map(),
+			transcriptCaches: new Map(),
+			snapshotGenerations: new Map(),
+			intentionalStop: false,
+			stopRevision: 0,
+		};
+		const workers = new Map([[worker.descriptor.workerId, worker]]);
+		const deleteWorkerDescriptor = vi.fn(async () => false);
+		const scheduleWorkerStopFinalization = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers,
+			workerStopCounts: new Map(),
+			shuttingDown: false,
+			processIdentity: vi.fn(() => "gone"),
+			persistWorkerStopTombstone: vi.fn((target: typeof worker) => {
+				target.intentionalStop = true;
+				(target.descriptor as typeof target.descriptor & { stopRequestedAt?: string }).stopRequestedAt =
+					new Date().toISOString();
+			}),
+			scheduleWorkerStopFinalization,
+			deleteWorkerDescriptor,
+			invalidateWorkerSessionInputPauses: vi.fn(),
+		}) as {
+			stopWorker(target: typeof worker, removeDescriptor: boolean, force: boolean): Promise<void>;
+		};
+
+		try {
+			await expect(supervisor.stopWorker(worker, true, true)).rejects.toThrow(
+				"recovery authority could not be removed",
+			);
+			expect(workers.get(worker.descriptor.workerId)).toBe(worker);
+			expect(deleteWorkerDescriptor).toHaveBeenCalledWith(worker, expect.anything());
+			expect(scheduleWorkerStopFinalization).toHaveBeenCalledWith(worker);
+			for (const path of [descriptorPath, recoveryJournalPath]) {
+				expect(existsSync(path)).toBe(true);
+			}
+			expect(existsSync(orphanProcessJournalPath)).toBe(true);
+		} finally {
+			if (matchesExactProcessIdentity(childPid, childStartId)) {
+				try {
+					process.kill(-childPid, "SIGKILL");
+				} catch {
+					// Already gone.
+				}
+			}
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("marks each busy worker session interrupted independently", async () => {
@@ -3796,22 +5258,13 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: string;
 				recoveryJournalPath: string;
 				orphanProcessJournalPath: string;
+				orphanProcessJournalGeneration: string;
 			};
 		};
 		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-recovery-test-"));
 		const journalPath = join(root, "worker.recovery.jsonl");
 		const orphanJournalPath = join(root, "worker.orphans.jsonl");
-		writeFileSync(
-			orphanJournalPath,
-			`${JSON.stringify({
-				version: 1,
-				pid: 987_654,
-				ownerPid: process.pid,
-				processStartId: "reused-process",
-				active: true,
-				recordedAt: new Date().toISOString(),
-			})}\n`,
-		);
+		const orphanProcessJournalGeneration = initializeOrphanProcessJournal(orphanJournalPath).generation;
 		const journal = new WorkerRecoveryJournal(journalPath);
 		journal.record({
 			activeSessionId: "root-active",
@@ -3834,20 +5287,23 @@ describe("daemon worker supervisor monitoring", () => {
 				rootActiveSessionId: "root-active",
 				recoveryJournalPath: journalPath,
 				orphanProcessJournalPath: orphanJournalPath,
+				orphanProcessJournalGeneration,
 			},
 		};
 		const markInterrupted = vi.fn(async () => undefined);
 		const kill = vi.spyOn(process, "kill").mockReturnValue(true);
 		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
-			catalog: { markInterrupted },
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			catalog: { start: vi.fn(async () => undefined), markInterrupted },
 			log: vi.fn(),
 			assertRecoveryAllowed: vi.fn(async () => {}),
 		}) as {
-			recoverUncertainWorkerOperations(worker: RecoveryWorker, killWorkerProcess: boolean): Promise<void>;
+			recoverUncertainWorkerOperations(worker: RecoveryWorker): Promise<void>;
 		};
 
 		try {
-			await supervisor.recoverUncertainWorkerOperations(worker, false);
+			await supervisor.recoverUncertainWorkerOperations(worker);
 			expect(kill).not.toHaveBeenCalled();
 			expect(markInterrupted).toHaveBeenCalledTimes(2);
 			expect(markInterrupted).toHaveBeenCalledWith("/tmp/root.jsonl", "root-active", ["model_stream"]);
@@ -3857,6 +5313,156 @@ describe("daemon worker supervisor monitoring", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	it.each([
+		{ name: "identity-bearing", hasProcessIdentity: true },
+		{ name: "PID-only", hasProcessIdentity: false },
+	])("retains a $name orphan journal when cleanup cannot be verified", async ({ hasProcessIdentity }) => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-orphan-retry-test-"));
+		const orphanJournalPath = join(root, "worker.orphans.jsonl");
+		const workerPid = 987_653;
+		const orphanPid = process.pid;
+		const processStartId = hasProcessIdentity ? getProcessStartId(orphanPid) : undefined;
+		if (hasProcessIdentity) expect(processStartId).toBeDefined();
+		writeFileSync(
+			orphanJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: orphanPid,
+				ownerPid: workerPid,
+				...(processStartId ? { processStartId } : {}),
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}
+`,
+		);
+		const worker = {
+			descriptor: {
+				workerId: "worker-orphan-retry",
+				pid: workerPid,
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath: join(root, "worker.recovery.jsonl"),
+				orphanProcessJournalPath: orphanJournalPath,
+			},
+		};
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			catalog: { start: vi.fn(async () => undefined), markInterrupted: vi.fn(async () => undefined) },
+			log: vi.fn(),
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+		}) as {
+			recoverUncertainWorkerOperations(target: typeof worker): Promise<void>;
+		};
+		const reap = vi.spyOn(orphanProcessModule, "reapOrphanProcessAuthority").mockResolvedValue(false);
+
+		try {
+			await expect(supervisor.recoverUncertainWorkerOperations(worker)).rejects.toThrow(
+				"child process cleanup is unverified",
+			);
+			expect(reap).toHaveBeenCalledWith(
+				orphanJournalPath,
+				expect.objectContaining({ additionalCandidates: [{ pid: workerPid }] }),
+			);
+			expect(existsSync(orphanJournalPath)).toBe(true);
+		} finally {
+			reap.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("skips catalog startup when recovery has no interrupted operations", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-empty-recovery-test-"));
+		const worker = {
+			descriptor: {
+				workerId: "worker-empty-recovery",
+				pid: 987_654,
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath: join(root, "worker.recovery.jsonl"),
+			},
+		};
+		const catalogStart = vi.fn(async () => {
+			throw new Error("catalog unavailable");
+		});
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			catalog: { start: catalogStart, markInterrupted: vi.fn() },
+			assertRecoveryAllowed: vi.fn(async () => undefined),
+		}) as {
+			recoverUncertainWorkerOperations(target: typeof worker): Promise<void>;
+		};
+
+		try {
+			await expect(supervisor.recoverUncertainWorkerOperations(worker)).resolves.toBeUndefined();
+			expect(catalogStart).not.toHaveBeenCalled();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not mark interrupted operations when catalog startup fails after cleanup proof", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-supervisor-catalog-readiness-test-"));
+		const recoveryJournalPath = join(root, "worker.recovery.jsonl");
+		const orphanJournalPath = join(root, "worker.orphans.jsonl");
+		const workerPid = 987_654;
+		new WorkerRecoveryJournal(recoveryJournalPath).record({
+			activeSessionId: "root-active",
+			sessionId: "root-session",
+			sessionFile: "/tmp/root.jsonl",
+			busy: true,
+			operation: "model_stream",
+		});
+		writeFileSync(
+			orphanJournalPath,
+			`${JSON.stringify({
+				version: 1,
+				pid: process.pid,
+				ownerPid: workerPid,
+				processStartId: getProcessStartId(process.pid),
+				active: true,
+				recordedAt: new Date().toISOString(),
+			})}
+`,
+		);
+		const worker = {
+			descriptor: {
+				workerId: "worker-catalog-blocked",
+				pid: workerPid,
+				rootActiveSessionId: "root-active",
+				recoveryJournalPath,
+				orphanProcessJournalPath: orphanJournalPath,
+			},
+			intentionalStop: false,
+		};
+		const catalogError = new Error("Timed out starting daemon catalog");
+		const reap = vi.spyOn(orphanProcessModule, "reapOrphanProcessAuthority").mockResolvedValue(true);
+		const markInterrupted = vi.fn();
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			workers: new Map([[worker.descriptor.workerId, worker]]),
+			shuttingDown: false,
+			catalog: {
+				start: vi.fn(async () => {
+					throw catalogError;
+				}),
+				markInterrupted,
+			},
+			assertRecoveryAllowed: vi.fn(async () => {}),
+		}) as {
+			recoverUncertainWorkerOperations(target: typeof worker): Promise<void>;
+		};
+
+		try {
+			await expect(supervisor.recoverUncertainWorkerOperations(worker)).rejects.toThrow(catalogError);
+			expect(reap).toHaveBeenCalledOnce();
+			expect(markInterrupted).not.toHaveBeenCalled();
+			expect(existsSync(orphanJournalPath)).toBe(true);
+		} finally {
+			reap.mockRestore();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it.each([
 		{ name: "malformed data", data: undefined, error: /invalid update manifest/ },
 		{
@@ -4043,30 +5649,69 @@ describe("daemon worker supervisor monitoring", () => {
 	});
 
 	it("limits abort admission to mutation drain", async () => {
-		const root = mkdtempSync(`/tmp/prime-update-drain-${process.pid}-`);
-		const socketPath = join(root, "supervisor.sock");
-		const supervisor = new DaemonSupervisor(socketPath, {
-			defaultSessionConfig: { cwd: root, agentDir: root },
-			descriptorDir: join(root, "workers"),
-		});
-		const client = new DaemonClient(socketPath);
-		vi.spyOn(DaemonCatalogClient.prototype, "start").mockResolvedValue();
+		const root = mkdtempSync(join(tmpdir(), "prime-update-drain-unit-"));
+		const commandJournal = new CommandRecoveryJournal(join(root, "commands.jsonl"));
+		const writes: string[] = [];
+		const client = {
+			id: "socket-client",
+			socket: {
+				destroyed: false,
+				write: vi.fn((chunk: string) => {
+					writes.push(chunk);
+					return true;
+				}),
+			},
+		} as unknown as DaemonSocketClient;
+		const handleCommand = vi.fn(async (_client: DaemonSocketClient, command: { id?: string; type: string }) =>
+			failure(command.id, command.type, "handled abort"),
+		);
+		const supervisor = Object.assign(Object.create(DaemonSupervisor.prototype), {
+			ready: Promise.resolve(),
+			workers: new Map(),
+			protocolClientIds: new WeakMap(),
+			commandJournal,
+			mutationDrain: { begin: vi.fn(), end: vi.fn() },
+			updateRestartPhase: "draining",
+			assertCurrentOwnership: vi.fn(async () => undefined),
+			cancelOwnedWorkerCleanup: vi.fn(),
+			handleCommand,
+		}) as unknown as {
+			updateRestartPhase: "draining" | "fencing";
+			handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+		};
 		try {
-			await supervisor.start();
-			await client.connect();
-			const prepare = client.request({ type: "prepare_update_restart" });
-			expect(await client.request({ type: "abort", activeSessionId: "missing" })).not.toMatchObject({
-				error: "Daemon is preparing an update restart",
-			});
-			await prepare;
-			await expect(client.request({ type: "abort", activeSessionId: "missing" })).resolves.toMatchObject({
-				error: "Daemon is preparing an update restart",
-			});
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope({ type: "abort", activeSessionId: "missing" }, "a", "c")),
+			);
+			expect(writes.join(" ")).toContain("handled abort");
+			expect(handleCommand).toHaveBeenCalledOnce();
+			writes.length = 0;
+			supervisor.updateRestartPhase = "fencing";
+			await supervisor.handleLine(
+				client,
+				JSON.stringify(createDaemonCommandEnvelope({ type: "abort", activeSessionId: "missing" }, "b", "c")),
+			);
+			expect(writes.join(" ")).toContain("Daemon is preparing an update restart");
+			expect(handleCommand).toHaveBeenCalledOnce();
 		} finally {
-			client.close();
-			await Reflect.apply(Reflect.get(supervisor, "cleanupSupervisorResources"), supervisor, []);
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("keeps legacy descriptor identity reads out of process-authority decisions", () => {
+		const source = readFileSync(resolve(__dirname, "../src/modes/daemon/daemon-supervisor.ts"), "utf8");
+		const unexpected = source
+			.split("\n")
+			.map((line, index) => ({ line: index + 1, text: line.trim() }))
+			.filter(({ text }) => text.includes("worker.descriptor.processStartId"))
+			.filter(
+				({ text }) =>
+					!text.includes("delete worker.descriptor.processStartId") &&
+					!text.includes("const previousLegacy =") &&
+					!/worker\.descriptor\.processStartId\s*=(?!=)/.test(text),
+			);
+		expect(unexpected).toEqual([]);
 	});
 
 	it("rejects update prepare when a resident worker is recovering or disconnected", async () => {

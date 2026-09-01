@@ -1,9 +1,18 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { KernelManager } from "../src/core/kernel/index.js";
+import { ReplKernelManager } from "../src/core/kernel/index.js";
+import { installTestOrphanProcessJournal } from "./orphan-process-journal-test-helper.js";
+
+function clearInheritedProcessTestEnvironment(): void {
+	for (const name of Object.keys(process.env)) {
+		if (name.startsWith("RLM_") || name.startsWith("PRIME_AGENT_INTERNAL_")) delete process.env[name];
+	}
+}
+
+clearInheritedProcessTestEnvironment();
 
 const runtimePython = resolve("../../prime-agent-runtime/.venv/bin/python");
 const fallbackPython = join(homedir(), ".prime", "agent", "kernel-venv", "bin", "python");
@@ -11,7 +20,7 @@ const fallbackPython = join(homedir(), ".prime", "agent", "kernel-venv", "bin", 
 function resolveKernelPython(): string | null {
 	for (const python of [process.env.PRIME_AGENT_KERNEL_PYTHON, runtimePython, fallbackPython]) {
 		if (!python || !existsSync(python)) continue;
-		const check = spawnSync(python, ["-c", "import ipykernel, mcp, rlm"], { encoding: "utf8" });
+		const check = spawnSync(python, ["-c", "import rlm.repl, mcp, rlm"], { encoding: "utf8" });
 		if (check.status === 0) return python;
 	}
 	return null;
@@ -56,24 +65,27 @@ async function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
 	return !pidExists(pid);
 }
 
-describeIfKernel("real IPython MCP shutdown", { tags: ["kernel-heavy"] }, () => {
+describeIfKernel("real REPL kernel MCP shutdown", { tags: ["kernel-heavy"] }, () => {
 	let dir = "";
 	let fixture = "";
 	let pidFile = "";
+	let restoreJournal = () => {};
 
 	beforeAll(() => {
-		dir = mkdtempSync(join(tmpdir(), "prime-agent-mcp-shutdown-"));
+		dir = mkdtempSync(join(tmpdir(), "prime-agent-repl-mcp-shutdown-"));
+		restoreJournal = installTestOrphanProcessJournal(dir);
 		fixture = join(dir, "stdio_server.py");
 		pidFile = join(dir, "stdio.pid");
 		writeFileSync(fixture, MCP_SERVER);
 	});
 
 	afterAll(() => {
+		restoreJournal();
 		if (dir) rmSync(dir, { recursive: true, force: true });
 	});
 
-	it("closes a stdio MCP child on control-channel shutdown without an AnyIO cross-task error", async () => {
-		let manager: KernelManager | undefined = new KernelManager({
+	it("closes a stdio MCP child on graceful shutdown", async () => {
+		let manager: ReplKernelManager | undefined = new ReplKernelManager({
 			python: python as string,
 			cwd: resolve("../../prime-agent-runtime"),
 			hostHandlers: {
@@ -86,11 +98,11 @@ describeIfKernel("real IPython MCP shutdown", { tags: ["kernel-heavy"] }, () => 
 		});
 		try {
 			const opened = await manager.execute(
-				"import rlm.mcp as mcp; mcp.install_shutdown_hook(); tools = await mcp.list_tools('fixture'); [t['name'] for t in tools]",
+				"import rlm.mcp as mcp; tools = await mcp.list_tools('fixture'); [t['name'] for t in tools]",
 			);
 			expect(opened.status, opened.stderr || opened.error?.traceback.join("\n")).toBe("ok");
 			expect(opened.result).toContain("fixture.echo");
-			const childPid = Number(await import("node:fs/promises").then(({ readFile }) => readFile(pidFile, "utf8")));
+			const childPid = Number(readFileSync(pidFile, "utf8"));
 			expect(pidExists(childPid)).toBe(true);
 
 			await manager.shutdown();

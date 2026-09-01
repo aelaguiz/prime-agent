@@ -106,10 +106,13 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 
 const spawnMock = vi.hoisted(() => {
 	const calls: string[][] = [];
+	const options: unknown[] = [];
 	return {
 		calls,
+		options,
 		mockSpawn: (...args: unknown[]) => {
 			calls.push(args[1] as string[]);
+			options.push(args[2]);
 			return {
 				unref: () => {},
 				kill: () => {},
@@ -130,6 +133,7 @@ vi.mock("node:child_process", async (importOriginal) => {
 });
 
 import { handleDaemonCommand } from "../src/cli/daemon-command.js";
+import { PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX } from "../src/core/session-lease.js";
 
 describe("daemon command", () => {
 	let consoleErrorMessages: unknown[];
@@ -560,6 +564,24 @@ describe("daemon command", () => {
 		// DaemonClient is constructed before runCreate parses session args
 		expect(daemonClientMock.instances.length).toBe(1);
 		expect(daemonClientMock.instances[0]?.requests.length).toBe(0);
+	});
+
+	it("launches daemon start with an exact supervisor owner argv0", async () => {
+		daemonClientMock.behavior.connectFails = true;
+		spawnMock.calls.length = 0;
+		spawnMock.options.length = 0;
+
+		await handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent-owner-argv0.sock", "start"]);
+
+		expect(spawnMock.calls).toHaveLength(1);
+		if (process.platform !== "win32") {
+			expect(spawnMock.calls[0]).toContain("/tmp/prime-agent-owner-argv0.sock");
+			expect(spawnMock.calls[0]).not.toContain("/private/tmp/prime-agent-owner-argv0.sock");
+		}
+		const argv0 = (spawnMock.options[0] as { argv0?: unknown }).argv0;
+		expect(typeof argv0).toBe("string");
+		expect((argv0 as string).startsWith(PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX)).toBe(true);
+		expect((argv0 as string).slice(PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX.length)).toMatch(/^[0-9a-f]{64}$/);
 	});
 
 	it("does not leak --goal/--goal-token-budget into daemon startup args", async () => {

@@ -1,11 +1,15 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getBundledSkillsDir } from "../src/config.js";
-import { KernelManager, type KernelSentAgentMessage } from "../src/core/kernel/index.js";
+import { type KernelSentAgentMessage, ReplKernelManager } from "../src/core/kernel/index.js";
 import type { PythonSkillRuntimeInfo } from "../src/core/skills.js";
 import { IpythonKernelProvisioner } from "../src/core/tools/ipython.js";
+import { installTestOrphanProcessJournal } from "./orphan-process-journal-test-helper.js";
+
+const runtimePython = join(dirname(fileURLToPath(import.meta.url)), "../../../prime-agent-runtime/.venv/bin/python");
 
 function bundledAgentMessageSkill(): PythonSkillRuntimeInfo {
 	const packagePath = join(getBundledSkillsDir(), "agent-message");
@@ -28,21 +32,27 @@ type LateHandlerRetentionHost = {
 describe("agent-message skill over the kernel host bridge", () => {
 	let tempDir: string;
 	let provisioner: IpythonKernelProvisioner | undefined;
+	let restoreJournal = () => {};
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-agent-message-skill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 		mkdirSync(tempDir, { recursive: true });
+		restoreJournal = installTestOrphanProcessJournal(tempDir);
 	});
 
 	afterEach(async () => {
 		await provisioner?.dispose();
 		provisioner = undefined;
+		restoreJournal();
+		restoreJournal = () => {};
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("lists agents and sends without exposing a spoofable sender", async () => {
 		const requests: Array<{ type: string; payload: Record<string, unknown> }> = [];
 		provisioner = new IpythonKernelProvisioner(tempDir, {
+			python: runtimePython,
+			env: { PYTHONPATH: join(getBundledSkillsDir(), "agent-message", "src") },
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
 				"agent_message.list_agents": async (payload) => {
@@ -116,6 +126,8 @@ print(json.dumps({"agents": agents, "receipt": receipt}, sort_keys=True))
 
 	it("emits successful broadcast receipts and leaves short errors in the result", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
+			python: runtimePython,
+			env: { PYTHONPATH: join(getBundledSkillsDir(), "agent-message", "src") },
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
 				"agent_message.send": async (payload) => ({
@@ -161,6 +173,8 @@ print(json.dumps(receipt, sort_keys=True))
 
 	it("rejects broadcast combined with role selectors before reaching the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
+			python: runtimePython,
+			env: { PYTHONPATH: join(getBundledSkillsDir(), "agent-message", "src") },
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
 				"agent_message.send": async () => {
@@ -182,6 +196,8 @@ except TypeError as error:
 
 	it("rejects a positional name target before reaching the host", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
+			python: runtimePython,
+			env: { PYTHONPATH: join(getBundledSkillsDir(), "agent-message", "src") },
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
 				"agent_message.send": async () => {
@@ -205,6 +221,8 @@ except TypeError as error:
 
 	it("does not expose a queueable delivery mode", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
+			python: runtimePython,
+			env: { PYTHONPATH: join(getBundledSkillsDir(), "agent-message", "src") },
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
 				"agent_message.send": async () => {
@@ -226,6 +244,8 @@ except TypeError as error:
 
 	it("captures sent messages from detached tasks after the cell is idle", async () => {
 		provisioner = new IpythonKernelProvisioner(tempDir, {
+			python: runtimePython,
+			env: { PYTHONPATH: join(getBundledSkillsDir(), "agent-message", "src") },
 			pythonSkills: [bundledAgentMessageSkill()],
 			hostHandlers: {
 				"agent_message.send": async (payload) => ({
@@ -266,7 +286,7 @@ background_send = asyncio.create_task(send_later())`,
 	});
 
 	it("bounds retained handlers for late sent messages", async () => {
-		const manager = new KernelManager({ cwd: tempDir });
+		const manager = new ReplKernelManager({ cwd: tempDir });
 		const host = manager as unknown as LateHandlerRetentionHost;
 		const handler = () => {};
 
@@ -277,6 +297,6 @@ background_send = asyncio.create_task(send_later())`,
 		expect(host.lateSentAgentMessageHandlers.size).toBe(256);
 		expect(host.lateSentAgentMessageHandlers.has("request-0")).toBe(false);
 		expect(host.lateSentAgentMessageHandlers.has("request-299")).toBe(true);
-		await manager.dispose();
+		await manager.shutdown({ snapshot: true, drainHostRequests: true });
 	});
 });

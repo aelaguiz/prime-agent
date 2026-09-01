@@ -13,6 +13,7 @@ export default defineConfig({
 		environment: "node",
 		testTimeout: 30000,
 		globalSetup: ["./test/global-setup.ts"],
+		env: { DO_NOT_TRACK: "1" },
 		tags: [
 			{
 				name: "process-stress",
@@ -20,11 +21,11 @@ export default defineConfig({
 			},
 			{
 				name: "kernel-heavy",
-				description: "Boots a real IPython kernel and syncs skills into the shared venv",
+				description: "Boots a real Python REPL and syncs skills into the shared venv",
 			},
 		],
-		// Kernel-heavy tests are excluded from the default sharded run: several files
-		// booting real kernels in one shard starve the neighbouring kernel tests that
+		// REPL-heavy tests are excluded from the default sharded run: several files
+		// booting real Python REPLs in one shard starve neighbouring REPL tests that
 		// rely on the 30s default timeout. `test:kernel` runs them on their own.
 		tagsFilter: ["!process-stress", "!kernel-heavy"],
 		server: {

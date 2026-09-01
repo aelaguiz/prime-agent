@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
+import { isDaemonSessionSummary } from "../src/cli/daemon-launch.js";
 import {
 	createDaemonCommandEnvelope,
 	createDaemonEventEnvelope,
 	createDaemonEventMeta,
 	createDaemonReplayInfo,
 	DAEMON_COMMAND_COMPATIBILITY,
+	DAEMON_COMMAND_PLANE,
 	DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	DAEMON_OUTBOUND_COMPATIBILITY,
 	DAEMON_PROTOCOL_INFO,
@@ -19,11 +21,15 @@ import {
 	getDaemonCommandCompatibilities,
 	isDaemonCommandEnvelope,
 	isDaemonMutatingCommand,
+	isSessionPlaneDaemonCommand,
+	parseDaemonSupervisorHelloIdentity,
 	salvageDaemonCommandId,
 } from "../src/modes/daemon/daemon-protocol.js";
 import {
 	type DaemonWorkerDescriptor,
 	durableDaemonWorkerDescriptor,
+	isDaemonWorkerDescriptor,
+	parseDaemonWorkerDescriptor,
 } from "../src/modes/daemon/daemon-worker-protocol.js";
 
 describe("daemon protocol helpers", () => {
@@ -32,12 +38,14 @@ describe("daemon protocol helpers", () => {
 			version: 1,
 			workerId: "worker",
 			pid: 123,
-			processStartId: "process-start",
+			processStartId: "proc:123",
 			socketPath: "/tmp/worker.sock",
 			recoveryJournalPath: "/state/recovery.jsonl",
 			orphanProcessJournalPath: "/state/orphans.jsonl",
+			orphanProcessJournalGeneration: "generation-1",
 			supervisorSocketPath: "/tmp/supervisor.sock",
 			authenticationToken: "local-worker-token",
+			workerInstanceId: "instance-1",
 			rootActiveSessionId: "active",
 			sessionFile: "/sessions/root.jsonl",
 			createdAt: "2026-01-01T00:00:00.000Z",
@@ -58,6 +66,14 @@ describe("daemon protocol helpers", () => {
 			},
 			launchEnv: { PROVIDER_TOKEN: "secret-top-level-env" },
 			consecutiveFailures: 0,
+			stopRequestedAt: "2026-01-01T00:00:01.000Z",
+			cleanup: {
+				version: 1,
+				state: "cleanup-proven",
+				token: "A".repeat(43),
+				authorityFingerprint: "a".repeat(64),
+				provenAt: "2026-01-01T00:00:02.000Z",
+			},
 			lastError: "secret-error",
 		} as unknown as DaemonWorkerDescriptor;
 
@@ -67,11 +83,157 @@ describe("daemon protocol helpers", () => {
 		expect(durable.createCommand).toEqual({ type: "create", sessionPath: "/sessions/root.jsonl" });
 		expect(durable).toMatchObject({
 			workerId: "worker",
+			workerInstanceId: "instance-1",
 			sessionFile: "/sessions/root.jsonl",
 			sessionDir: "/legacy/sessions",
 			telemetryDisabled: true,
+			cleanup: {
+				version: 1,
+				state: "cleanup-proven",
+				token: "A".repeat(43),
+				authorityFingerprint: "a".repeat(64),
+			},
 		});
 		expect(JSON.stringify(durable)).not.toContain("secret-");
+		expect(isDaemonWorkerDescriptor(durable)).toBe(true);
+
+		const invalidProof = {
+			...durable,
+			cleanup: { ...durable.cleanup!, token: "too-short" },
+		} as DaemonWorkerDescriptor;
+		expect(isDaemonWorkerDescriptor(invalidProof)).toBe(false);
+		expect(parseDaemonWorkerDescriptor(invalidProof)?.cleanup).toBeUndefined();
+		expect(durableDaemonWorkerDescriptor(invalidProof).cleanup).toBeUndefined();
+	});
+
+	it("keeps exact worker authority separate from signal-unsafe legacy projections", () => {
+		const base = durableDaemonWorkerDescriptor({
+			version: 2,
+			workerId: "dual-worker",
+			pid: 123,
+			socketPath: "/tmp/worker.sock",
+			recoveryJournalPath: "/state/recovery.jsonl",
+			supervisorSocketPath: "/tmp/supervisor.sock",
+			authenticationToken: "token",
+			rootActiveSessionId: "active",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			lifecycle: "ready",
+			createCommand: { type: "create" },
+			consecutiveFailures: 0,
+		});
+		const linuxExact = "proc:11111111-1111-1111-1111-111111111111:123";
+		const transitional = { ...base, processStartId: "proc:123", authorityProcessStartId: linuxExact };
+		expect(isDaemonWorkerDescriptor(transitional)).toBe(true);
+		expect(durableDaemonWorkerDescriptor(transitional).processStartId).toBeUndefined();
+		expect(durableDaemonWorkerDescriptor(transitional).authorityProcessStartId).toBe(linuxExact);
+		expect(isDaemonWorkerDescriptor({ ...transitional, processStartId: "proc:999" })).toBe(false);
+		expect(isDaemonWorkerDescriptor({ ...base, authorityProcessStartId: "proc:123" })).toBe(false);
+		expect(
+			isDaemonWorkerDescriptor({
+				...transitional,
+				authorityProcessIdentityHint: "diagnostic-only",
+			}),
+		).toBe(false);
+		const hint = "ps:lstart:Mon Jan 01 00:00:00 2026";
+		expect(
+			isDaemonWorkerDescriptor({
+				...base,
+				processIdentityHint: hint,
+				authorityProcessIdentityHint: hint,
+			}),
+		).toBe(true);
+		for (const invalid of [
+			{
+				...base,
+				processStartId: "ps:Mon Jan 01 00:00:00 2026",
+				authorityProcessStartId: `token:${"a".repeat(64)}`,
+			},
+			{ ...base, authorityProcessStartId: linuxExact, processIdentityHint: hint },
+			{ ...base, processStartId: "proc:123", authorityProcessIdentityHint: hint },
+			{ ...base, processIdentityHint: hint, authorityProcessIdentityHint: `${hint}-other` },
+			{ ...base, processIdentityHint: "ps:lstart:bad\rvalue" },
+			{ ...base, processIdentityHint: `ps:lstart:${"x".repeat(1_025)}` },
+			{ ...base, processStartId: `ps:${"x".repeat(1_025)}` },
+			{ ...base, processStartId: "proc:00" },
+		]) {
+			expect(isDaemonWorkerDescriptor(invalid)).toBe(false);
+		}
+	});
+
+	it("migrates old exact worker fields and retains bare proc fields", () => {
+		const base = durableDaemonWorkerDescriptor({
+			version: 2,
+			workerId: "old-worker",
+			pid: 123,
+			socketPath: "/tmp/worker.sock",
+			recoveryJournalPath: "/state/recovery.jsonl",
+			supervisorSocketPath: "/tmp/supervisor.sock",
+			authenticationToken: "token",
+			rootActiveSessionId: "active",
+			createdAt: "2026-01-01T00:00:00.000Z",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			lifecycle: "ready",
+			createCommand: { type: "create" },
+			consecutiveFailures: 0,
+		});
+		const exact = "proc:11111111-1111-1111-1111-111111111111:123";
+		const migrated = parseDaemonWorkerDescriptor({ ...base, processStartId: exact });
+		expect(migrated).toMatchObject({ authorityProcessStartId: exact, processStartId: "proc:123" });
+		expect(parseDaemonWorkerDescriptor({ ...base, processStartId: "proc:123" })).toMatchObject({
+			processStartId: "proc:123",
+		});
+		const windows = durableDaemonWorkerDescriptor({
+			...base,
+			processStartId: "win:123",
+			authorityProcessStartId: "win:123",
+		});
+		expect(windows).toMatchObject({ processStartId: "win:123", authorityProcessStartId: "win:123" });
+	});
+
+	it("parses schema-24 supervisor hello identity without legacy signal side doors", () => {
+		const linux = "proc:11111111-1111-1111-1111-111111111111:123";
+		const token = `token:${"a".repeat(64)}`;
+		expect(parseDaemonSupervisorHelloIdentity({ supervisorAuthorityProcessStartId: linux })).toEqual({
+			status: "exact",
+			authorityProcessStartId: linux,
+		});
+		expect(parseDaemonSupervisorHelloIdentity({ supervisorAuthorityProcessStartId: token })).toEqual({
+			status: "exact",
+			authorityProcessStartId: token,
+		});
+		expect(
+			parseDaemonSupervisorHelloIdentity({
+				supervisorProcessStartId: "win:123",
+				supervisorAuthorityProcessStartId: "win:123",
+			}),
+		).toEqual({ status: "exact", authorityProcessStartId: "win:123", legacyProcessStartId: "win:123" });
+		for (const exact of [linux, token, "win:123"]) {
+			expect(parseDaemonSupervisorHelloIdentity({ supervisorProcessStartId: exact })).toEqual({
+				status: "exact",
+				authorityProcessStartId: exact,
+				legacyProcessStartId: exact,
+			});
+		}
+		for (const legacy of ["proc:123", "ps:Mon Jan 01 00:00:00 2026"]) {
+			expect(parseDaemonSupervisorHelloIdentity({ supervisorProcessStartId: legacy })).toEqual({
+				status: "legacy-only",
+				legacyProcessStartId: legacy,
+			});
+		}
+		for (const invalid of [
+			{},
+			{ supervisorAuthorityProcessStartId: "proc:123" },
+			{ supervisorProcessStartId: "proc:123", supervisorAuthorityProcessStartId: linux },
+			{ supervisorProcessStartId: `ps:now`, supervisorAuthorityProcessStartId: token },
+			{ supervisorProcessStartId: "proc:00" },
+			{ supervisorProcessStartId: "proc:18446744073709551616" },
+			{ supervisorProcessStartId: `ps:${"x".repeat(1_025)}` },
+			{ supervisorProcessStartId: "ps:bad\rvalue" },
+			{ supervisorProcessStartId: "win:999", supervisorAuthorityProcessStartId: "win:123" },
+		]) {
+			expect(parseDaemonSupervisorHelloIdentity(invalid).status).toBe("invalid");
+		}
 	});
 
 	it("keeps the advertised schema identity synchronized with wire type shapes", () => {
@@ -136,10 +298,10 @@ describe("daemon protocol helpers", () => {
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toContain("acp_mcp_servers");
 	});
 
-	it("publishes the composed revision with both AIM handoff and ACP MCP capabilities", () => {
-		expect(DAEMON_SCHEMA_REVISION).toBe(23);
+	it("publishes schema 24 with AIM, ACP MCP, and on-demand peer capabilities", () => {
+		expect(DAEMON_SCHEMA_REVISION).toBe(24);
 		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).toEqual(
-			expect.arrayContaining(["aim_credential_handoff", "acp_mcp_servers"]),
+			expect.arrayContaining(["aim_credential_handoff", "acp_mcp_servers", "agent_peer_list"]),
 		);
 		expect(DAEMON_COMMAND_COMPATIBILITY.handoff_aim_credential).toEqual({
 			minProtocol: 7,
@@ -151,6 +313,12 @@ describe("daemon protocol helpers", () => {
 			minSchemaRevision: 22,
 			capability: "acp_mcp_servers",
 		});
+		expect(DAEMON_COMMAND_COMPATIBILITY.list_agent_peers).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 24,
+			capability: "agent_peer_list",
+		});
+		expect(isDaemonMutatingCommand({ type: "list_agent_peers" })).toBe(false);
 	});
 
 	it("capability-gates the optional model catalog surface", () => {
@@ -384,8 +552,48 @@ describe("daemon protocol helpers", () => {
 	it("keeps attachment routing out of the durable mutation journal", () => {
 		expect(isDaemonMutatingCommand({ type: "attach" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "reattach" })).toBe(false);
+		// Journal replays after a reconnect would skip re-subscribing the new socket.
+		expect(isDaemonMutatingCommand({ type: "roster_subscribe" })).toBe(false);
+		expect(isDaemonMutatingCommand({ type: "roster_unsubscribe" })).toBe(false);
 		expect(isDaemonMutatingCommand({ type: "wait_for_headless_completion" })).toBe(true);
 		expect(isDaemonMutatingCommand({ type: "switch_session" })).toBe(true);
+	});
+
+	it("keeps the roster push additive for pre-roster clients", () => {
+		// Subscription commands and the push are capability-gated; a client that
+		// never sends roster_subscribe is never written a roster_update.
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_subscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_COMMAND_COMPATIBILITY.roster_unsubscribe).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		expect(DAEMON_OUTBOUND_COMPATIBILITY.roster_update).toEqual({ minProtocol: 7, capability: "agent_roster" });
+		// list responses now carry rosterStatus/statusLabel/lastHeardFromAt; the
+		// summary validator pre-roster clients shipped stays open to additive fields.
+		expect(
+			isDaemonSessionSummary({
+				id: "session-1",
+				activeSessionId: "active-1",
+				rosterStatus: "running",
+				statusLabel: "queued",
+				lastHeardFromAt: "2026-08-01T12:00:00.000Z",
+			}),
+		).toBe(true);
+	});
+
+	it("capability-gates direct worker transport discovery as a supervisor-only surface", () => {
+		expect(DAEMON_COMMAND_COMPATIBILITY.get_direct_worker_transport).toEqual({
+			minProtocol: 7,
+			minSchemaRevision: 25,
+			capability: "direct_peer_transport",
+		});
+		// Only the supervisor issues tickets; workers and standalone daemons must not advertise it.
+		expect(DAEMON_DEFAULT_SERVER_CAPABILITIES).not.toContain("direct_peer_transport");
+		expect(isDaemonMutatingCommand({ type: "get_direct_worker_transport" })).toBe(false);
+	});
+
+	it("classifies every command plane and never defaults unknown commands to the session plane", () => {
+		// A worker "list" means only that worker's sessions; the supervisor list is authoritative.
+		expect(DAEMON_COMMAND_PLANE.list).toBe("control");
+		expect(DAEMON_COMMAND_PLANE.prompt).toBe("session");
+		expect(isSessionPlaneDaemonCommand("no_such_command")).toBe(false);
 	});
 
 	it("reports replay availability from resume cursors", () => {

@@ -18,12 +18,16 @@ import { describe, expect, it, vi } from "vitest";
 import {
 	AGENT_FAMILY_REACH_ERROR,
 	type AgentSessionMessageController,
+	createAgentMessageHostHandlers,
 	DEFAULT_AGENT_MESSAGE_MAX_CHARS,
 	sessionNameReservationKey,
 } from "../src/core/agent-messages.js";
 import type { AgentObserveController } from "../src/core/agent-observe.js";
 import type { CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.js";
+import { flushAgentTraceUpload, installAgentTraceUpload } from "../src/core/agent-traces.js";
+import { AuthStorage } from "../src/core/auth-storage.js";
 import type { AgentCronJob, AgentCronJobStore } from "../src/core/cron-jobs.js";
+import { PRIME_AGENT_TRACES_PROVIDER_ID } from "../src/core/prime-inference-auth.js";
 import {
 	type CreateRlmSubagentRuntimeOptions,
 	createDefaultRlmSubagentSessionName,
@@ -31,6 +35,7 @@ import {
 } from "../src/core/rlm-runtime.js";
 import { canonicalSessionPath } from "../src/core/session-lease.js";
 import { readSessionInfo, type SessionInfo, SessionManager } from "../src/core/session-manager.js";
+import { SettingsManager } from "../src/core/settings-manager.js";
 import type { ActiveSessionState, DaemonSocketClient } from "../src/modes/daemon/active-session-state.js";
 import {
 	AgentDaemon,
@@ -54,7 +59,7 @@ import {
 } from "../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 import { DAEMON_WORKER_SUPERVISOR_SOCKET_ENV } from "../src/modes/daemon/daemon-worker-protocol.js";
-import { RlmSpawnLedger } from "../src/modes/daemon/rlm-ledger.js";
+import { RlmSpawnLedger, rlmLedgerPath } from "../src/modes/daemon/rlm-ledger.js";
 
 describe("daemon mode helpers", () => {
 	it("preserves envelope client identity while registering prompt admission", () => {
@@ -67,6 +72,103 @@ describe("daemon mode helpers", () => {
 
 		parse(client, JSON.stringify(createDaemonCommandEnvelope({ type: "list" }, "request-1", "public-client")));
 		expect(client.id).toBe("public-client");
+	});
+
+	it("waits for overlapping Bash commands with a bounded close deadline", async () => {
+		vi.useFakeTimers();
+		try {
+			const daemon = new AgentDaemon("/tmp/unused-daemon.sock", {
+				defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+				createRuntime: vi.fn(),
+			});
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonOutbound | undefined>;
+				abortBashForClose(state: ActiveSessionState): Promise<void>;
+			};
+
+			let resolveFirstBash!: () => void;
+			let resolveSecondBash!: () => void;
+			const firstBash = new Promise<void>((resolve) => {
+				resolveFirstBash = resolve;
+			});
+			const secondBash = new Promise<void>((resolve) => {
+				resolveSecondBash = resolve;
+			});
+			let isBashRunning = false;
+			const abortBash = vi.fn();
+			const state = makeState("active");
+			state.runtime = {
+				...state.runtime,
+				session: {
+					get isBashRunning() {
+						return isBashRunning;
+					},
+					runUserBash: vi.fn(() => {
+						isBashRunning = true;
+						return firstBash;
+					}),
+					executeBash: vi.fn(() => secondBash),
+					abortBash,
+				},
+			} as never;
+			internals.sessions.set(state.activeSessionId, state);
+			const client = makeClient("client", state.activeSessionId);
+
+			await internals.handleCommand(client, {
+				id: "first",
+				type: "execute_bash",
+				activeSessionId: state.activeSessionId,
+				command: "first",
+			});
+			const secondResponse = internals.handleCommand(client, {
+				id: "second",
+				type: "execute_bash_and_wait",
+				activeSessionId: state.activeSessionId,
+				command: "second",
+			});
+			resolveSecondBash();
+			await secondResponse;
+
+			const closing = internals.abortBashForClose(state);
+			expect(await Promise.race([closing.then(() => "done"), Promise.resolve("pending")])).toBe("pending");
+			resolveFirstBash();
+			await expect(closing).resolves.toBeUndefined();
+			expect(abortBash).toHaveBeenCalledOnce();
+
+			let isStalledBashRunning = false;
+			const abortStalledBash = vi.fn();
+			const stalledState = makeState("stalled");
+			stalledState.runtime = {
+				...stalledState.runtime,
+				session: {
+					get isBashRunning() {
+						return isStalledBashRunning;
+					},
+					runUserBash: vi.fn(() => {
+						isStalledBashRunning = true;
+						return new Promise<void>(() => {});
+					}),
+					abortBash: abortStalledBash,
+				},
+			} as never;
+			internals.sessions.set(stalledState.activeSessionId, stalledState);
+			await internals.handleCommand(makeClient("stalled-client", stalledState.activeSessionId), {
+				id: "stalled",
+				type: "execute_bash",
+				activeSessionId: stalledState.activeSessionId,
+				command: "stalled",
+			});
+
+			const stalledClose = internals.abortBashForClose(stalledState);
+			await vi.advanceTimersByTimeAsync(4999);
+			expect(await Promise.race([stalledClose.then(() => "done"), Promise.resolve("pending")])).toBe("pending");
+			await vi.advanceTimersByTimeAsync(1);
+			await expect(stalledClose).resolves.toBeUndefined();
+			expect(abortStalledBash).toHaveBeenCalledOnce();
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("normalizes daemon session names before validation and persistence", async () => {
@@ -94,6 +196,96 @@ describe("daemon mode helpers", () => {
 		expect(setSessionName).toHaveBeenCalledWith("normalized");
 		await expect(internals.setStateSessionName(state, "   ")).rejects.toThrow("Session name cannot be empty");
 		expect(setSessionName).toHaveBeenCalledOnce();
+	});
+
+	it("uses a supervisor-approved worker session name without validating it again", async () => {
+		const daemon = new AgentDaemon("/tmp/unused-worker.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+			worker: { authenticationToken: "token" },
+		});
+		const setSessionName = vi.fn();
+		const state = makeState("active");
+		state.runtime = {
+			...state.runtime,
+			session: { setSessionName },
+		} as never;
+		const assertStateSessionNameAvailable = vi.fn(async () => {
+			throw new Error("stale peer name");
+		});
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			assertStateSessionNameAvailable: typeof assertStateSessionNameAvailable;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonOutbound | undefined>;
+		};
+		internals.sessions.set(state.activeSessionId, state);
+		internals.assertStateSessionNameAvailable = assertStateSessionNameAvailable;
+
+		await expect(
+			internals.handleCommand(makeClient("supervisor", state.activeSessionId), {
+				type: "set_session_name",
+				activeSessionId: state.activeSessionId,
+				name: "approved",
+			}),
+		).resolves.toMatchObject({ success: true });
+		expect(assertStateSessionNameAvailable).not.toHaveBeenCalled();
+		expect(setSessionName).toHaveBeenCalledWith("approved");
+	});
+
+	it("keeps a custom worker ledger directory after restart and rejects drift", () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-daemon-worker-ledger-restart-"));
+		try {
+			const defaultSessions = join(directory, "default-sessions");
+			const customSessions = join(directory, "custom-sessions");
+			const driftedSessions = join(directory, "drifted-sessions");
+			mkdirSync(defaultSessions, { recursive: true });
+			mkdirSync(customSessions, { recursive: true });
+			mkdirSync(driftedSessions, { recursive: true });
+			const createWorker = () =>
+				new AgentDaemon(join(directory, "worker.sock"), {
+					defaultSessionConfig: { agentDir: directory, cwd: directory, sessionDir: defaultSessions },
+					createRuntime: vi.fn(),
+					worker: { authenticationToken: "token" },
+				});
+			const bind = (daemon: AgentDaemon) =>
+				daemon as unknown as {
+					bindWorkerSessionsDir(
+						command: Extract<DaemonCommand, { type: "create" }>,
+						config: { agentDir: string; cwd: string; sessionDir?: string },
+					): { sessionDir?: string };
+					workerScopedSessionsDir(requested?: string): string | undefined;
+					rlmSpawnLedger(): RlmSpawnLedger;
+				};
+			const rootCreate = {
+				type: "create" as const,
+				config: { agentDir: directory, cwd: directory, sessionDir: customSessions },
+			};
+
+			const initial = bind(createWorker());
+			expect(() => initial.rlmSpawnLedger()).toThrow("not bound to its root create command");
+			expect(initial.bindWorkerSessionsDir(rootCreate, rootCreate.config).sessionDir).toBe(customSessions);
+			expect(initial.rlmSpawnLedger().ledgerPath).toBe(rlmLedgerPath(directory, customSessions));
+
+			const restarted = bind(createWorker());
+			expect(restarted.bindWorkerSessionsDir(rootCreate, rootCreate.config).sessionDir).toBe(customSessions);
+			expect(restarted.rlmSpawnLedger().ledgerPath).toBe(rlmLedgerPath(directory, customSessions));
+			expect(restarted.workerScopedSessionsDir()).toBe(customSessions);
+			expect(() => restarted.workerScopedSessionsDir(driftedSessions)).toThrow("refusing drift");
+			expect(
+				restarted.bindWorkerSessionsDir(
+					{ type: "create" },
+					{ agentDir: directory, cwd: directory, sessionDir: defaultSessions },
+				).sessionDir,
+			).toBe(customSessions);
+			expect(() =>
+				restarted.bindWorkerSessionsDir(
+					{ type: "create", config: { sessionDir: driftedSessions } },
+					{ agentDir: directory, cwd: directory, sessionDir: driftedSessions },
+				),
+			).toThrow("refusing drift");
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	it("treats a depth-zero fork as a sibling of another root", () => {
@@ -276,6 +468,26 @@ describe("daemon mode helpers", () => {
 			servers: [],
 		});
 		expect(releaseAcpMcpServers).toHaveBeenLastCalledWith("other-token", ["other"]);
+	});
+
+	it("fails fast on unknown worker commands instead of dropping them", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-unknown-worker-command.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const internals = daemon as unknown as {
+			handleWorkerCommand(client: DaemonSocketClient, command: unknown): Promise<void>;
+			write: ReturnType<typeof vi.fn>;
+		};
+		internals.write = vi.fn();
+		const client = makeClient("legacy-supervisor", "active");
+
+		await internals.handleWorkerCommand(client, { id: "legacy-1", type: "worker_sync_agent_peers", peers: [] });
+
+		expect(internals.write).toHaveBeenCalledWith(
+			client,
+			expect.objectContaining({ id: "legacy-1", command: "worker_sync_agent_peers", success: false }),
+		);
 	});
 
 	it("cancels pending extension UI requests directly", () => {
@@ -503,6 +715,36 @@ describe("daemon mode helpers", () => {
 		expect(second.runtime.session.setSessionName).toHaveBeenCalledWith("worker");
 	});
 
+	it("restores the previous in-memory name when durable ledger rename fails", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-rename-rollback.sock", {
+			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
+			createRuntime: vi.fn(),
+		});
+		const state = makeState("rename-rollback");
+		let sessionName = "old-name";
+		const session = {
+			get sessionName() {
+				return sessionName;
+			},
+			setSessionName: vi.fn((name: string) => {
+				sessionName = name;
+			}),
+		};
+		state.runtime = { ...state.runtime, session } as never;
+		const internals = daemon as unknown as {
+			appendRlmLedgerRenameForState: ReturnType<typeof vi.fn>;
+			applyStateSessionName(state: ActiveSessionState, name: string): Promise<void>;
+		};
+		internals.appendRlmLedgerRenameForState = vi.fn(async () => {
+			throw new Error("ledger unavailable");
+		});
+
+		await expect(internals.applyStateSessionName(state, "new-name")).rejects.toThrow("ledger unavailable");
+		expect(session.sessionName).toBe("old-name");
+		expect(session.setSessionName).toHaveBeenNthCalledWith(1, "new-name");
+		expect(session.setSessionName).toHaveBeenNthCalledWith(2, "old-name");
+	});
+
 	it("scopes a switched child rename from its session-relative persisted parent header", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-switched-child-name-"));
 		try {
@@ -548,120 +790,26 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("keeps fresh local rows over stale synced peers in the family catalog", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-local-precedence.sock", {
-			defaultSessionConfig: { agentDir: "/tmp", cwd: "/tmp" },
-			createRuntime: vi.fn(),
-		});
-		const state = makeState("local-active");
-		state.runtime = {
-			...state.runtime,
-			cwd: "/tmp",
-			metadata: { kind: "top-level", createdAt: 1 },
-			session: {
-				sessionId: "shared-session",
-				sessionName: "fresh-local",
-				isSessionActive: false,
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				hasRunningRlmChildren: () => false,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			remoteAgentPeers: Map<string, Record<string, unknown>>;
-			createAgentFamilyCatalog(): Promise<Array<{ id: string; name?: string }>>;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		internals.remoteAgentPeers.set("stale-active", {
-			activeSessionId: "stale-active",
-			sessionId: "shared-session",
-			sessionName: "stale-peer",
-			runtimeKind: "top-level",
-			cwd: "/tmp",
-			isStreaming: false,
-			unfinishedActionCount: 0,
-		});
-		const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
-		try {
-			expect(await internals.createAgentFamilyCatalog()).toContainEqual(
-				expect.objectContaining({ id: "shared-session", name: "fresh-local" }),
-			);
-		} finally {
-			listAll.mockRestore();
-		}
-	});
-
-	it("canonicalizes symlinked paths in the family catalog and name reservations", async () => {
+	it("canonicalizes symlinked parent paths in name reservations", () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-family-catalog-paths-"));
 		try {
 			const realDir = join(tempDir, "real");
 			const aliasDir = join(tempDir, "alias");
 			mkdirSync(realDir);
 			symlinkSync(realDir, aliasDir, "dir");
-			const parentPath = join(realDir, "parent.jsonl");
-			writeFileSync(parentPath, "");
-			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
-				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: tempDir },
-				createRuntime: vi.fn(),
-			});
-			const parent = makeState("parent");
-			parent.runtime = {
-				...parent.runtime,
-				cwd: tempDir,
-				metadata: { kind: "top-level", createdAt: 1 },
-				session: {
-					sessionId: "session-parent",
-					sessionName: "parent",
-					sessionFile: parentPath,
-					sessionManager: { getSessionArtifactDir: () => undefined },
-					rlmDepth: 0,
-					isStreaming: false,
-					isSessionActive: false,
-					unfinishedActionCount: 0,
-					hasRunningRlmChildren: () => false,
-				},
-			} as never;
-			const child = {
-				activeSessionId: "child-active",
-				sessionId: "session-child",
-				sessionName: "child",
-				runtimeKind: "subagent",
-				cwd: tempDir,
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				parentSessionPath: join(aliasDir, "parent.jsonl"),
-				rlmDepth: 1,
-				status: "idle",
-			};
-			const internals = daemon as unknown as {
-				sessions: Map<string, ActiveSessionState>;
-				remoteAgentPeers: Map<string, typeof child>;
-				createAgentFamilyRoster(state: ActiveSessionState): Promise<{ entries: Array<{ id: string }> }>;
-			};
-			internals.sessions.set(parent.activeSessionId, parent);
-			internals.remoteAgentPeers.set(child.activeSessionId, child);
-			const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
-			try {
-				expect(await internals.createAgentFamilyRoster(parent)).toMatchObject({
-					entries: [expect.objectContaining({ id: "session-child" })],
-				});
-				expect(
-					sessionNameReservationKey({
-						name: "worker",
-						depth: 1,
-						parentSessionPath: parentPath,
-					}),
-				).toBe(
-					sessionNameReservationKey({
-						name: "worker",
-						depth: 1,
-						parentSessionPath: join(aliasDir, "parent.jsonl"),
-					}),
-				);
-			} finally {
-				listAll.mockRestore();
-			}
+			expect(
+				sessionNameReservationKey({
+					name: "worker",
+					depth: 1,
+					parentSessionPath: join(realDir, "parent.jsonl"),
+				}),
+			).toBe(
+				sessionNameReservationKey({
+					name: "worker",
+					depth: 1,
+					parentSessionPath: join(aliasDir, "parent.jsonl"),
+				}),
+			);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -764,6 +912,8 @@ describe("daemon mode helpers", () => {
 		});
 		const parentState = makeState("parent");
 		const childState = makeState("child", parentState.activeSessionId);
+		Object.assign(parentState.runtime, { session: { sessionId: "parent-session" } });
+		Object.assign(childState.runtime, { session: { sessionId: "child-session" } });
 		Object.assign(childState.runtime.metadata, {
 			kind: "subagent",
 			parentActiveSessionId: parentState.activeSessionId,
@@ -771,11 +921,29 @@ describe("daemon mode helpers", () => {
 		});
 		let internals: {
 			sessions: Map<string, ActiveSessionState>;
+			rlmDeletionAdmissionFences: Map<string, unknown>;
+			beginDaemonWorkAdmission(operation: string, selectors: Iterable<string>): () => void;
 			closeSession: (state: ActiveSessionState, reason: "completed" | "killed") => Promise<void>;
 			recordRlmSubagentDeletion(parentState: ActiveSessionState, childId: string): Promise<void>;
 			createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost;
 		};
-		const closeSession = vi.fn(async (state: ActiveSessionState) => {
+		let releaseCancelledClose!: () => void;
+		const cancelledCloseGate = new Promise<void>((resolve) => {
+			releaseCancelledClose = resolve;
+		});
+		let markCancelledCloseStarted!: () => void;
+		const cancelledCloseStarted = new Promise<void>((resolve) => {
+			markCancelledCloseStarted = resolve;
+		});
+		let gateNextCancelledClose = true;
+		const fenceSizesDuringClose: number[] = [];
+		const closeSession = vi.fn(async (state: ActiveSessionState, reason: "completed" | "killed") => {
+			fenceSizesDuringClose.push(internals.rlmDeletionAdmissionFences.size);
+			if (reason === "killed" && gateNextCancelledClose) {
+				gateNextCancelledClose = false;
+				markCancelledCloseStarted();
+				await cancelledCloseGate;
+			}
 			internals.sessions.delete(state.activeSessionId);
 		});
 		internals = daemon as unknown as typeof internals;
@@ -794,18 +962,29 @@ describe("daemon mode helpers", () => {
 			);
 
 		expect(recordDeletion).not.toHaveBeenCalled();
-		expect(closeSession).toHaveBeenCalledWith(childState, "completed");
+		expect(closeSession).toHaveBeenCalledWith(childState, "completed", true, true, undefined, undefined);
 		internals.sessions.set(childState.activeSessionId, childState);
-		await internals
+		const cancelledRelease = internals
 			.createSubagentRuntimeHost(parentState)
 			.releaseRlmSubagentRuntime?.(
 				{ session: childState.runtime.session },
 				{ id: "child-1" } as CreateRlmSubagentRuntimeOptions,
 				"cancelled",
 			);
+		await cancelledCloseStarted;
+		expect(internals.rlmDeletionAdmissionFences.size).toBe(1);
+		expect(() => internals.beginDaemonWorkAdmission("test child work", [childState.activeSessionId])).toThrow(
+			"the target RLM subagent family is being deleted",
+		);
+		releaseCancelledClose();
+		await cancelledRelease;
 		expect(recordDeletion).toHaveBeenCalledWith(parentState, "child-1", "revoked");
 		expect(recordDeletion.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[1]!);
-		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
+		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed", true, true, undefined, {
+			kernelSnapshot: false,
+		});
+		expect(fenceSizesDuringClose).toEqual([0, 1]);
+		expect(internals.rlmDeletionAdmissionFences.size).toBe(0);
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 
 		// A registry failure must not strand the cancelled child as a stale resident session.
@@ -822,7 +1001,11 @@ describe("daemon mode helpers", () => {
 					"cancelled",
 				),
 		).rejects.toThrow("registry write failed");
-		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed");
+		expect(closeSession).toHaveBeenLastCalledWith(childState, "killed", true, true, undefined, {
+			kernelSnapshot: false,
+		});
+		expect(fenceSizesDuringClose.at(-1)).toBe(1);
+		expect(internals.rlmDeletionAdmissionFences.size).toBe(0);
 		expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
 	});
 
@@ -947,18 +1130,19 @@ describe("daemon mode helpers", () => {
 			const registryPath = join(fixture.parentArtifactDir, "rlm-subagents.jsonl");
 			const entry = JSON.parse(readFileSync(registryPath, "utf8")) as Record<string, unknown>;
 			entry.status = "running";
+			delete entry.sessionDir;
 			writeFileSync(registryPath, `${JSON.stringify(entry)}\n`);
 			const internals = fixture.daemon as unknown as {
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
-				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string } }>>;
+				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string; status: string } }>>;
 				createAgentMessageController(
 					getCurrentState: () => ActiveSessionState | undefined,
 				): AgentSessionMessageController;
 			};
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 
-			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).toContain(
-				fixture.childId,
+			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry)).toContainEqual(
+				expect.objectContaining({ childId: fixture.childId, status: "running" }),
 			);
 			await expect(internals.createAgentMessageController(() => parentState).roster?.()).resolves.toMatchObject({
 				entries: [expect.objectContaining({ relationship: "child", name: "renamed-worker" })],
@@ -1149,6 +1333,156 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("skips a cron job cancelled while its prompt waits for admission", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-cron-admission-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			manager.newSession();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) {
+				throw new Error("Missing session file");
+			}
+			let cancelJobDuringAdmission: (() => void) | undefined;
+			const promptUntilAccepted = vi.fn(async (_prompt: string, options?: { admissionCommitted?: () => void }) => {
+				cancelJobDuringAdmission?.();
+				options?.admissionCommitted?.();
+			});
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				const session = makeRuntimeSession(options.sessionManager);
+				Object.assign(session, {
+					isStreaming: false,
+					isCompacting: false,
+					isRetrying: false,
+					isBashRunning: false,
+					unfinishedActionCount: 0,
+					hasAcceptedPromptInFlight: false,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+					promptUntilAccepted,
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				cronScheduler: { runDue(now: Date): Promise<number> };
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: sessionFile });
+			const job = internals.cronStore.create({
+				activeSessionId: state.activeSessionId,
+				sessionId: state.runtime.session.sessionId,
+				sessionFile,
+				cwd: tempDir,
+				scheduleText: "every 5m",
+				prompt: "scheduled work",
+			});
+			cancelJobDuringAdmission = () => {
+				internals.cronStore.cancel(job.id);
+			};
+
+			expect(await internals.cronScheduler.runDue(new Date(Date.now() + 10 * 60 * 1000))).toBe(0);
+			expect(promptUntilAccepted).toHaveBeenCalledOnce();
+			expect(internals.cronStore.list().find((candidate) => candidate.id === job.id)?.status).toBe("cancelled");
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("skips a heartbeat whose instruction changed while its prompt waits for admission", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-heartbeat-admission-"));
+		try {
+			const sessionDir = join(tempDir, "sessions");
+			const manager = SessionManager.create(tempDir, sessionDir);
+			manager.newSession();
+			const sessionFile = manager.getSessionFile();
+			if (!sessionFile) {
+				throw new Error("Missing session file");
+			}
+			let updateHeartbeatDuringAdmission: (() => void) | undefined;
+			const promptHeartbeat = vi.fn(async (_job: AgentCronJob, options?: { admissionCommitted?: () => void }) => {
+				updateHeartbeatDuringAdmission?.();
+				updateHeartbeatDuringAdmission = undefined;
+				options?.admissionCommitted?.();
+			});
+			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				const session = makeRuntimeSession(options.sessionManager);
+				Object.assign(session, {
+					isStreaming: false,
+					isCompacting: false,
+					isRetrying: false,
+					isBashRunning: false,
+					unfinishedActionCount: 0,
+					hasAcceptedPromptInFlight: false,
+					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
+					promptHeartbeat,
+				});
+				return {
+					session,
+					extensionsResult: { extensions: [], errors: [], runtime: {} } as unknown as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["extensionsResult"],
+					services: { cwd: options.cwd, agentDir: options.agentDir } as Awaited<
+						ReturnType<CreateAgentSessionRuntimeFactory>
+					>["services"],
+					diagnostics: [],
+				};
+			});
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir },
+				createRuntime,
+			});
+			const internals = daemon as unknown as {
+				cronStore: AgentCronJobStore;
+				cronScheduler: { runDue(now: Date): Promise<number> };
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+			};
+			const state = await internals.createRuntime({ type: "create", sessionPath: sessionFile });
+			const heartbeat = internals.cronStore.createRlmHeartbeat({
+				activeSessionId: state.activeSessionId,
+				sessionId: state.runtime.session.sessionId,
+				sessionFile,
+				cwd: tempDir,
+				runtimeKind: "top-level",
+				scheduleText: "every 5m",
+				prompt: "old instruction",
+			});
+			updateHeartbeatDuringAdmission = () => {
+				internals.cronStore.updateRlmHeartbeat(state.activeSessionId, heartbeat.id, { prompt: "new instruction" });
+			};
+
+			expect(await internals.cronScheduler.runDue(new Date(Date.now() + 10 * 60 * 1000))).toBe(0);
+			expect(promptHeartbeat).toHaveBeenCalledOnce();
+			expect(promptHeartbeat.mock.calls[0]?.[0]).toMatchObject({ prompt: "old instruction" });
+			expect(internals.cronStore.list().find((candidate) => candidate.id === heartbeat.id)).toMatchObject({
+				status: "active",
+				runCount: 0,
+			});
+
+			expect(await internals.cronScheduler.runDue(new Date(Date.now() + 20 * 60 * 1000))).toBe(1);
+			expect(promptHeartbeat).toHaveBeenCalledTimes(2);
+			expect(promptHeartbeat.mock.calls[1]?.[0]).toMatchObject({ prompt: "new instruction" });
+			expect(internals.cronStore.list().find((candidate) => candidate.id === heartbeat.id)).toMatchObject({
+				status: "active",
+				runCount: 1,
+			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("closes the exact parent-scoped daemon runtime when a retained subagent is deleted", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -1200,7 +1534,9 @@ describe("daemon mode helpers", () => {
 		await host.deleteRlmSubagentRuntime("child-1", staleParentReference);
 
 		expect(closeSession).toHaveBeenCalledOnce();
-		expect(closeSession).toHaveBeenCalledWith(childState, "killed", false);
+		expect(closeSession).toHaveBeenCalledWith(childState, "killed", false, true, undefined, {
+			kernelSnapshot: false,
+		});
 		expect(closeSession).not.toHaveBeenCalledWith(foreignChildState, expect.anything());
 		expect(childSession.disposeAsync).not.toHaveBeenCalled();
 		expect(staleParentReference.disposeAsync).toHaveBeenCalledOnce();
@@ -1351,8 +1687,6 @@ describe("daemon mode helpers", () => {
 			): AgentSessionMessageController;
 			getBoundSessionState(id: string): ActiveSessionState;
 			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			agentMessageTargetLocks: Map<string, Promise<void>>;
-			promptWithAgentMessagePreparingGuard(state: ActiveSessionState, message: string): Promise<boolean>;
 		};
 		internals.sessions.set(parentState.activeSessionId, parentState);
 		internals.sessions.set(childState.activeSessionId, childState);
@@ -1375,19 +1709,6 @@ describe("daemon mode helpers", () => {
 		] as const) {
 			await expect(internals.handleCommand(client, command)).rejects.toThrow("is closing");
 		}
-
-		internals.closingSessions.delete(childState.activeSessionId);
-		let releaseTargetLock: () => void = () => {};
-		const targetLock = new Promise<void>((resolve) => {
-			releaseTargetLock = resolve;
-		});
-		internals.agentMessageTargetLocks.set(childState.activeSessionId, targetLock);
-		const guardedPrompt = internals.promptWithAgentMessagePreparingGuard(childState, "continue");
-		await Promise.resolve();
-		internals.closingSessions.set(childState.activeSessionId, { promise: Promise.resolve(), reason: "shutdown" });
-		releaseTargetLock();
-		await expect(guardedPrompt).rejects.toThrow("closing before prompt delivery");
-		expect(sessionPrompt).not.toHaveBeenCalled();
 	});
 
 	it("removes a closing daemon session even when runtime disposal fails", async () => {
@@ -1438,7 +1759,29 @@ describe("daemon mode helpers", () => {
 		expect(internals.closingSessions.has(state.activeSessionId)).toBe(false);
 	});
 
-	it("lists and routes agent messages to peers hosted by another worker", async () => {
+	it("returns no peers when the supervisor query fails", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-peer-query-failure-"));
+		const previousSupervisorSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		try {
+			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = join(tempDir, "missing.sock");
+			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: vi.fn(),
+				worker: { authenticationToken: "worker-token" },
+			});
+			const listSupervisorAgentPeers = (
+				daemon as unknown as { listSupervisorAgentPeers(): Promise<unknown[]> }
+			).listSupervisorAgentPeers.bind(daemon);
+
+			await expect(listSupervisorAgentPeers()).resolves.toEqual([]);
+		} finally {
+			if (previousSupervisorSocket === undefined) delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			else process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("lists and role-addresses root siblings hosted by another worker", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
 			createRuntime: async () => {
@@ -1446,6 +1789,7 @@ describe("daemon mode helpers", () => {
 			},
 			worker: { authenticationToken: "worker-token" },
 		});
+		Object.assign(daemon, { canonicalWorkerSessionsDir: "/tmp/prime-agent-test-agent/sessions" });
 		const source = makeState("source");
 		source.runtime = {
 			...source.runtime,
@@ -1470,42 +1814,53 @@ describe("daemon mode helpers", () => {
 		const sendRemoteAgentSessionMessage = vi.fn().mockResolvedValue(receipt);
 		const internals = daemon as unknown as {
 			sessions: Map<string, ActiveSessionState>;
-			remoteAgentPeers: Map<string, Record<string, unknown>>;
+			listSupervisorAgentPeers: ReturnType<typeof vi.fn>;
 			createAgentMessageListResult(
 				current: ActiveSessionState,
 			): Promise<{ agents: Array<{ activeSessionId: string }> }>;
+			createAgentMessageController(getCurrentState: () => ActiveSessionState): AgentSessionMessageController;
 			sendRemoteAgentSessionMessage: typeof sendRemoteAgentSessionMessage;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState: ActiveSessionState;
-				origin: "agent";
-			}): Promise<unknown>;
 		};
 		internals.sessions.set(source.activeSessionId, source);
-		internals.remoteAgentPeers.set(remoteSelector, {
-			activeSessionId: remoteSelector,
-			sessionId: "session-remote",
-			sessionName: "Remote",
-			runtimeKind: "top-level",
-			cwd: "/tmp/remote",
-			isStreaming: false,
-			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
-		});
+		internals.listSupervisorAgentPeers = vi.fn(async () => [
+			{
+				activeSessionId: remoteSelector,
+				sessionId: "session-remote",
+				sessionName: "Remote",
+				runtimeKind: "top-level",
+				cwd: "/tmp/remote",
+				isStreaming: false,
+				unfinishedActionCount: 0,
+			},
+		]);
 		internals.sendRemoteAgentSessionMessage = sendRemoteAgentSessionMessage;
 
 		expect((await internals.createAgentMessageListResult(source)).agents).toContainEqual(
 			expect.objectContaining({ activeSessionId: remoteSelector }),
 		);
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: remoteSelector,
-				message: "continue remotely",
-				fromState: source,
-				origin: "agent",
-			}),
-		).resolves.toEqual(receipt);
-		expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, remoteSelector, "continue remotely");
+		const listAll = vi.spyOn(SessionManager, "listAll").mockResolvedValue([]);
+		try {
+			const handlers = createAgentMessageHostHandlers(internals.createAgentMessageController(() => source));
+			const roster = await handlers["agent_message.list_agents"]!({});
+			expect(roster.current).toMatchObject({ name: "Source", id: "session-source", depth: 0 });
+			expect(roster.entries).toContainEqual({
+				relationship: "sibling",
+				name: "Remote",
+				id: "session-remote",
+				depth: 0,
+				status: "idle",
+			});
+			await expect(
+				handlers["agent_message.send"]!({
+					message: "continue remotely",
+					receiver_role: "sibling",
+					receiver_name: "Remote",
+				}),
+			).resolves.toEqual(receipt);
+			expect(sendRemoteAgentSessionMessage).toHaveBeenCalledWith(source, "session-remote", "continue remotely");
+		} finally {
+			listAll.mockRestore();
+		}
 	});
 
 	it("routes nonresident agent-message targets through the supervisor wake path", async () => {
@@ -1660,6 +2015,85 @@ describe("daemon mode helpers", () => {
 				"Target session has too many pending messages",
 			);
 			expect(connectionCount).toBe(1);
+		} finally {
+			if (previousSupervisorSocket === undefined) {
+				delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+			} else {
+				process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = previousSupervisorSocket;
+			}
+			await new Promise<void>((resolve) => server.close(() => resolve()));
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not retry after the supervisor receives an agent message", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pa-msg-disconnect-"));
+		const socketPath = join(tempDir, "d.sock");
+		let requestCount = 0;
+		const server: Server = createServer((socket) => {
+			socket.on("error", () => undefined);
+			socket.write(
+				`${JSON.stringify({
+					type: "daemon_hello",
+					socketPath,
+					protocol: DAEMON_PROTOCOL_INFO,
+					schemaId: DAEMON_SCHEMA_ID,
+					clientId: "supervisor",
+					serverCapabilities: [],
+				})}\n`,
+			);
+			let buffer = "";
+			socket.on("data", (chunk) => {
+				buffer += chunk.toString();
+				const newline = buffer.indexOf("\n");
+				if (newline === -1) return;
+				const wire = JSON.parse(buffer.slice(0, newline)) as {
+					id: string;
+					command?: { type: string };
+					type: string;
+				};
+				const command = wire.command ?? wire;
+				requestCount++;
+				if (requestCount === 1) {
+					socket.destroy();
+					return;
+				}
+				socket.write(
+					`${JSON.stringify({
+						type: "response",
+						id: wire.id,
+						command: command.type,
+						success: true,
+						data: {},
+					})}\n`,
+				);
+			});
+		});
+		const previousSupervisorSocket = process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
+		try {
+			await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+			process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] = socketPath;
+			const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
+				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+				worker: { authenticationToken: "worker-token" },
+			});
+			const sendRemoteAgentSessionMessage = (
+				daemon as unknown as {
+					sendRemoteAgentSessionMessage(
+						fromState: ActiveSessionState,
+						targetSelector: string,
+						message: string,
+					): Promise<unknown>;
+				}
+			).sendRemoteAgentSessionMessage.bind(daemon);
+
+			await expect(sendRemoteAgentSessionMessage(makeState("source"), "remote", "continue")).rejects.toThrow(
+				"Connection to the Prime Agent daemon closed",
+			);
+			expect(requestCount).toBe(1);
 		} finally {
 			if (previousSupervisorSocket === undefined) {
 				delete process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
@@ -1866,6 +2300,71 @@ describe("daemon mode helpers", () => {
 		expect(acceptAgentMessagePrompt.mock.calls[0]?.[1]).toMatchObject({ streamingBehavior: "steer" });
 	});
 
+	it("rejects an agent message when pause wins core admission", async () => {
+		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
+			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
+			createRuntime: async () => {
+				throw new Error("unexpected runtime creation");
+			},
+		});
+		const targetState = makeState("target");
+		let releaseAdmission: () => void = () => {};
+		const admissionGate = new Promise<void>((resolve) => {
+			releaseAdmission = resolve;
+		});
+		let markAdmissionStarted: () => void = () => {};
+		const admissionStarted = new Promise<void>((resolve) => {
+			markAdmissionStarted = resolve;
+		});
+		const acceptAgentMessagePrompt = vi.fn(
+			async (
+				_message: string,
+				options?: {
+					admissionCommitted?: () => void;
+					preflightResult?: (accepted: boolean) => void;
+				},
+			) => {
+				markAdmissionStarted();
+				await admissionGate;
+				options?.admissionCommitted?.();
+				options?.preflightResult?.(true);
+			},
+		);
+		targetState.runtime = {
+			...targetState.runtime,
+			cwd: "/tmp",
+			session: {
+				sessionId: "session-target",
+				sessionName: "Target",
+				acceptAgentMessagePrompt,
+				clearQueuedAgentMessages: vi.fn(() => ({ steering: [], followUp: [] })),
+			},
+		} as never;
+		const internals = daemon as unknown as {
+			sessions: Map<string, ActiveSessionState>;
+			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			sendAgentSessionMessage(options: {
+				targetSelector: string;
+				message: string;
+				origin: "agent" | "cli";
+			}): Promise<unknown>;
+		};
+		internals.sessions.set(targetState.activeSessionId, targetState);
+
+		const send = internals.sendAgentSessionMessage({
+			targetSelector: targetState.activeSessionId,
+			message: "pause race",
+			origin: "agent",
+		});
+		await admissionStarted;
+		await internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
+			type: "agent_messages_pause",
+		});
+		releaseAdmission();
+
+		await expect(send).rejects.toThrow("Agent messaging is paused");
+	});
+
 	it("ignores a legacy follow-up mode and always steers agent messages", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -1874,7 +2373,12 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const targetState = makeState("target");
-		const queueAgentMessagePrompt = vi.fn(async () => true);
+		const acceptAgentMessagePrompt = vi.fn(
+			(_message: string, options?: { preflightResult?: (accepted: boolean, queued?: boolean) => void }) => {
+				options?.preflightResult?.(true, true);
+				return Promise.resolve();
+			},
+		);
 		targetState.runtime = {
 			...targetState.runtime,
 			cwd: "/tmp",
@@ -1886,7 +2390,7 @@ describe("daemon mode helpers", () => {
 				isRetrying: false,
 				isBashRunning: false,
 				unfinishedActionCount: 0,
-				queueAgentMessagePrompt,
+				acceptAgentMessagePrompt,
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -1903,10 +2407,12 @@ describe("daemon mode helpers", () => {
 		});
 
 		expect(response).toMatchObject({ data: { deliveryStatus: "queued", deliveryMode: "steer" } });
-		expect(queueAgentMessagePrompt).toHaveBeenCalledWith(
+		expect(acceptAgentMessagePrompt).toHaveBeenCalledWith(
 			expect.stringContaining("do not defer"),
-			"steer",
-			expect.objectContaining({ customType: "agent_message" }),
+			expect.objectContaining({
+				streamingBehavior: "steer",
+				customMessage: expect.objectContaining({ customType: "agent_message" }),
+			}),
 		);
 	});
 
@@ -1933,10 +2439,15 @@ describe("daemon mode helpers", () => {
 					sessionName: targetState.activeSessionId,
 					isStreaming: false,
 					sessionActions: { queuedCount: 0, steering: [], followUps: [] },
-					prompt: vi.fn(async () => {}),
+					acceptAgentMessagePrompt: vi.fn(
+						(_message: string, options?: { preflightResult?: (accepted: boolean) => void }) => {
+							options?.preflightResult?.(true);
+							return Promise.resolve();
+						},
+					),
 					followUp: vi.fn(async () => true),
 					clearQueue: vi.fn(() => ({ cleared: 0 })),
-					clearQueuedUserMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
+					clearQueuedAgentMessages: vi.fn(() => ({ steering: [], followUp: [] })),
 				},
 			} as never;
 		}
@@ -2003,12 +2514,7 @@ describe("daemon mode helpers", () => {
 			},
 		});
 		const targetState = makeState("target");
-		const agentMessageText =
-			"Agent-to-agent message received.\nSource: agent_message\nTo: Target, active target, session session-target\nMessage id: agentmsg_test\n\nhello";
-		const clearQueuedUserMessagesMatching = vi.fn((predicate: (text: string) => boolean) => ({
-			steering: [agentMessageText].filter(predicate),
-			followUp: [],
-		}));
+		const clearQueuedAgentMessages = vi.fn(() => ({ steering: ["agent message"], followUp: [] }));
 		const clearQueue = vi.fn(() => ({ steering: ["user prompt"], followUp: ["heartbeat"] }));
 		targetState.runtime = {
 			...targetState.runtime,
@@ -2018,7 +2524,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				unfinishedActionCount: 2,
-				clearQueuedUserMessagesMatching,
+				clearQueuedAgentMessages,
 				clearQueue,
 			},
 		} as never;
@@ -2034,10 +2540,7 @@ describe("daemon mode helpers", () => {
 			activeSessionId: targetState.activeSessionId,
 		});
 
-		expect(clearQueuedUserMessagesMatching).toHaveBeenCalledOnce();
-		const predicate = clearQueuedUserMessagesMatching.mock.calls[0]?.[0];
-		expect(predicate?.(agentMessageText)).toBe(true);
-		expect(predicate?.("ordinary queued follow-up")).toBe(false);
+		expect(clearQueuedAgentMessages).toHaveBeenCalledOnce();
 		expect(clearQueue).not.toHaveBeenCalled();
 	});
 
@@ -2052,7 +2555,7 @@ describe("daemon mode helpers", () => {
 		const secondState = makeState("target-2");
 		const firstClear = vi.fn(() => ({ steering: [], followUp: ["agent message"] }));
 		const secondClear = vi.fn(() => ({ steering: ["agent message"], followUp: [] }));
-		for (const [state, clearQueuedUserMessagesMatching] of [
+		for (const [state, clearQueuedAgentMessages] of [
 			[firstState, firstClear],
 			[secondState, secondClear],
 		] as const) {
@@ -2064,7 +2567,7 @@ describe("daemon mode helpers", () => {
 					sessionName: state.activeSessionId,
 					isStreaming: false,
 					unfinishedActionCount: 1,
-					clearQueuedUserMessagesMatching,
+					clearQueuedAgentMessages,
 				},
 			} as never;
 		}
@@ -2104,7 +2607,7 @@ describe("daemon mode helpers", () => {
 				}),
 		);
 		const readyClear = vi.fn(() => ({ steering: [], followUp: ["agent message"] }));
-		for (const [state, clearQueuedUserMessagesMatching] of [
+		for (const [state, clearQueuedAgentMessages] of [
 			[blockedState, blockedClear],
 			[readyState, readyClear],
 		] as const) {
@@ -2116,7 +2619,7 @@ describe("daemon mode helpers", () => {
 					sessionName: state.activeSessionId,
 					isStreaming: false,
 					unfinishedActionCount: 1,
-					clearQueuedUserMessagesMatching,
+					clearQueuedAgentMessages,
 				},
 			} as never;
 		}
@@ -2161,7 +2664,7 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				unfinishedActionCount: 0,
-				prompt: vi.fn(async () => {
+				acceptAgentMessagePrompt: vi.fn(async () => {
 					throw new Error("missing model");
 				}),
 			},
@@ -2196,315 +2699,6 @@ describe("daemon mode helpers", () => {
 				origin: "agent",
 			}),
 		).rejects.toThrow("missing model");
-	});
-
-	it("counts concurrent agent message queue reservations against the target queue cap", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		let rejectQueuedMessage: (error: Error) => void = () => {};
-		const queueAgentMessagePrompt = vi.fn(
-			(_message: string, _streamingBehavior: "steer" | "followUp") =>
-				new Promise<boolean>((_resolve, reject) => {
-					rejectQueuedMessage = reject;
-				}),
-		);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: true,
-				unfinishedActionCount: 19,
-				clearQueue: vi.fn(() => ({ cleared: 0 })),
-				clearQueuedUserMessagesMatching: vi.fn(() => ({ steering: [], followUp: [] })),
-				queueAgentMessagePrompt,
-				prompt: vi.fn(async () => {}),
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const first = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "first",
-			fromState,
-			origin: "agent",
-		});
-		await Promise.resolve();
-
-		const clear = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
-			id: "command-1",
-			type: "agent_messages_clear",
-			activeSessionId: targetState.activeSessionId,
-		});
-		await Promise.resolve();
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "second",
-				fromState,
-				origin: "agent",
-			}),
-		).rejects.toThrow("Target session has too many pending messages");
-
-		rejectQueuedMessage(new Error("release reservation"));
-		await expect(first).rejects.toThrow("release reservation");
-		await clear;
-	});
-
-	it("releases queue reservations once messages are queued so concurrent senders do not halve capacity", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let pending = 0;
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => {
-			pending += 1;
-			return true;
-		});
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: true,
-				get unfinishedActionCount() {
-					return pending;
-				},
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-		// Distinct senders so the per-sender rate limit stays out of the way.
-		const senders = Array.from({ length: 12 }, (_, i) => {
-			const fromState = makeState(`source-${i}`);
-			fromState.runtime = {
-				...fromState.runtime,
-				session: { sessionId: `session-source-${i}`, sessionName: `Source ${i}` },
-			} as never;
-			internals.sessions.set(fromState.activeSessionId, fromState);
-			return fromState;
-		});
-
-		const errors: unknown[] = [];
-		for (const [i, fromState] of senders.entries()) {
-			void internals
-				.sendAgentSessionMessage({
-					targetSelector: targetState.activeSessionId,
-					message: `message ${i}`,
-					fromState,
-					origin: "agent",
-				})
-				.catch((error) => {
-					errors.push(error);
-				});
-		}
-		for (let attempt = 0; attempt < 200 && queueAgentMessagePrompt.mock.calls.length < 12; attempt++) {
-			await Promise.resolve();
-		}
-
-		// With reservations held past queue time, 12 concurrent senders would
-		// count as 24 against the 20-slot cap and the tail would reject.
-		expect(errors).toEqual([]);
-		expect(queueAgentMessagePrompt).toHaveBeenCalledTimes(12);
-	});
-
-	it("resolves queued sends immediately with a queued receipt while the target is streaming", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		// A real streaming session only resolves this once its turn progresses;
-		// the send must not depend on it.
-		const waitForAgentMessagePromptDelivery = vi.fn(() => new Promise<void>(() => {}));
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: true,
-				unfinishedActionCount: 0,
-				queueAgentMessagePrompt,
-				waitForAgentMessagePromptDelivery,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "queued while streaming",
-				fromState,
-				origin: "agent",
-			}),
-		).resolves.toMatchObject({
-			deliveryStatus: "queued",
-			target: { activeSessionId: targetState.activeSessionId },
-		});
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(waitForAgentMessagePromptDelivery).not.toHaveBeenCalled();
-	});
-
-	it("resolves mutual sends between two busy sessions without deadlocking", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const makeBusyState = (name: string) => {
-			const state = makeState(name);
-			state.runtime = {
-				...state.runtime,
-				cwd: "/tmp",
-				session: {
-					sessionId: `session-${name}`,
-					sessionName: name,
-					isStreaming: true,
-					unfinishedActionCount: 0,
-					queueAgentMessagePrompt: vi.fn(async () => true),
-					// Neither turn ends while both sessions block inside their own send.
-					waitForAgentMessagePromptDelivery: vi.fn(() => new Promise<void>(() => {})),
-				},
-			} as never;
-			return state;
-		};
-		const stateA = makeBusyState("alpha");
-		const stateB = makeBusyState("beta");
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(stateA.activeSessionId, stateA);
-		internals.sessions.set(stateB.activeSessionId, stateB);
-
-		const [aToB, bToA] = await Promise.all([
-			internals.sendAgentSessionMessage({
-				targetSelector: stateB.activeSessionId,
-				message: "alpha to beta",
-				fromState: stateA,
-				origin: "agent",
-			}),
-			internals.sendAgentSessionMessage({
-				targetSelector: stateA.activeSessionId,
-				message: "beta to alpha",
-				fromState: stateB,
-				origin: "agent",
-			}),
-		]);
-
-		expect(aToB).toMatchObject({ deliveryStatus: "queued", target: { activeSessionId: stateB.activeSessionId } });
-		expect(bToA).toMatchObject({ deliveryStatus: "queued", target: { activeSessionId: stateA.activeSessionId } });
-	});
-
-	it("counts accepted in-flight agent messages against the target queue cap", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 20,
-				hasAcceptedPromptInFlight: true,
-				acceptAgentMessagePrompt,
-				queueAgentMessagePrompt: vi.fn(async () => true),
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "over cap",
-				fromState,
-				origin: "agent",
-			}),
-		).rejects.toThrow("Target session has too many pending messages");
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
 	it("reports accepted in-flight agent messages in agent-message lists", async () => {
@@ -2934,483 +3128,6 @@ describe("daemon mode helpers", () => {
 		expect(sibling.acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
-	it("serializes concurrent agent messages to an idle target", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const promptResolves: Array<() => void> = [];
-		const prompt = vi.fn(
-			(_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) =>
-				new Promise<void>((resolve) => {
-					promptResolves.push(resolve);
-				}),
-		);
-		const followUp = vi.fn(async () => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				prompt,
-				followUp,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const first = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "first",
-			fromState,
-			origin: "agent",
-		});
-		const second = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "second",
-			fromState,
-			origin: "agent",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(prompt).toHaveBeenCalledTimes(1);
-
-		promptResolves[0]?.();
-		await expect(first).resolves.toMatchObject({ message: "first" });
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(prompt).toHaveBeenCalledTimes(2);
-		expect(followUp).not.toHaveBeenCalled();
-		promptResolves[1]?.();
-		await expect(second).resolves.toMatchObject({ message: "second" });
-	});
-
-	it("queues agent messages behind an idle target with a pending retry", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const prompt = vi.fn(async (_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
-		const followUp = vi.fn(async () => true);
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				isRetrying: true,
-				unfinishedActionCount: 0,
-				prompt,
-				followUp,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "queued behind retry",
-				fromState,
-				origin: "agent",
-			}),
-		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
-
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
-		expect(followUp).not.toHaveBeenCalled();
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("queues agent messages behind existing pending work on an idle target", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const prompt = vi.fn(async (_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
-		const followUp = vi.fn(async () => true);
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 1,
-				prompt,
-				followUp,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "queued behind existing work",
-				fromState,
-				origin: "agent",
-			}),
-		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
-
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
-		expect(followUp).not.toHaveBeenCalled();
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("queues agent messages while the target is compacting", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const prompt = vi.fn(async (_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) => {});
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				isCompacting: true,
-				unfinishedActionCount: 0,
-				prompt,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "queued behind compaction",
-				fromState,
-				origin: "agent",
-			}),
-		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
-
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
-		expect(prompt).not.toHaveBeenCalled();
-	});
-
-	it("queues agent messages while target bash is running", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				isBashRunning: true,
-				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "queued behind bash",
-				fromState,
-				origin: "agent",
-			}),
-		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
-
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-	});
-
-	it("acknowledges queued agent messages after queue insertion", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		let resolveQueuedDelivery: () => void = () => {};
-		const waitForAgentMessagePromptDelivery = vi.fn(
-			() =>
-				new Promise<void>((resolve) => {
-					resolveQueuedDelivery = resolve;
-				}),
-		);
-		const queueAgentMessagePrompt = vi.fn(async () => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: true,
-				unfinishedActionCount: 0,
-				queueAgentMessagePrompt,
-				waitForAgentMessagePromptDelivery,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "queued",
-				fromState,
-				origin: "agent",
-			}),
-		).resolves.toMatchObject({ target: { activeSessionId: targetState.activeSessionId } });
-
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(waitForAgentMessagePromptDelivery).not.toHaveBeenCalled();
-		resolveQueuedDelivery();
-	});
-
-	it("recomputes agent message streaming behavior after waiting for the target lock", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const promptResolves: Array<() => void> = [];
-		const prompt = vi.fn(
-			(_message: string, _options?: { streamingBehavior?: "steer" | "followUp" }) =>
-				new Promise<void>((resolve) => {
-					promptResolves.push(resolve);
-				}),
-		);
-		const followUp = vi.fn(async () => true);
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				prompt,
-				followUp,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const first = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "first",
-			fromState,
-			origin: "agent",
-		});
-		const second = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "second",
-			fromState,
-			origin: "agent",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(prompt).toHaveBeenCalledTimes(1);
-		(targetState.runtime.session as { isStreaming: boolean }).isStreaming = true;
-		promptResolves[0]?.();
-		await expect(first).resolves.toMatchObject({ message: "first" });
-		await Promise.resolve();
-		await Promise.resolve();
-
-		expect(prompt).toHaveBeenCalledTimes(1);
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
-		expect(followUp).not.toHaveBeenCalled();
-		await expect(second).resolves.toMatchObject({ message: "second" });
-	});
-
-	it("rejects agent messages when queued delivery is coalesced", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		const queueAgentMessagePrompt = vi.fn(async () => false);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: true,
-				unfinishedActionCount: 1,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		await expect(
-			internals.sendAgentSessionMessage({
-				targetSelector: targetState.activeSessionId,
-				message: "coalesced",
-				fromState,
-				origin: "agent",
-			}),
-		).rejects.toThrow("Agent message was not queued");
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-	});
-
 	it("rejects agent messages when direct delivery preflight fails", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -3463,353 +3180,6 @@ describe("daemon mode helpers", () => {
 		).rejects.toThrow("Agent message was not accepted");
 	});
 
-	it("queues agent messages while daemon prompts prepare to stream", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let resolvePrompt: () => void = () => {};
-		let reportPreflight: ((didSucceed: boolean) => void) | undefined;
-		const prompt = vi.fn((_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
-			reportPreflight = options?.preflightResult;
-			return new Promise<void>((resolve) => {
-				resolvePrompt = resolve;
-			});
-		});
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				prompt,
-				acceptAgentMessagePrompt,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-		const promptClient = makeClient("client-1", targetState.activeSessionId);
-		(promptClient.socket as unknown as { write: ReturnType<typeof vi.fn> }).write = vi.fn();
-
-		internals.handleCommand(promptClient, {
-			id: "command-1",
-			type: "prompt",
-			activeSessionId: targetState.activeSessionId,
-			message: "normal prompt",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		reportPreflight?.(true);
-
-		const send = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "agent message",
-			origin: "agent",
-		});
-		await Promise.resolve();
-		await send;
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt.mock.calls[0]?.[1]).toBe("steer");
-		resolvePrompt();
-	});
-
-	it("waits for an in-flight agent-message accept before starting daemon prompts", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let resolveAccept: () => void = () => {};
-		const acceptAgentMessagePrompt = vi.fn(
-			(_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
-				options?.preflightResult?.(true);
-				return new Promise<void>((resolve) => {
-					resolveAccept = resolve;
-				});
-			},
-		);
-		const prompt = vi.fn(async (_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
-			options?.preflightResult?.(true);
-		});
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				prompt,
-				acceptAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const send = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "agent message",
-			origin: "agent",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
-
-		const promptClient = makeClient("client-1", targetState.activeSessionId);
-		(promptClient.socket as unknown as { write: ReturnType<typeof vi.fn> }).write = vi.fn();
-		internals.handleCommand(promptClient, {
-			id: "command-1",
-			type: "prompt",
-			activeSessionId: targetState.activeSessionId,
-			message: "normal prompt",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(prompt).not.toHaveBeenCalled();
-
-		resolveAccept();
-		await send;
-		for (let attempt = 0; attempt < 10 && prompt.mock.calls.length === 0; attempt++) {
-			await Promise.resolve();
-		}
-
-		expect(prompt).toHaveBeenCalledOnce();
-	});
-
-	it("releases cron preparing state after prompt admission", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let resolvePrompt: () => void = () => {};
-		const prompt = vi.fn(
-			(_message: string, _options?: unknown) =>
-				new Promise<void>((resolve) => {
-					resolvePrompt = resolve;
-				}),
-		);
-		const promptUntilAccepted = vi.fn(async () => {});
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				isBashRunning: false,
-				unfinishedActionCount: 0,
-				prompt,
-				promptUntilAccepted,
-				acceptAgentMessagePrompt,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const cronRun = internals.runCronJob(
-			makeCronJob({ id: "cron-1", source: "cron", activeSessionId: targetState.activeSessionId }),
-		);
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(promptUntilAccepted).toHaveBeenCalledOnce();
-		expect(prompt).not.toHaveBeenCalled();
-
-		await internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "agent message",
-			origin: "agent",
-		});
-
-		expect(acceptAgentMessagePrompt).toHaveBeenCalledOnce();
-		expect(queueAgentMessagePrompt).not.toHaveBeenCalled();
-		resolvePrompt();
-		await cronRun;
-	});
-
-	it("keeps the preparing state until every concurrent prompt settles", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		const promptResolves: Array<() => void> = [];
-		const prompt = vi.fn(
-			(_message: string, _options?: unknown) =>
-				new Promise<void>((resolve) => {
-					promptResolves.push(resolve);
-				}),
-		);
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		const queueAgentMessagePrompt = vi.fn(async (_message: string, _streamingBehavior: "steer" | "followUp") => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				prompt,
-				acceptAgentMessagePrompt,
-				queueAgentMessagePrompt,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-		const promptClient = makeClient("client-1", targetState.activeSessionId);
-		(promptClient.socket as unknown as { write: ReturnType<typeof vi.fn> }).write = vi.fn();
-
-		internals.handleCommand(promptClient, {
-			id: "command-1",
-			type: "prompt",
-			activeSessionId: targetState.activeSessionId,
-			message: "first prompt",
-		});
-		internals.handleCommand(promptClient, {
-			id: "command-2",
-			type: "prompt",
-			activeSessionId: targetState.activeSessionId,
-			message: "second prompt",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		expect(prompt).toHaveBeenCalledTimes(2);
-
-		// The first prompt settles; the second is still in preflight, so agent
-		// messages must keep queueing (a plain Set would have lost the flag here).
-		promptResolves[0]?.();
-		await Promise.resolve();
-		await Promise.resolve();
-
-		await internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "agent message",
-			origin: "agent",
-		});
-
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-		expect(queueAgentMessagePrompt).toHaveBeenCalledOnce();
-		promptResolves[1]?.();
-	});
-
-	it("re-checks agent message queue capacity after waiting for the target lock", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const fromState = makeState("source");
-		const targetState = makeState("target");
-		fromState.runtime = {
-			...fromState.runtime,
-			session: { sessionId: "session-source", sessionName: "Source" },
-		} as never;
-		let resolveFirstPrompt: () => void = () => {};
-		const acceptAgentMessagePrompt = vi.fn(
-			() =>
-				new Promise<void>((resolve) => {
-					resolveFirstPrompt = resolve;
-				}),
-		);
-		const followUp = vi.fn(async () => true);
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
-				followUp,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				fromState?: ActiveSessionState;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(fromState.activeSessionId, fromState);
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const first = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "first",
-			fromState,
-			origin: "agent",
-		});
-		const second = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "second",
-			fromState,
-			origin: "agent",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-		(targetState.runtime.session as { unfinishedActionCount: number }).unfinishedActionCount = 20;
-
-		resolveFirstPrompt();
-		await expect(first).resolves.toMatchObject({ message: "first" });
-		await expect(second).rejects.toThrow("Target session has too many pending messages");
-		expect(followUp).not.toHaveBeenCalled();
-	});
-
 	it("rate limits CLI agent messages by stable daemon identity", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -3826,7 +3196,12 @@ describe("daemon mode helpers", () => {
 				sessionName: "Target",
 				isStreaming: false,
 				unfinishedActionCount: 0,
-				prompt: vi.fn(async () => {}),
+				acceptAgentMessagePrompt: vi.fn(
+					(_message: string, options?: { preflightResult?: (accepted: boolean) => void }) => {
+						options?.preflightResult?.(true);
+						return Promise.resolve();
+					},
+				),
 			},
 		} as never;
 		const internals = daemon as unknown as {
@@ -3853,266 +3228,6 @@ describe("daemon mode helpers", () => {
 				message: "over limit",
 			}),
 		).rejects.toThrow("Agent messaging rate limit exceeded");
-	});
-
-	it("holds the target lock while clearing queued agent messages", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let resolvePrompt: () => void = () => {};
-		const acceptAgentMessagePrompt = vi.fn(
-			(_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
-				options?.preflightResult?.(true);
-				return new Promise<void>((resolve) => {
-					resolvePrompt = resolve;
-				});
-			},
-		);
-		const clearQueuedUserMessagesMatching = vi.fn(() => ({ steering: [], followUp: [] }));
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const send = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "first",
-			origin: "agent",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-
-		const clear = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
-			id: "command-1",
-			type: "agent_messages_clear",
-			activeSessionId: targetState.activeSessionId,
-		});
-		await Promise.resolve();
-		expect(clearQueuedUserMessagesMatching).not.toHaveBeenCalled();
-
-		resolvePrompt();
-		await send;
-		await clear;
-		expect(clearQueuedUserMessagesMatching).toHaveBeenCalledOnce();
-	});
-
-	it("rejects agent messages when pause wins the target lock", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let resolveBlockedClear: () => void = () => {};
-		const clearQueuedUserMessagesMatching = vi.fn(
-			() =>
-				new Promise<{ steering: string[]; followUp: string[] }>((resolve) => {
-					resolveBlockedClear = () => resolve({ steering: [], followUp: [] });
-				}),
-		);
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const pause = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
-			id: "command-1",
-			type: "agent_messages_pause",
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-
-		const send = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "after pause requested",
-			origin: "agent",
-		});
-		await Promise.resolve();
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-
-		resolveBlockedClear();
-		await pause;
-		await expect(send).rejects.toThrow("Agent messaging is paused");
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-	});
-
-	it("rejects agent messages when the target session changes before delivery", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		let resolveBlockedClear: () => void = () => {};
-		const clearQueuedUserMessagesMatching = vi.fn(
-			() =>
-				new Promise<{ steering: string[]; followUp: string[] }>((resolve) => {
-					resolveBlockedClear = () => resolve({ steering: [], followUp: [] });
-				}),
-		);
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		targetState.runtime = {
-			...targetState.runtime,
-			cwd: "/tmp",
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const clear = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
-			id: "command-1",
-			type: "agent_messages_clear",
-			activeSessionId: targetState.activeSessionId,
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-
-		const send = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "after session switch",
-			origin: "agent",
-		});
-		await Promise.resolve();
-		(targetState.runtime.session as { sessionId: string }).sessionId = "session-replacement";
-		resolveBlockedClear();
-		await clear;
-
-		await expect(send).rejects.toThrow("Target session changed before agent message delivery");
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
-	});
-
-	it("rejects agent messages when the target session closes before delivery", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const targetState = makeState("target");
-		targetState.extensionUiRequests = new Map();
-		let resolveBlockedClear: () => void = () => {};
-		const clearQueuedUserMessagesMatching = vi.fn(
-			() =>
-				new Promise<{ steering: string[]; followUp: string[] }>((resolve) => {
-					resolveBlockedClear = () => resolve({ steering: [], followUp: [] });
-				}),
-		);
-		const acceptAgentMessagePrompt = vi.fn(async () => {});
-		const dispose = vi.fn(async () => {});
-		targetState.runtime = {
-			...targetState.runtime,
-			dispose,
-			cwd: "/tmp",
-			metadata: { kind: "subagent", createdAt: 1 },
-			session: {
-				sessionId: "session-target",
-				sessionName: "Target",
-				isStreaming: false,
-				unfinishedActionCount: 0,
-				messages: [],
-				acceptAgentMessagePrompt,
-				clearQueuedUserMessagesMatching,
-				abort: vi.fn(async () => {}),
-				dispose: vi.fn(),
-				sessionManager: { appendSessionState: vi.fn(), hasUserContent: () => true },
-			},
-		} as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			sendAgentSessionMessage(options: {
-				targetSelector: string;
-				message: string;
-				origin: "agent" | "cli";
-			}): Promise<unknown>;
-		};
-		internals.sessions.set(targetState.activeSessionId, targetState);
-
-		const clear = internals.handleCommand(makeClient("client-1", targetState.activeSessionId), {
-			id: "command-1",
-			type: "agent_messages_clear",
-			activeSessionId: targetState.activeSessionId,
-		});
-		await Promise.resolve();
-		await Promise.resolve();
-
-		const send = internals.sendAgentSessionMessage({
-			targetSelector: targetState.activeSessionId,
-			message: "after close requested",
-			origin: "agent",
-		});
-		await Promise.resolve();
-
-		const close = internals.handleCommand(makeClient("client-2", targetState.activeSessionId), {
-			id: "command-2",
-			type: "kill",
-			activeSessionId: targetState.activeSessionId,
-		});
-		await close;
-		expect(dispose).toHaveBeenCalledOnce();
-
-		resolveBlockedClear();
-		await clear;
-		await expect(send).rejects.toThrow("Target session is closing before agent message delivery");
-		expect(acceptAgentMessagePrompt).not.toHaveBeenCalled();
 	});
 
 	it("rejects agent messages to the sending session", async () => {
@@ -6070,7 +5185,7 @@ describe("daemon mode helpers", () => {
 
 			const explicitOpen = internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
 			await openStarted;
-			expect(internals.reservingSessionOpens.has(resolve(fixture.childSessionFile))).toBe(true);
+			expect(internals.reservingSessionOpens.has(canonicalSessionPath(fixture.childSessionFile))).toBe(true);
 
 			const hydration = internals.hydratePassiveRlmSubagent(passive);
 			const joined = Promise.all([explicitOpen, hydration]);
@@ -6092,6 +5207,97 @@ describe("daemon mode helpers", () => {
 		} finally {
 			releaseOpen();
 			openAsyncSpy?.mockRestore();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("waits for passive hydration to publish before rechecking a saved-session delete", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-hydrate-mutate-race-"));
+		let releaseHydration!: () => void;
+		const hydrationGate = new Promise<void>((resolve) => {
+			releaseHydration = resolve;
+		});
+		let markHydrationStarted!: () => void;
+		const hydrationStarted = new Promise<void>((resolve) => {
+			markHydrationStarted = resolve;
+		});
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, {
+				childRuntimeStarted: markHydrationStarted,
+				childRuntimeGate: hydrationGate,
+			});
+			const deleteSavedSessionFile = vi.fn(async () => ({ ok: true as const, method: "trash" as const }));
+			const internals = fixture.daemon as unknown as {
+				deleteSavedSessionFile: typeof deleteSavedSessionFile;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				findPassiveRlmSubagent(target: string): Promise<unknown>;
+				hydratePassiveRlmSubagent(passive: unknown): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const passive = await internals.findPassiveRlmSubagent(fixture.childId);
+			if (!passive) throw new Error("Missing passive child");
+			internals.deleteSavedSessionFile = deleteSavedSessionFile;
+
+			const hydration = internals.hydratePassiveRlmSubagent(passive);
+			await hydrationStarted;
+			const deletion = internals.handleCommand(makeClient("client", parentState.activeSessionId), {
+				type: "delete_saved_session",
+				activeSessionId: parentState.activeSessionId,
+				sessionPath: fixture.childSessionFile,
+			});
+			await Promise.resolve();
+			expect(deleteSavedSessionFile).not.toHaveBeenCalled();
+			releaseHydration();
+			await hydration;
+			await expect(deletion).rejects.toThrow("Cannot delete the currently active session");
+			expect(deleteSavedSessionFile).not.toHaveBeenCalled();
+		} finally {
+			releaseHydration();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("propagates a failed saved-session mutation to racing passive hydration", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-mutate-hydrate-failure-"));
+		let releaseDelete!: () => void;
+		const deleteGate = new Promise<void>((resolve) => {
+			releaseDelete = resolve;
+		});
+		let markDeleteStarted!: () => void;
+		const deleteStarted = new Promise<void>((resolve) => {
+			markDeleteStarted = resolve;
+		});
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				deleteSavedSessionFile: ReturnType<typeof vi.fn>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				getOrHydrateBoundSessionState(target: string): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			internals.deleteSavedSessionFile = vi.fn(async () => {
+				markDeleteStarted();
+				await deleteGate;
+				throw new Error("physical delete failed");
+			});
+
+			const deletion = internals.handleCommand(makeClient("client", parentState.activeSessionId), {
+				type: "delete_saved_session",
+				activeSessionId: parentState.activeSessionId,
+				sessionPath: fixture.childSessionFile,
+			});
+			await deleteStarted;
+			const hydration = internals.getOrHydrateBoundSessionState(fixture.childId);
+			await Promise.resolve();
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+			releaseDelete();
+			await expect(deletion).rejects.toThrow("physical delete failed");
+			await expect(hydration).rejects.toThrow("physical delete failed");
+			expect(fixture.createRuntime).toHaveBeenCalledOnce();
+		} finally {
+			releaseDelete();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -6448,7 +5654,7 @@ describe("daemon mode helpers", () => {
 				session: makeRuntimeSession(SessionManager.open(fixture.childSessionFile, fixture.childSessionDir)),
 			});
 			internals.sessions.set(wrongState.activeSessionId, wrongState);
-			internals.openingSessions.set(resolve(fixture.childSessionFile), Promise.resolve(wrongState));
+			internals.openingSessions.set(canonicalSessionPath(fixture.childSessionFile), Promise.resolve(wrongState));
 
 			const childState = await internals.hydratePassiveRlmSubagent(passive);
 
@@ -6635,7 +5841,10 @@ describe("daemon mode helpers", () => {
 				if (sessionFile !== fixture.grandchildSessionFile) return;
 				internals.sessions.delete(staleParent.activeSessionId);
 				internals.sessions.set(residentGrandchild.activeSessionId, residentGrandchild);
-				internals.openingSessions.set(resolve(fixture.grandchildSessionFile), Promise.resolve(residentGrandchild));
+				internals.openingSessions.set(
+					canonicalSessionPath(fixture.grandchildSessionFile),
+					Promise.resolve(residentGrandchild),
+				);
 			});
 
 			await expect(internals.hydratePassiveRlmSubagent(passive)).resolves.toBe(residentGrandchild);
@@ -6764,7 +5973,7 @@ describe("daemon mode helpers", () => {
 						promise: passivation,
 						reason: "shutdown",
 					});
-					internals.passivatingSessions.set(resolve(fixture.childSessionFile), passivation);
+					internals.passivatingSessions.set(canonicalSessionPath(fixture.childSessionFile), passivation);
 					markRaceStarted();
 					return internals.waitForBoundSession(closingChild);
 				}
@@ -6918,7 +6127,7 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
-	it("re-adopts a resident child when its passivation close fails", async () => {
+	it("keeps ownership of a resident child until passivation succeeds", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-passivation-close-failure-"));
 		let releaseAbort!: () => void;
 		const abortGate = new Promise<void>((resolve) => {
@@ -6942,7 +6151,6 @@ describe("daemon mode helpers", () => {
 			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
 			const parentSession = parentState.runtime.session as unknown as {
 				releaseRlmChildSession: ReturnType<typeof vi.fn>;
-				registerRlmChildSession: ReturnType<typeof vi.fn>;
 			};
 			let parentOwnsChild = true;
 			let forwarderActive = true;
@@ -6955,16 +6163,11 @@ describe("daemon mode helpers", () => {
 			});
 			parentSession.releaseRlmChildSession = vi.fn(() => {
 				if (!parentOwnsChild) return false;
-				parentOwnsChild = false;
-				return unsubscribeForwarder;
+				return () => {
+					parentOwnsChild = false;
+					unsubscribeForwarder();
+				};
 			});
-			parentSession.registerRlmChildSession = vi.fn(
-				(_childId: string, _childSession: unknown, unsubscribe: () => void) => {
-					parentOwnsChild = true;
-					forwarderActive = unsubscribe === unsubscribeForwarder;
-					return true;
-				},
-			);
 			childState.unsubscribe = vi
 				.fn()
 				.mockImplementationOnce(() => {
@@ -6990,11 +6193,6 @@ describe("daemon mode helpers", () => {
 			await expect(delivery).resolves.toMatchObject({ deliveryStatus: "delivered" });
 			expect(internals.sessions.get(childState.activeSessionId)).toBe(childState);
 			expect(parentOwnsChild).toBe(true);
-			expect(parentSession.registerRlmChildSession).toHaveBeenCalledWith(
-				fixture.childId,
-				childState.runtime.session,
-				unsubscribeForwarder,
-			);
 			expect(unsubscribeForwarder).not.toHaveBeenCalled();
 			emitChildUpdate("recap after failed close");
 			expect(parentUpdates).toEqual(["recap after failed close"]);
@@ -7326,28 +6524,31 @@ describe("daemon mode helpers", () => {
 			const fixture = makePersistedRlmDaemonFixture(tempDir);
 			const internals = fixture.daemon as unknown as {
 				sessions: Map<string, ActiveSessionState>;
+				rlmDeletionAdmissionFences: Map<string, unknown>;
 				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
 				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
 			};
 			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
 			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
-			let isStreaming = true;
-			Object.defineProperty(childState.runtime.session, "isStreaming", { get: () => isStreaming });
+			let isBusy = true;
+			Object.defineProperty(childState.runtime.session, "isStreaming", { get: () => false });
 			Object.defineProperty(childState.runtime.session, "unfinishedActionCount", { get: () => 0 });
+			Object.defineProperty(childState.runtime.session, "isSessionActive", { get: () => isBusy });
 			const parentSession = parentState.runtime.session as unknown as {
 				deleteInactiveRlmSubagent: ReturnType<typeof vi.fn>;
 			};
-			const deleteSpy = vi.fn(async (childId: string, isExternallyRunning: () => boolean) => {
-				if (isExternallyRunning()) return "running" as const;
-				await (
-					fixture.daemon as unknown as {
-						createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
-					}
-				)
-					.createSubagentRuntimeHost(parentState)
-					.deleteRlmSubagentRuntime(childId, childState.runtime.session);
-				return "deleted" as const;
-			});
+			const runtimeHost = (
+				fixture.daemon as unknown as {
+					createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				}
+			).createSubagentRuntimeHost(parentState);
+			const deleteSpy = vi.fn(async (childId: string) =>
+				runtimeHost.withRlmSubagentDeletion!(childId, async (isFamilyBusy) => {
+					if (isFamilyBusy()) return "running" as const;
+					await runtimeHost.deleteRlmSubagentRuntime(childId, childState.runtime.session);
+					return "deleted" as const;
+				}),
+			);
 			parentSession.deleteInactiveRlmSubagent = deleteSpy;
 			const client = makeClient("client-1", parentState.activeSessionId);
 
@@ -7357,18 +6558,200 @@ describe("daemon mode helpers", () => {
 				childId: fixture.childId,
 			})) as { data: { deleted: boolean; reason?: string } };
 			expect(busy.data).toEqual({ deleted: false, reason: "running" });
-			expect(deleteSpy).not.toHaveBeenCalled();
+			expect(deleteSpy).toHaveBeenCalledOnce();
 			expect(internals.sessions.get(childState.activeSessionId)).toBe(childState);
+			expect(internals.rlmDeletionAdmissionFences.size).toBe(0);
 
-			isStreaming = false;
+			isBusy = false;
 			const idle = (await internals.handleCommand(client, {
 				type: "delete_rlm_subagent",
 				activeSessionId: parentState.activeSessionId,
 				childId: fixture.childId,
 			})) as { data: { deleted: boolean } };
 			expect(idle.data).toEqual({ deleted: true });
+			expect(deleteSpy).toHaveBeenCalledTimes(2);
 			expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+			expect(internals.rlmDeletionAdmissionFences.size).toBe(0);
 		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rechecks resident child activity inside the inactive-delete callback", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-rlm-delete-toctou-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			let isBusy = false;
+			Object.defineProperty(childState.runtime.session, "isSessionActive", { get: () => isBusy });
+			childState.runtime.session.hasRunningRlmChildren = () => false;
+			const parentSession = parentState.runtime.session as unknown as {
+				deleteInactiveRlmSubagent: ReturnType<typeof vi.fn>;
+			};
+			const runtimeHost = (
+				fixture.daemon as unknown as {
+					createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				}
+			).createSubagentRuntimeHost(parentState);
+			parentSession.deleteInactiveRlmSubagent = vi.fn(async (childId: string) =>
+				runtimeHost.withRlmSubagentDeletion!(childId, async (isFamilyBusy) => {
+					isBusy = true;
+					return isFamilyBusy() ? ("running" as const) : ("deleted" as const);
+				}),
+			);
+
+			const result = (await internals.handleCommand(makeClient("client-1", parentState.activeSessionId), {
+				type: "delete_rlm_subagent",
+				activeSessionId: parentState.activeSessionId,
+				childId: fixture.childId,
+			})) as { data: { deleted: boolean; reason?: string } };
+
+			expect(result.data).toEqual({ deleted: false, reason: "running" });
+			expect(parentSession.deleteInactiveRlmSubagent).toHaveBeenCalledOnce();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fences direct and descendant work through deletion persistence and close", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-rlm-delete-fence-"));
+		let releasePersistence = () => {};
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				rlmDeletionAdmissionFences: Map<string, unknown>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				handleLine(client: DaemonSocketClient, line: string): Promise<void>;
+				recordRlmSubagentDeletion(
+					parent: ActiveSessionState,
+					childId: string,
+					reason?: "user" | "parent-teardown" | "revoked" | "gc",
+				): Promise<void>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const grandchildState = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.grandchildSessionFile,
+			});
+			expect(grandchildState.runtime.metadata.parentActiveSessionId).toBe(childState.activeSessionId);
+			const childBash = vi.fn();
+			const grandchildBash = vi.fn();
+			Object.assign(childState.runtime.session, { runUserBash: childBash });
+			Object.assign(grandchildState.runtime.session, { runUserBash: grandchildBash });
+
+			let markPersistenceStarted!: () => void;
+			const persistenceStarted = new Promise<void>((resolve) => {
+				markPersistenceStarted = resolve;
+			});
+			const persistenceGate = new Promise<void>((resolve) => {
+				releasePersistence = resolve;
+			});
+			const originalRecordDeletion = internals.recordRlmSubagentDeletion.bind(fixture.daemon);
+			internals.recordRlmSubagentDeletion = vi.fn(async (parent, childId, reason) => {
+				markPersistenceStarted();
+				await persistenceGate;
+				await originalRecordDeletion(parent, childId, reason);
+			});
+			const parentSession = parentState.runtime.session as unknown as {
+				deleteInactiveRlmSubagent: ReturnType<typeof vi.fn>;
+			};
+			const runtimeHost = internals.createSubagentRuntimeHost(parentState);
+			parentSession.deleteInactiveRlmSubagent = vi.fn(async (childId: string) =>
+				runtimeHost.withRlmSubagentDeletion!(childId, async (isFamilyBusy) => {
+					if (isFamilyBusy()) return "running" as const;
+					await runtimeHost.deleteRlmSubagentRuntime(childId, childState.runtime.session);
+					return "deleted" as const;
+				}),
+			);
+
+			const deletion = internals.handleCommand(makeClient("delete-client", parentState.activeSessionId), {
+				type: "delete_rlm_subagent",
+				activeSessionId: parentState.activeSessionId,
+				childId: fixture.childId,
+			});
+			await persistenceStarted;
+			expect(internals.rlmDeletionAdmissionFences.size).toBe(1);
+
+			for (const [target, bash] of [
+				[childState, childBash],
+				[grandchildState, grandchildBash],
+			] as const) {
+				const workClient = makeClient(`work-${target.activeSessionId}`, target.activeSessionId);
+				const write = vi.fn(() => true);
+				workClient.socket.write = write;
+				await internals.handleLine(
+					workClient,
+					JSON.stringify({
+						id: `bash-${target.activeSessionId}`,
+						type: "execute_bash",
+						activeSessionId: target.activeSessionId,
+						command: "echo must-not-run",
+					}),
+				);
+				expect(write).toHaveBeenCalledWith(expect.stringContaining('"success":false'));
+				expect(write).toHaveBeenCalledWith(expect.stringContaining("target RLM subagent family is being deleted"));
+				expect(bash).not.toHaveBeenCalled();
+			}
+
+			releasePersistence();
+			await expect(deletion).resolves.toMatchObject({ data: { deleted: true } });
+			expect(internals.sessions.has(childState.activeSessionId)).toBe(false);
+			expect(internals.sessions.has(grandchildState.activeSessionId)).toBe(false);
+			expect(internals.rlmDeletionAdmissionFences.size).toBe(0);
+		} finally {
+			releasePersistence();
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the host deletion fence through Python deletion artifact cleanup", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-python-delete-fence-"));
+		let releaseCleanup!: () => void;
+		const cleanupGate = new Promise<void>((resolve) => {
+			releaseCleanup = resolve;
+		});
+		let markCleanupStarted!: () => void;
+		const cleanupStarted = new Promise<void>((resolve) => {
+			markCleanupStarted = resolve;
+		});
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				rlmDeletionAdmissionFences: Map<string, unknown>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				deleteRlmSubagentArtifacts(childId: string, sessionFile: string): Promise<void>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const originalCleanup = internals.deleteRlmSubagentArtifacts.bind(fixture.daemon);
+			internals.deleteRlmSubagentArtifacts = vi.fn(async (childId, sessionFile) => {
+				markCleanupStarted();
+				await cleanupGate;
+				await originalCleanup(childId, sessionFile);
+			});
+
+			const runtimeHost = internals.createSubagentRuntimeHost(parentState);
+			const deletion = runtimeHost.withRlmSubagentDeletion!(fixture.childId, async () => {
+				await runtimeHost.deleteRlmSubagentRuntime(fixture.childId, childState.runtime.session);
+				return { subagent: { rlm_child_id: fixture.childId } };
+			});
+			await cleanupStarted;
+			expect(internals.rlmDeletionAdmissionFences.size).toBe(1);
+			releaseCleanup();
+			await expect(deletion).resolves.toMatchObject({ subagent: { rlm_child_id: fixture.childId } });
+			expect(internals.rlmDeletionAdmissionFences.size).toBe(0);
+		} finally {
+			releaseCleanup();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -7393,12 +6776,23 @@ describe("daemon mode helpers", () => {
 				},
 				session: nestedSession,
 			} as ActiveSessionState["runtime"];
-			Object.defineProperty(nestedState.runtime.session, "isStreaming", { get: () => true });
+			Object.defineProperty(nestedState.runtime.session, "isStreaming", { get: () => false });
 			Object.defineProperty(nestedState.runtime.session, "unfinishedActionCount", { get: () => 0 });
+			Object.defineProperty(nestedState.runtime.session, "isSessionActive", { get: () => false });
+			nestedState.runtime.session.hasRunningRlmChildren = () => true;
 			const rootSession = rootState.runtime.session as unknown as {
 				deleteInactiveRlmSubagent: ReturnType<typeof vi.fn>;
 			};
-			const deleteSpy = vi.fn(async () => "deleted" as const);
+			const runtimeHost = (
+				fixture.daemon as unknown as {
+					createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				}
+			).createSubagentRuntimeHost(rootState);
+			const deleteSpy = vi.fn(async (childId: string) =>
+				runtimeHost.withRlmSubagentDeletion!(childId, async (isFamilyBusy) =>
+					isFamilyBusy() ? ("running" as const) : ("deleted" as const),
+				),
+			);
 			rootSession.deleteInactiveRlmSubagent = deleteSpy;
 
 			const result = (await internals.handleCommand(makeClient("client-1", rootState.activeSessionId), {
@@ -7408,7 +6802,7 @@ describe("daemon mode helpers", () => {
 			})) as { data: { deleted: boolean; reason?: string } };
 
 			expect(result.data).toEqual({ deleted: false, reason: "running" });
-			expect(deleteSpy).not.toHaveBeenCalled();
+			expect(deleteSpy).toHaveBeenCalledOnce();
 			expect(internals.sessions.get(nestedState.activeSessionId)).toBe(nestedState);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
@@ -7493,6 +6887,57 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("keeps a child retryable after display deletion succeeds but the ledger tombstone fails", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-retry-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				closeSession(state: ActiveSessionState, reason: "shutdown"): Promise<void>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				listPassiveRlmSubagents(): Promise<Array<{ entry: { childId: string; status: string } }>>;
+				rlmSpawnLedger(): RlmSpawnLedger;
+				rlmSpawnLedgerInstance?: RlmSpawnLedger;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const ledger = internals.rlmSpawnLedger();
+			vi.spyOn(ledger, "appendDelete").mockRejectedValueOnce(new Error("ledger append failed"));
+
+			await expect(
+				internals.createSubagentRuntimeHost(parentState).deleteRlmSubagentRuntime(fixture.childId),
+			).rejects.toThrow("ledger append failed");
+			const failedDisplay = JSON.parse(readFileSync(join(fixture.childSessionDir, "rlm-subagent.json"), "utf8")) as {
+				status: string;
+			};
+			expect(failedDisplay.status).toBe("deleted");
+			expect(await internals.listPassiveRlmSubagents()).toContainEqual(
+				expect.objectContaining({
+					entry: expect.objectContaining({ childId: fixture.childId, status: "completed" }),
+				}),
+			);
+
+			await internals.closeSession(parentState, "shutdown");
+			internals.rlmSpawnLedgerInstance = undefined;
+			const reloadedParent = await internals.createRuntime({
+				type: "create",
+				sessionPath: fixture.parentSessionFile,
+			});
+			expect(await internals.listPassiveRlmSubagents()).toContainEqual(
+				expect.objectContaining({
+					entry: expect.objectContaining({ childId: fixture.childId, status: "completed" }),
+				}),
+			);
+
+			await internals.createSubagentRuntimeHost(reloadedParent).deleteRlmSubagentRuntime(fixture.childId);
+			expect((await internals.listPassiveRlmSubagents()).map(({ entry }) => entry.childId)).not.toContain(
+				fixture.childId,
+			);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("removes a deleted child's nested artifact dir but keeps its transcript and display tombstone", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-artifact-cleanup-"));
 		try {
@@ -7525,6 +6970,84 @@ describe("daemon mode helpers", () => {
 			expect(existsSync(fixture.childArtifactDir)).toBe(false);
 			expect(existsSync(fixture.childSessionFile)).toBe(true);
 		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("deletes a resident child without awaiting its pending trace upload and skips the doomed kernel snapshot", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-trace-flush-"));
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir);
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			const childManager = childState.runtime.session.sessionManager as SessionManager;
+			const { calls, releaseFetch } = installGatedTraceUpload(childManager);
+			childManager.appendMessage({ role: "user", content: "pending trace data", timestamp: 3 });
+			childManager.flushNow();
+
+			// The fetch gate is still held: the delete must not await the upload.
+			await internals
+				.createSubagentRuntimeHost(parentState)
+				.deleteRlmSubagentRuntime(fixture.childId, childState.runtime.session);
+
+			await vi.waitFor(() => expect(calls).toHaveLength(1));
+			expect(childState.runtime.session.disposeAsync).toHaveBeenCalledWith({ kernelSnapshot: false });
+			releaseFetch();
+			await flushAgentTraceUpload(childManager);
+			expect(calls).toHaveLength(1);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a delete that joins an in-flight passivation close without awaiting the trace upload", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-passivation-flush-"));
+		let releaseDispose!: () => void;
+		const disposeGate = new Promise<void>((resolve) => {
+			releaseDispose = resolve;
+		});
+		let markDisposeStarted!: () => void;
+		const disposeStarted = new Promise<void>((resolve) => {
+			markDisposeStarted = resolve;
+		});
+		try {
+			const fixture = makePersistedRlmDaemonFixture(tempDir, {
+				childDisposeStarted: markDisposeStarted,
+				childDisposeGate: disposeGate,
+			});
+			const internals = fixture.daemon as unknown as {
+				createRuntime(command: Extract<DaemonCommand, { type: "create" }>): Promise<ActiveSessionState>;
+				createSubagentRuntimeHost(parent: ActiveSessionState): SubagentRuntimeHost;
+				passivateIdleChildren(threshold: number, now: number, limit: number): Promise<number>;
+			};
+			const parentState = await internals.createRuntime({ type: "create", sessionPath: fixture.parentSessionFile });
+			const childState = await internals.createRuntime({ type: "create", sessionPath: fixture.childSessionFile });
+			(
+				parentState.runtime.session as unknown as { releaseRlmChildSession: ReturnType<typeof vi.fn> }
+			).releaseRlmChildSession = vi.fn(() => vi.fn());
+			const childManager = childState.runtime.session.sessionManager as SessionManager;
+			const { calls, releaseFetch } = installGatedTraceUpload(childManager);
+			childManager.appendMessage({ role: "user", content: "pending trace data", timestamp: 3 });
+			childManager.flushNow();
+
+			const passivation = internals.passivateIdleChildren(90, Date.parse("2036-08-01T12:00:00Z"), 1);
+			await disposeStarted;
+			const deletion = internals
+				.createSubagentRuntimeHost(parentState)
+				.deleteRlmSubagentRuntime(fixture.childId, childState.runtime.session);
+			releaseDispose();
+			// Both resolve while the fetch gate is still held.
+			await Promise.all([passivation, deletion]);
+			expect(calls).toHaveLength(1);
+			expect(childState.runtime.session.disposeAsync).toHaveBeenCalledWith({ kernelSnapshot: true });
+			releaseFetch();
+			await flushAgentTraceUpload(childManager);
+		} finally {
+			releaseDispose();
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
@@ -7894,7 +7417,12 @@ describe("daemon mode helpers", () => {
 			});
 			const createRuntime = vi.fn(async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
 				const session = makeRuntimeSession(options.sessionManager);
-				session.prompt = vi.fn(async () => {});
+				session.acceptAgentMessagePrompt = vi.fn(
+					(_message: string, promptOptions?: { preflightResult?: (accepted: boolean) => void }) => {
+						promptOptions?.preflightResult?.(true);
+						return Promise.resolve();
+					},
+				);
 				session.bindExtensions = vi.fn(async () => {
 					await bindBarrier;
 				});
@@ -8453,6 +7981,40 @@ describe("daemon mode helpers", () => {
 		}
 	});
 
+	it("blocks deleting a live session through a symlinked path", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-symlink-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const sessionFile = join(tempDir, "live-session.jsonl");
+			writeFileSync(sessionFile, "");
+			const linkPath = join(tempDir, "live-session-link.jsonl");
+			symlinkSync(sessionFile, linkPath);
+			const state = makeState("active-1");
+			(state.runtime as { session?: unknown }).session = { sessionFile };
+			internals.sessions.set(state.activeSessionId, state);
+
+			await expect(
+				internals.handleCommand(makeClient("client-1", "active-1"), {
+					id: "command-1",
+					type: "delete_saved_session",
+					sessionPath: linkPath,
+				}),
+			).rejects.toThrow("Cannot delete the currently active session");
+			expect(existsSync(sessionFile)).toBe(true);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("cancels scheduled jobs when a saved session is deleted", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-cron-"));
 		try {
@@ -8646,13 +8208,244 @@ describe("daemon mode helpers", () => {
 			});
 
 			expect(response).toMatchObject({ data: { ok: false, error: "delete failed" } });
-			expect(deleteSavedSessionFile).toHaveBeenCalledWith(sessionFile, {
+			expect(deleteSavedSessionFile).toHaveBeenCalledWith(canonicalSessionPath(sessionFile), {
 				afterFileRemoved: expect.any(Function),
 			});
 			expect(internals.cronStore.list().find((job) => job.id === cron.id)).toMatchObject({ status: "active" });
 			expect(internals.cronStore.list().find((job) => job.id === heartbeat.id)).toMatchObject({
 				status: "active",
 			});
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("appends a saved-session tombstone only after physical deletion succeeds", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-delete-tombstone-gate-"));
+		try {
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const deleteSavedSessionFile = vi
+				.fn()
+				.mockResolvedValueOnce({ ok: false as const, error: "permission denied" })
+				.mockResolvedValueOnce({ ok: true as const, method: "trash" as const })
+				.mockResolvedValueOnce({ ok: true as const, method: "unlink" as const });
+			const appendDeleteByChildPath = vi.fn(async () => {});
+			const internals = daemon as unknown as {
+				deleteSavedSessionFile: typeof deleteSavedSessionFile;
+				rlmSpawnLedger(): { appendDeleteByChildPath: typeof appendDeleteByChildPath };
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			internals.deleteSavedSessionFile = deleteSavedSessionFile;
+			internals.rlmSpawnLedger = () => ({ appendDeleteByChildPath });
+			const failedPath = join(tempDir, "failed.jsonl");
+			const missingPath = join(tempDir, "already-missing.jsonl");
+
+			await expect(
+				internals.handleCommand(makeClient("client-1", "detached"), {
+					type: "delete_saved_session",
+					sessionPath: failedPath,
+				}),
+			).resolves.toMatchObject({ data: { ok: false } });
+			expect(appendDeleteByChildPath).not.toHaveBeenCalled();
+			await expect(
+				internals.handleCommand(makeClient("client-1", "detached"), {
+					type: "delete_saved_session",
+					sessionPath: missingPath,
+				}),
+			).resolves.toMatchObject({ data: { ok: true } });
+			expect(appendDeleteByChildPath).toHaveBeenCalledOnce();
+			expect(appendDeleteByChildPath).toHaveBeenCalledWith(canonicalSessionPath(missingPath), "user");
+
+			appendDeleteByChildPath.mockRejectedValueOnce(new Error("ledger append failed"));
+			await expect(
+				internals.handleCommand(makeClient("client-1", "detached"), {
+					type: "delete_saved_session",
+					sessionPath: join(tempDir, "physically-removed.jsonl"),
+				}),
+			).rejects.toThrow("ledger append failed");
+			expect(deleteSavedSessionFile).toHaveBeenCalledTimes(3);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed and verifies worker-routed nested saved-session tombstones", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-worker-nested-delete-"));
+		try {
+			const sessionsDir = join(tempDir, "sessions");
+			const wrongSessionsDir = join(tempDir, "wrong-sessions");
+			mkdirSync(sessionsDir, { recursive: true });
+			mkdirSync(wrongSessionsDir, { recursive: true });
+			const rootPath = join(sessionsDir, "root.jsonl");
+			const childPath = join(tempDir, "session-artifacts", "root", "sub-child", "child.jsonl");
+			writeFileSync(rootPath, "{}\n");
+			mkdirSync(resolve(childPath, ".."), { recursive: true });
+			writeFileSync(childPath, "{}\n");
+			let workerIndex = 0;
+
+			const makeWorker = () => {
+				const daemon = new AgentDaemon(join(tempDir, `daemon-${workerIndex++}.sock`), {
+					defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: sessionsDir },
+					createRuntime: async () => {
+						throw new Error("unexpected runtime creation");
+					},
+					worker: { authenticationToken: "worker-token" },
+				});
+				const rootState = makeAgentFamilyState("root-active", "root").state;
+				Object.defineProperty(rootState.runtime.session, "sessionFile", { value: rootPath });
+				const internals = daemon as unknown as {
+					canonicalWorkerSessionsDir: string;
+					sessions: Map<string, ActiveSessionState>;
+					deleteSavedSessionFile: ReturnType<typeof vi.fn>;
+					rlmSpawnLedger(): RlmSpawnLedger;
+					handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+				};
+				internals.canonicalWorkerSessionsDir = sessionsDir;
+				internals.sessions.set(rootState.activeSessionId, rootState);
+				return { daemon, internals, rootState };
+			};
+
+			await new RlmSpawnLedger(tempDir, wrongSessionsDir).appendSpawn({
+				childId: "wrong-child",
+				parent: join(wrongSessionsDir, "root.jsonl"),
+				child: childPath,
+				depth: 1,
+				name: "wrong-owner",
+			});
+			const missing = makeWorker();
+			missing.internals.deleteSavedSessionFile = vi.fn(async () => ({ ok: true, method: "trash" }));
+			await expect(
+				missing.internals.handleCommand(makeClient("client", missing.rootState.activeSessionId), {
+					type: "delete_saved_session",
+					activeSessionId: missing.rootState.activeSessionId,
+					sessionDir: sessionsDir,
+					sessionPath: childPath,
+				}),
+			).rejects.toThrow("No authoritative RLM ledger edge contains child session");
+			expect(missing.internals.deleteSavedSessionFile).not.toHaveBeenCalled();
+
+			const wrongParent = makeWorker();
+			const wrongParentChildPath = join(tempDir, "session-artifacts", "other-root", "sub-child", "child.jsonl");
+			mkdirSync(resolve(wrongParentChildPath, ".."), { recursive: true });
+			writeFileSync(wrongParentChildPath, "{}\n");
+			await wrongParent.internals.rlmSpawnLedger().appendSpawn({
+				childId: "wrong-parent-child",
+				parent: join(sessionsDir, "other-root.jsonl"),
+				child: wrongParentChildPath,
+				depth: 1,
+				name: "wrong-parent",
+			});
+			wrongParent.internals.deleteSavedSessionFile = vi.fn(async () => ({ ok: true, method: "trash" }));
+			await expect(
+				wrongParent.internals.handleCommand(makeClient("client", wrongParent.rootState.activeSessionId), {
+					type: "delete_saved_session",
+					activeSessionId: wrongParent.rootState.activeSessionId,
+					sessionDir: sessionsDir,
+					sessionPath: wrongParentChildPath,
+				}),
+			).rejects.toThrow("does not reach worker context");
+			expect(wrongParent.internals.deleteSavedSessionFile).not.toHaveBeenCalled();
+
+			const postcondition = makeWorker();
+			const edge = {
+				childId: "sub-child",
+				parent: canonicalSessionPath(rootPath),
+				child: canonicalSessionPath(childPath),
+				depth: 1,
+				name: "child",
+			};
+			const edgeByChildPath = vi.fn(async () => edge);
+			const appendDeleteByChildPath = vi.fn(async () => {});
+			Object.assign(postcondition.daemon, {
+				rlmSpawnLedger: () => ({
+					edgeByChildPath,
+					edges: async () => [edge],
+					appendDeleteByChildPath,
+				}),
+			});
+			postcondition.internals.deleteSavedSessionFile = vi.fn(async () => ({ ok: true, method: "trash" }));
+			await expect(
+				postcondition.internals.handleCommand(makeClient("client", postcondition.rootState.activeSessionId), {
+					type: "delete_saved_session",
+					activeSessionId: postcondition.rootState.activeSessionId,
+					sessionDir: sessionsDir,
+					sessionPath: childPath,
+				}),
+			).rejects.toThrow("RLM ledger did not tombstone child session");
+			expect(appendDeleteByChildPath).toHaveBeenCalledOnce();
+
+			const idempotent = makeWorker();
+			const ledger = idempotent.internals.rlmSpawnLedger();
+			await ledger.appendSpawn({
+				childId: "sub-child",
+				parent: rootPath,
+				child: childPath,
+				depth: 1,
+				name: "child",
+			});
+			await ledger.appendDelete({ childId: "sub-child", child: childPath, reason: "user" });
+			idempotent.internals.deleteSavedSessionFile = vi.fn(async () => ({ ok: true, method: "unlink" }));
+			await expect(
+				idempotent.internals.handleCommand(makeClient("client", idempotent.rootState.activeSessionId), {
+					type: "delete_saved_session",
+					activeSessionId: idempotent.rootState.activeSessionId,
+					sessionDir: sessionsDir,
+					sessionPath: childPath,
+				}),
+			).resolves.toMatchObject({ data: { ok: true } });
+			expect(await ledger.edgeByChildPath(childPath)).toMatchObject({ deleted: "user" });
+
+			const rootDelete = makeWorker();
+			rootDelete.internals.deleteSavedSessionFile = vi.fn(async () => ({ ok: true, method: "unlink" }));
+			await expect(
+				rootDelete.internals.handleCommand(makeClient("client", rootDelete.rootState.activeSessionId), {
+					type: "delete_saved_session",
+					activeSessionId: rootDelete.rootState.activeSessionId,
+					sessionDir: sessionsDir,
+					sessionPath: join(sessionsDir, "already-missing-root.jsonl"),
+				}),
+			).resolves.toMatchObject({ data: { ok: true } });
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an active saved-session delete through an alternate canonical path spelling", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-agent-daemon-canonical-active-delete-"));
+		try {
+			const sessionPath = join(tempDir, "active.jsonl");
+			const aliasPath = join(tempDir, "active-alias.jsonl");
+			writeFileSync(sessionPath, "{}\n");
+			symlinkSync(sessionPath, aliasPath);
+			const daemon = new AgentDaemon(join(tempDir, "daemon.sock"), {
+				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir },
+				createRuntime: async () => {
+					throw new Error("unexpected runtime creation");
+				},
+			});
+			const deleteSavedSessionFile = vi.fn();
+			const internals = daemon as unknown as {
+				sessions: Map<string, ActiveSessionState>;
+				deleteSavedSessionFile: typeof deleteSavedSessionFile;
+				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
+			};
+			const { state } = makeAgentFamilyState("active", "active");
+			Object.defineProperty(state.runtime.session, "sessionFile", { value: sessionPath });
+			internals.sessions.set(state.activeSessionId, state);
+			internals.deleteSavedSessionFile = deleteSavedSessionFile;
+
+			await expect(
+				internals.handleCommand(makeClient("client-1", state.activeSessionId), {
+					type: "delete_saved_session",
+					sessionPath: aliasPath,
+				}),
+			).rejects.toThrow("Cannot delete the currently active session");
+			expect(deleteSavedSessionFile).not.toHaveBeenCalled();
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -8894,126 +8687,6 @@ describe("daemon mode helpers", () => {
 		expect(fixture.followUp).not.toHaveBeenCalled();
 	});
 
-	it("delivers steer heartbeats after an RPC prompt finishes preflight while its turn is still streaming", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		let releasePrompt = () => {};
-		const promptFinished = new Promise<void>((resolve) => {
-			releasePrompt = resolve;
-		});
-		let reportPromptStarted = () => {};
-		const promptStarted = new Promise<void>((resolve) => {
-			reportPromptStarted = resolve;
-		});
-		const sessionState = {
-			isStreaming: false,
-			isBashRunning: false,
-			hasPendingSessionWork: false,
-			unfinishedActionCount: 1,
-			sessionActions: { queuedCount: 0, steering: [], followUps: [] },
-		};
-		const prompt = vi.fn(async (_message: string, options?: { preflightResult?: (didSucceed: boolean) => void }) => {
-			sessionState.isStreaming = true;
-			options?.preflightResult?.(true);
-			reportPromptStarted();
-			await promptFinished;
-		});
-		const promptHeartbeat = vi.fn(
-			async (
-				_job: AgentCronJob,
-				options?: { streamingBehavior?: "steer" | "followUp"; preflightResult?: (didSucceed: boolean) => void },
-			) => {
-				options?.preflightResult?.(true);
-			},
-		);
-		const state = makeState("active-1") as ActiveSessionState & {
-			runtime: ActiveSessionState["runtime"] & {
-				session: typeof sessionState & {
-					prompt: typeof prompt;
-					promptHeartbeat: typeof promptHeartbeat;
-				};
-			};
-		};
-		state.runtime.session = Object.assign(sessionState, { prompt, promptHeartbeat }) as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			agentMessagePreparingTargets: Map<string, number>;
-			promptWithAgentMessagePreparingGuard(state: ActiveSessionState, message: string): Promise<void>;
-			runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-
-		const promptPromise = internals.promptWithAgentMessagePreparingGuard(state, "long-running prompt");
-		await promptStarted;
-		const preparingReleased = !internals.agentMessagePreparingTargets.has(state.activeSessionId);
-		const result = await internals.runCronJob(
-			makeCronJob({ id: "heartbeat-1", source: "heartbeat", activeSessionId: state.activeSessionId }),
-		);
-		releasePrompt();
-		await promptPromise;
-
-		expect(preparingReleased).toBe(true);
-		expect(result).toBeUndefined();
-		expect(promptHeartbeat).toHaveBeenCalledWith(
-			expect.objectContaining({ id: "heartbeat-1" }),
-			expect.objectContaining({ streamingBehavior: "steer" }),
-		);
-	});
-
-	it.each(["steer", "follow_up"] as const)(
-		"idle daemon %s inserts into its scheduler lane exactly once",
-		async (type) => {
-			const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-				defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-				createRuntime: async () => {
-					throw new Error("unexpected runtime creation");
-				},
-			});
-			const steer = vi.fn(async () => {});
-			const followUp = vi.fn(async () => true);
-			const state = makeState("active-1") as ActiveSessionState & {
-				runtime: ActiveSessionState["runtime"] & {
-					session: { isStreaming: boolean; steer: typeof steer; followUp: typeof followUp };
-				};
-			};
-			state.runtime = { ...state.runtime, session: { isStreaming: false, steer, followUp } } as never;
-			const internals = daemon as unknown as {
-				sessions: Map<string, ActiveSessionState>;
-				recordWorkerRecoveryState: ReturnType<typeof vi.fn>;
-				handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown>;
-			};
-			internals.sessions.set(state.activeSessionId, state);
-			internals.recordWorkerRecoveryState = vi.fn();
-
-			await expect(
-				internals.handleCommand(makeClient("client-1", state.activeSessionId), {
-					id: "command-1",
-					type,
-					activeSessionId: state.activeSessionId,
-					message: "idle queued turn",
-				}),
-			).resolves.toMatchObject({
-				success: true,
-				command: type,
-				...(type === "follow_up" ? { data: { queued: true } } : {}),
-			});
-			const queue = type === "steer" ? steer : followUp;
-			expect(queue).toHaveBeenCalledOnce();
-			expect(queue).toHaveBeenCalledWith("idle queued turn", undefined, {
-				queueKey: undefined,
-				agentMessageId: undefined,
-				resumeIfIdle: true,
-			});
-			if (type === "follow_up") {
-				expect(internals.recordWorkerRecoveryState).toHaveBeenCalledWith(state, "follow_up_queued", true);
-			}
-		},
-	);
-
 	it("clears prompt admission registered before unauthenticated worker rejection", async () => {
 		const daemon = new AgentDaemon("/tmp/prime-agent-worker-test.sock", {
 			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
@@ -9249,53 +8922,6 @@ describe("daemon mode helpers", () => {
 		).resolves.toMatchObject({ success: true, data: { status: "owned" } });
 		expect(promptOptions?.signal?.aborted).toBe(true);
 		rejectPrompt?.(new Error("test cleanup"));
-	});
-
-	it("settles cancellation while prompt routing waits on the target lock", async () => {
-		const daemon = new AgentDaemon("/tmp/prime-agent-test.sock", {
-			defaultSessionConfig: { agentDir: "/tmp/prime-agent-test-agent", cwd: "/tmp" },
-			createRuntime: async () => {
-				throw new Error("unexpected runtime creation");
-			},
-		});
-		const promptUntilAccepted = vi.fn(async () => {});
-		const state = makeState("active-lock") as ActiveSessionState;
-		state.runtime = { ...state.runtime, session: { promptUntilAccepted } } as never;
-		const internals = daemon as unknown as {
-			sessions: Map<string, ActiveSessionState>;
-			agentMessageTargetLocks: Map<string, Promise<void>>;
-			promptAdmissions: Map<string, unknown>;
-			parseCommandAndRegisterPromptAdmission(client: DaemonSocketClient, line: string): unknown;
-			handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<unknown> | undefined;
-		};
-		internals.sessions.set(state.activeSessionId, state);
-		internals.agentMessageTargetLocks.set(state.activeSessionId, new Promise(() => {}));
-		const client = makeClient("client-lock", state.activeSessionId);
-		client.socket = { destroyed: false, write: vi.fn(() => true) } as unknown as Socket;
-		internals.parseCommandAndRegisterPromptAdmission(
-			client,
-			JSON.stringify({
-				type: "prompt",
-				activeSessionId: state.activeSessionId,
-				message: "blocked",
-				admissionId: "lock-admission",
-			}),
-		);
-		internals.handleCommand(client, {
-			type: "prompt",
-			activeSessionId: state.activeSessionId,
-			message: "blocked",
-			admissionId: "lock-admission",
-		});
-		await expect(
-			internals.handleCommand(client, {
-				type: "cancel_prompt_admission",
-				activeSessionId: state.activeSessionId,
-				admissionId: "lock-admission",
-			}),
-		).resolves.toMatchObject({ data: { status: "cancelled" } });
-		await vi.waitFor(() => expect(internals.promptAdmissions.size).toBe(0));
-		expect(promptUntilAccepted).not.toHaveBeenCalled();
 	});
 
 	it("aborts waiting prompt admissions when their session closes", () => {
@@ -10027,10 +9653,11 @@ function makeCronAdmissionFixture(
 			isCompacting: false,
 			isRetrying: false,
 			isBashRunning: false,
-			hasPendingSessionWork: false,
-			unfinishedActionCount: 0,
+			hasPendingSessionWork: options.acceptingAgentMessage === true,
+			unfinishedActionCount: options.acceptingAgentMessage === true ? 1 : 0,
 			...activity,
 			prompt,
+			promptUntilAccepted: prompt,
 			promptHeartbeat,
 			followUp,
 			removeQueuedFollowUp,
@@ -10038,13 +9665,9 @@ function makeCronAdmissionFixture(
 	} as never;
 	const internals = daemon as unknown as {
 		sessions: Map<string, ActiveSessionState>;
-		agentMessageAcceptingTargets: Set<string>;
 		runCronJob(job: AgentCronJob): Promise<"skipped" | undefined>;
 	};
 	internals.sessions.set(activeSessionId, state);
-	if (options.acceptingAgentMessage) {
-		internals.agentMessageAcceptingTargets.add(activeSessionId);
-	}
 
 	return {
 		activeSessionId,
@@ -10080,6 +9703,34 @@ function makeCronJob(input: {
 	};
 }
 
+/** Gated fetch stub on a session's trace-upload controller: observes whether a close awaits the upload. */
+function installGatedTraceUpload(sessionManager: SessionManager): {
+	calls: string[];
+	releaseFetch: () => void;
+} {
+	const calls: string[] = [];
+	let releaseFetch: () => void = () => {};
+	const gate = new Promise<void>((resolveGate) => {
+		releaseFetch = resolveGate;
+	});
+	installAgentTraceUpload(sessionManager, {
+		authStorage: AuthStorage.inMemory({
+			[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key", key: "trace-key" },
+		}),
+		settingsManager: SettingsManager.inMemory({ agentTraces: { enabled: true } }),
+		baseUrl: "https://api.example.test",
+		fetchFn: (async (input: unknown) => {
+			calls.push(String(input));
+			await gate;
+			return new Response(JSON.stringify({ bytes_stored: 1 }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		}) as typeof fetch,
+	});
+	return { calls, releaseFetch };
+}
+
 function makePersistedRlmDaemonFixture(
 	tempDir: string,
 	options: {
@@ -10097,7 +9748,7 @@ function makePersistedRlmDaemonFixture(
 ) {
 	const sessionDir = join(tempDir, "sessions");
 	const parentManager = SessionManager.create(tempDir, sessionDir);
-	parentManager.newSession();
+	parentManager.newSession({ rlmDepth: 0 });
 	parentManager.appendSessionInfo("Parent");
 	parentManager.appendSessionState({ status: "active" });
 	const parentSessionFile = parentManager.getSessionFile();
@@ -10168,13 +9819,19 @@ function makePersistedRlmDaemonFixture(
 `,
 	);
 
+	let admissionPending = false;
 	const acceptAgentMessagePrompt = vi.fn(
 		async (_message: string, promptOptions?: { preflightResult?: (didSucceed: boolean) => void }) => {
-			if (options.childAdmissionGate) {
-				options.childAdmissionStarted?.();
-				await options.childAdmissionGate;
+			admissionPending = true;
+			try {
+				if (options.childAdmissionGate) {
+					options.childAdmissionStarted?.();
+					await options.childAdmissionGate;
+				}
+				promptOptions?.preflightResult?.(true);
+			} finally {
+				admissionPending = false;
 			}
-			promptOptions?.preflightResult?.(true);
 		},
 	);
 	const runtimeSessions: Array<ReturnType<typeof makeRuntimeSession>> = [];
@@ -10204,6 +9861,9 @@ function makePersistedRlmDaemonFixture(
 				await options.childDisposeGate;
 			});
 		}
+		Object.defineProperty(runtimeSession, "hasPendingAdmissionWaiters", {
+			get: () => admissionPending,
+		});
 		Object.assign(runtimeSession, {
 			isStreaming: false,
 			isCompacting: false,
@@ -10270,6 +9930,7 @@ function makeRuntimeSession(
 		},
 		setSubagentRuntimeHost: vi.fn(),
 		getRlmChildRunStatus: vi.fn(() => "running"),
+		getRlmChildSnapshots: vi.fn(() => []),
 		registerRlmChildSession: vi.fn(() => true),
 		releaseRlmChildSession: vi.fn(() => vi.fn()),
 		subscribe: vi.fn(() => vi.fn()),

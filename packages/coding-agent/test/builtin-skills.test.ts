@@ -269,6 +269,20 @@ describe("builtin skills", () => {
 			expect(edit?.kind === "python" && edit.python.importName).toBe("edit");
 		});
 
+		it("does not teach unsupported shell escapes in current Python skill instructions", () => {
+			const instructionPaths = [
+				join(__dirname, "..", "docs", "skills.md"),
+				join(getBundledSkillsDir(), "edit", "SKILL.md"),
+				join(getBundledSkillsDir(), "skill-creator", "references", "python-skills.md"),
+			];
+
+			for (const instructionPath of instructionPaths) {
+				const instructions = readFileSync(instructionPath, "utf-8");
+				expect(instructions, instructionPath).not.toMatch(/^[ \t]*![A-Za-z_][\w-]*/m);
+				expect(instructions, instructionPath).toContain("await bash(");
+			}
+		});
+
 		it("loads the skill-creator python template as a valid python skill", () => {
 			const referencePath = join(getBundledSkillsDir(), "skill-creator", "references", "python-skills.md");
 			const reference = readFileSync(referencePath, "utf-8");

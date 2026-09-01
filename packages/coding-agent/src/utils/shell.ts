@@ -1,45 +1,46 @@
-import { existsSync } from "node:fs";
-import { delimiter } from "node:path";
-import { spawn, spawnSync } from "child_process";
+import { accessSync, constants, existsSync, lstatSync, statSync } from "node:fs";
+import { delimiter, resolve } from "node:path";
 import { getBinDir } from "../config.js";
-import { recordOrphanProcessState } from "../core/orphan-process-journal.js";
+import {
+	type ActiveOrphanProcessCandidate,
+	enrollOrphanProcess,
+	retireOrphanProcess,
+	retireOrphanProcessAfterHeldWindowsJobEmpty,
+	withoutOrphanProcessJournalAuthority,
+} from "../core/orphan-process-journal.js";
+import { isExactProcessStartId } from "../core/session-lease.js";
 
 export interface ShellConfig {
 	shell: string;
 	args: string[];
 }
 
-/**
- * Find bash executable on PATH (cross-platform)
- */
-function findBashOnPath(): string | null {
-	if (process.platform === "win32") {
-		// Windows: Use 'where' and verify file exists (where can return non-existent paths)
-		try {
-			const result = spawnSync("where", ["bash.exe"], { encoding: "utf-8", timeout: 5000 });
-			if (result.status === 0 && result.stdout) {
-				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && existsSync(firstMatch)) {
-					return firstMatch;
-				}
-			}
-		} catch {
-			// Ignore errors
-		}
-		return null;
-	}
+// Ambient ProgramFiles and PATH values must not select executable code that
+// runs before the Windows Job admission protocol exists.
+const WINDOWS_GIT_BASH_PATHS = ["C:\\Program Files\\Git\\bin\\bash.exe", "C:\\Program Files (x86)\\Git\\bin\\bash.exe"];
 
-	// Unix: Use 'which' and trust its output (handles Termux and special filesystems)
+const POSIX_PATH_SCAN_MAX_ENTRIES = 256;
+const POSIX_PATH_ENTRY_MAX_BYTES = 4 * 1024;
+
+function isExecutableRegularFile(path: string): boolean {
 	try {
-		const result = spawnSync("which", ["bash"], { encoding: "utf-8", timeout: 5000 });
-		if (result.status === 0 && result.stdout) {
-			const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-			if (firstMatch) {
-				return firstMatch;
-			}
-		}
+		const link = lstatSync(path);
+		if (!link.isFile() && !link.isSymbolicLink()) return false;
+		if (!statSync(path).isFile()) return false;
+		accessSync(path, constants.X_OK);
+		return true;
 	} catch {
-		// Ignore errors
+		return false;
+	}
+}
+
+/** Resolve bash from PATH as bounded filesystem data without executing a helper. */
+function findBashOnPath(pathValue = process.env.PATH ?? ""): string | null {
+	const entries = pathValue.split(delimiter).slice(0, POSIX_PATH_SCAN_MAX_ENTRIES);
+	for (const entry of entries) {
+		if (Buffer.byteLength(entry, "utf8") > POSIX_PATH_ENTRY_MAX_BYTES) continue;
+		const candidate = resolve(entry || ".", "bash");
+		if (isExecutableRegularFile(candidate)) return candidate;
 	}
 	return null;
 }
@@ -48,8 +49,8 @@ function findBashOnPath(): string | null {
  * Resolve shell configuration based on platform and an optional explicit shell path.
  * Resolution order:
  * 1. User-specified shellPath
- * 2. On Windows: Git Bash in known locations, then bash on PATH
- * 3. On Unix: /bin/bash, then bash on PATH, then fallback to sh
+ * 2. On Windows: Git Bash in canonical locations only
+ * 3. On Unix: /bin/bash, then bash on PATH, then fallback to /bin/sh
  */
 export function getShellConfig(customShellPath?: string): ShellConfig {
 	// 1. Check user-specified shell path
@@ -61,40 +62,20 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 	}
 
 	if (process.platform === "win32") {
-		// 2. Try Git Bash in known locations
-		const paths: string[] = [];
-		const programFiles = process.env.ProgramFiles;
-		if (programFiles) {
-			paths.push(`${programFiles}\\Git\\bin\\bash.exe`);
+		for (const path of WINDOWS_GIT_BASH_PATHS) {
+			if (existsSync(path)) return { shell: path, args: ["-c"] };
 		}
-		const programFilesX86 = process.env["ProgramFiles(x86)"];
-		if (programFilesX86) {
-			paths.push(`${programFilesX86}\\Git\\bin\\bash.exe`);
-		}
-
-		for (const path of paths) {
-			if (existsSync(path)) {
-				return { shell: path, args: ["-c"] };
-			}
-		}
-
-		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, WSL, etc.)
-		const bashOnPath = findBashOnPath();
-		if (bashOnPath) {
-			return { shell: bashOnPath, args: ["-c"] };
-		}
-
 		throw new Error(
 			`No bash shell found. Options:\n` +
 				`  1. Install Git for Windows: https://git-scm.com/download/win\n` +
-				`  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n` +
-				"  3. Set shellPath in settings.json\n\n" +
-				`Searched Git Bash in:\n${paths.map((p) => `  ${p}`).join("\n")}`,
+				"  2. Set shellPath in settings.json\n\n" +
+				`Searched Git Bash in:\n${WINDOWS_GIT_BASH_PATHS.map((path) => `  ${path}`).join("\n")}`,
 		);
 	}
 
-	// Unix: try /bin/bash, then bash on PATH, then fallback to sh
-	if (existsSync("/bin/bash")) {
+	// POSIX resolution is data-only: no `which`, shell, loader, or other helper
+	// may run before the selected shell itself enters process containment.
+	if (existsSync("/bin/bash") && isExecutableRegularFile("/bin/bash")) {
 		return { shell: "/bin/bash", args: ["-c"] };
 	}
 
@@ -103,21 +84,45 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		return { shell: bashOnPath, args: ["-c"] };
 	}
 
-	return { shell: "sh", args: ["-c"] };
+	return { shell: "/bin/sh", args: ["-c"] };
 }
 
-export function getShellEnv(): NodeJS.ProcessEnv {
+/**
+ * Absolute default shell for the kernel's bash(): explicit shellPath wins; POSIX
+ * uses /bin/bash else /bin/sh (absolute, never PATH — the kernel inherits a
+ * user-influenced PATH); win32 uses only the canonical Git Bash install paths,
+ * never PATH (a repo-controlled PATH/where.exe must not pick the kernel shell).
+ * undefined = no shell found: kernel startup must not fail, bash() raises its
+ * teaching error.
+ */
+export function resolveKernelBashShell(customShellPath?: string): string | undefined {
+	const explicit = customShellPath?.trim();
+	if (explicit) {
+		return explicit;
+	}
+	if (process.platform !== "win32") {
+		return existsSync("/bin/bash") ? "/bin/bash" : "/bin/sh";
+	}
+	for (const path of WINDOWS_GIT_BASH_PATHS) {
+		if (existsSync(path)) {
+			return path;
+		}
+	}
+	return undefined;
+}
+
+export function getShellEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
 	const binDir = getBinDir();
-	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-	const currentPath = process.env[pathKey] ?? "";
+	const pathKey = Object.keys(source).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	const currentPath = source[pathKey] ?? "";
 	const pathEntries = currentPath.split(delimiter).filter(Boolean);
 	const hasBinDir = pathEntries.includes(binDir);
 	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
 
-	return {
-		...process.env,
+	return withoutOrphanProcessJournalAuthority({
+		...source,
 		[pathKey]: updatedPath,
-	};
+	});
 }
 
 /**
@@ -164,51 +169,82 @@ export function sanitizeBinaryOutput(str: string): string {
  * Detached child processes must be tracked so they can be killed on parent
  * shutdown signals (SIGHUP/SIGTERM).
  */
-const trackedDetachedChildPids = new Set<number>();
+const TRACKED_DETACHED_CHILD_ENROLLMENT = Symbol("tracked-detached-child-enrollment");
 
-export function trackDetachedChildPid(pid: number): void {
-	trackedDetachedChildPids.add(pid);
-	recordOrphanProcessState(pid, true);
+type ExactTrackedCandidate = ActiveOrphanProcessCandidate & { processStartId: string };
+
+/** Immutable capability for one exact enrollment. A PID alone is never authority. */
+export interface TrackedDetachedChildEnrollment {
+	readonly pid: number;
+	readonly kernelPid?: number;
+	readonly processStartId: string;
+	readonly [TRACKED_DETACHED_CHILD_ENROLLMENT]: true;
 }
 
-export function untrackDetachedChildPid(pid: number): void {
-	trackedDetachedChildPids.delete(pid);
-	recordOrphanProcessState(pid, false);
+interface TrackedDetachedChild {
+	candidate: ExactTrackedCandidate;
+	requestTermination: () => void;
 }
 
-export function killTrackedDetachedChildren(): void {
-	for (const pid of trackedDetachedChildPids) {
-		killProcessTree(pid);
-		recordOrphanProcessState(pid, false);
-	}
-	trackedDetachedChildPids.clear();
+// Object-identity keys preserve concurrent/late enrollments even when Windows
+// has already reused the numeric PID for a different exact process identity.
+const trackedDetachedChildren = new Map<TrackedDetachedChildEnrollment, TrackedDetachedChild>();
+
+function isExactTrackedIdentity(value: string | undefined): value is string {
+	return typeof value === "string" && isExactProcessStartId(value);
 }
 
 /**
- * Kill a process and all its children (cross-platform)
+ * Enroll a newly spawned, still-gated child and return the sole immutable
+ * capability that can retire this exact journal candidate.
  */
-export function killProcessTree(pid: number): void {
-	if (process.platform === "win32") {
-		// Use taskkill on Windows to kill process tree
+export function enrollTrackedDetachedChildPid(
+	pid: number,
+	requestTermination: () => void,
+	expectedProcessStartId?: string,
+): TrackedDetachedChildEnrollment {
+	const observed = enrollOrphanProcess(pid, undefined, expectedProcessStartId);
+	if (!isExactTrackedIdentity(observed.processStartId)) {
+		throw new Error(`Cannot track detached child ${pid} without an exact process identity`);
+	}
+	const candidate = Object.freeze({ ...observed, processStartId: observed.processStartId });
+	const enrollment: TrackedDetachedChildEnrollment = Object.freeze({
+		pid: candidate.pid,
+		...(candidate.kernelPid !== undefined ? { kernelPid: candidate.kernelPid } : {}),
+		processStartId: candidate.processStartId,
+		[TRACKED_DETACHED_CHILD_ENROLLMENT]: true as const,
+	});
+	trackedDetachedChildren.set(enrollment, { candidate, requestTermination });
+	return enrollment;
+}
+
+export function untrackDetachedChildPid(enrollment: TrackedDetachedChildEnrollment): boolean {
+	const tracked = trackedDetachedChildren.get(enrollment);
+	if (!tracked) return true;
+	if (!retireOrphanProcess(tracked.candidate)) return false;
+	trackedDetachedChildren.delete(enrollment);
+	return true;
+}
+
+/**
+ * Retire only the captured candidate covered by this live owner's exact
+ * empty-Job proof. Generic Windows exits retain their journal record.
+ */
+export function untrackDetachedChildPidAfterHeldWindowsJobEmpty(enrollment: TrackedDetachedChildEnrollment): boolean {
+	const tracked = trackedDetachedChildren.get(enrollment);
+	if (!tracked) return true;
+	if (!retireOrphanProcessAfterHeldWindowsJobEmpty(tracked.candidate)) return false;
+	trackedDetachedChildren.delete(enrollment);
+	return true;
+}
+
+export function killTrackedDetachedChildren(): void {
+	for (const [enrollment, tracked] of trackedDetachedChildren) {
+		tracked.requestTermination();
 		try {
-			spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
-				stdio: "ignore",
-				detached: true,
-			});
+			if (retireOrphanProcess(tracked.candidate)) trackedDetachedChildren.delete(enrollment);
 		} catch {
-			// Ignore errors if taskkill fails
-		}
-	} else {
-		// Use SIGKILL on Unix/Linux/Mac
-		try {
-			process.kill(-pid, "SIGKILL");
-		} catch {
-			// Fallback to killing just the child if process group kill fails
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {
-				// Process already dead
-			}
+			// Shutdown signaling must continue; canonical cleanup retains the record.
 		}
 	}
 }

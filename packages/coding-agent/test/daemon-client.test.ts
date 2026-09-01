@@ -248,6 +248,56 @@ describe("DaemonClient", () => {
 		await expect(request).rejects.toThrow("closed before the operation completed");
 	});
 
+	it("does not send on-demand peer listing to either incompatible schema-23 lineage", async () => {
+		for (const capabilities of [[], ["agent_peer_list"]]) {
+			const client = new DaemonClient("/tmp/prime-agent.sock");
+			const connect = client.connect();
+			const socket = netMock.sockets.at(-1)!;
+			socket.emit("connect");
+			await connect;
+			emitHello(socket, DAEMON_PROTOCOL_VERSION, capabilities, 23);
+
+			await expect(client.request({ type: "list_agent_peers", workerToken: "worker-token" })).rejects.toThrow(
+				"does not support agent_peer_list",
+			);
+			expect(socket.writes).toEqual([]);
+			client.close();
+		}
+	});
+
+	it("sends on-demand peer listing only to a schema-24 capable daemon", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets.at(-1)!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, ["agent_peer_list"], 24);
+
+		const request = client.request({ type: "list_agent_peers", workerToken: "worker-token" });
+		await vi.waitFor(() => expect(socket.writes).toHaveLength(1));
+		expect(JSON.parse(socket.writes[0]!.trim())).toMatchObject({
+			type: "command",
+			command: { type: "list_agent_peers", workerToken: "worker-token" },
+		});
+		client.close();
+		await expect(request).rejects.toThrow("closed before the operation completed");
+	});
+
+	it("does not send direct transport discovery to a daemon without the capability", async () => {
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket, DAEMON_PROTOCOL_VERSION, [], DAEMON_SCHEMA_REVISION);
+
+		await expect(
+			client.request({ type: "get_direct_worker_transport", activeSessionId: "active-1" }),
+		).rejects.toThrow("does not support direct_peer_transport");
+		expect(socket.writes).toEqual([]);
+		client.close();
+	});
+
 	it("rejects an old daemon before requesting session state", async () => {
 		const client = new DaemonClient("/tmp/prime-agent.sock");
 		const connect = client.connect();

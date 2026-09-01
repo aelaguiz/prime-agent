@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
 	reapCalls: [] as Array<[boolean, boolean]>,
 	shutdownCalls: [] as Array<[boolean, boolean]>,
 	mcpCommands: [] as string[][],
+	mcpServeCalls: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("../src/cli/daemon-command.js", () => ({
@@ -32,6 +33,14 @@ vi.mock("../src/core/mcp/mcp-command.js", () => ({
 	},
 }));
 
+vi.mock("../src/modes/mcp-serve/mcp-serve-mode.js", () => ({
+	MCP_SERVE_DEFAULT_BIND: "0.0.0.0",
+	MCP_SERVE_DEFAULT_PORT: 7717,
+	runMcpServe: async (options: Record<string, unknown>) => {
+		mocks.mcpServeCalls.push(options);
+	},
+}));
+
 vi.mock("../src/core/settings-manager.js", () => ({
 	SettingsManager: {
 		create: () => ({ flush: async () => {}, drainErrors: () => [], getGlobalMcpServers: () => undefined }),
@@ -51,7 +60,7 @@ vi.mock("../src/cli/daemon-ps.js", () => ({
 }));
 
 import { INTERNAL_RUNTIME_COMMAND_MARKER } from "../src/cli/args.js";
-import { formatTopLevelHelp } from "../src/cli/command-registry.js";
+import { formatCommandHelp, formatTopLevelHelp } from "../src/cli/command-registry.js";
 import { DAEMON_UPDATE_RESTART_COORDINATOR_FLAG } from "../src/cli/daemon-update-restart.js";
 import { handlePublicCommand } from "../src/cli/public-command.js";
 
@@ -63,6 +72,7 @@ describe("public command routing", () => {
 		mocks.reapCalls.length = 0;
 		mocks.shutdownCalls.length = 0;
 		mocks.mcpCommands.length = 0;
+		mocks.mcpServeCalls.length = 0;
 		process.exitCode = undefined;
 		vi.spyOn(console, "log").mockImplementation(() => {});
 		vi.spyOn(console, "error").mockImplementation(() => {});
@@ -118,6 +128,20 @@ describe("public command routing", () => {
 			handlePublicCommand(["mcp", "add", "local", "--", "node", "server file.js", "--stdio"]),
 		).resolves.toMatchObject({ handled: true });
 		expect(mocks.mcpCommands).toEqual([["add", "local", "--", "node", "server file.js", "--stdio"]]);
+	});
+
+	it("routes both MCP daemon socket option names", async () => {
+		await expect(
+			handlePublicCommand(["mcp-serve", "--port", "9000", "--bind", "127.0.0.1", "--socket", "/tmp/legacy.sock"]),
+		).resolves.toMatchObject({ handled: true });
+		await expect(
+			handlePublicCommand(["mcp-serve", "--stdio", "--daemon-socket", "/tmp/current.sock"]),
+		).resolves.toMatchObject({ handled: true });
+
+		expect(mocks.mcpServeCalls).toEqual([
+			{ port: 9000, bind: "127.0.0.1", stdio: false, daemonSocket: "/tmp/legacy.sock" },
+			{ port: 7717, bind: "0.0.0.0", stdio: true, daemonSocket: "/tmp/current.sock" },
+		]);
 	});
 
 	it("routes agent operations through the internal protocol adapter", async () => {
@@ -346,6 +370,12 @@ describe("public command routing", () => {
 		expect(console.log).toHaveBeenNthCalledWith(2, expect.stringContaining("prime-agent doctor [--fix] [--json]"));
 		expect(console.log).toHaveBeenNthCalledWith(3, expect.stringContaining("prime-agent package install <source>"));
 		expect(console.error).not.toHaveBeenCalled();
+	});
+
+	it("documents both MCP daemon socket option names", () => {
+		const help = formatCommandHelp(["mcp-serve"]);
+		expect(help).toContain("--daemon-socket <path>");
+		expect(help).toContain("--socket <path>");
 	});
 
 	it("leaves top-level help flags on the full CLI help path", async () => {

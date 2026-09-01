@@ -125,10 +125,10 @@ function registerSessionDetailTool(server: McpServer, context: McpServeToolConte
 		async ({ session }) =>
 			runTool(async () => {
 				const bridge = context.bridge;
-				const state = await bridge.command<SessionSummary>(
-					{ type: "get_state", activeSessionId: session },
-					DAEMON_GET_TIMEOUT_MS,
-				);
+				const state = await readSessionSummary(bridge, session);
+				if (!state) {
+					throw new Error(`Unknown active session: ${session}`);
+				}
 				const notes: string[] = [];
 				const [stats, queue, children, lastAssistantText, heartbeats] = await Promise.all([
 					attempt(notes, "stats", () =>
@@ -585,9 +585,7 @@ async function resumeSession(
 	bridge: DaemonBridge,
 	selector: string,
 ): Promise<{ session: string; wasAlreadyActive: boolean; summary?: SessionSummary }> {
-	const live = await optional(() =>
-		bridge.command<SessionSummary>({ type: "get_state", activeSessionId: selector }, DAEMON_GET_TIMEOUT_MS),
-	);
+	const live = await optional(() => readSessionSummary(bridge, selector));
 	if (live) {
 		return { session: sessionSelector(live), wasAlreadyActive: true, summary: live };
 	}
@@ -609,9 +607,7 @@ async function resumeSession(
  * row every other tool sees.
  */
 async function refreshState(bridge: DaemonBridge, session: string, fallback: SessionSummary): Promise<SessionSummary> {
-	const state = await optional(() =>
-		bridge.command<SessionSummary>({ type: "get_state", activeSessionId: session }, DAEMON_GET_TIMEOUT_MS),
-	);
+	const state = await optional(() => readSessionSummary(bridge, session));
 	return state ?? fallback;
 }
 
@@ -688,31 +684,55 @@ function renderSessionDetail(detail: SessionDetail): string {
 }
 
 /**
- * The supervisor refuses to route a session command to a worker without a live
- * client ("Session worker is failed"/"recovering"), so `get_state` is unusable on
- * exactly the sessions that need repair. Its own session list still carries the
- * row, stamped with `workerState` and `sessionFile`.
+ * Worker `get_state` is the freshest session-owned view, but only the supervisor
+ * list carries authoritative residency fields such as workerState and attached
+ * clients. Merge both without allowing a raw worker row to erase stamped fields.
+ * Failed/recovering workers cannot answer `get_state`, so their list row remains
+ * sufficient for restart and stop operations.
  */
 async function readSessionSummary(bridge: DaemonBridge, selector: string): Promise<SessionSummary | undefined> {
+	let publicState: SessionSummary | undefined;
+	let listError: unknown;
+	try {
+		publicState = resolveSessionSummary(await listSessions(bridge, false), selector);
+	} catch (error) {
+		if (error instanceof Error && error.message.startsWith("Ambiguous active session")) {
+			throw error;
+		}
+		listError = error;
+	}
+
+	if (publicState?.workerState === "failed" || publicState?.workerState === "recovering") {
+		return publicState;
+	}
+
+	let sessionState: SessionSummary | undefined;
 	let stateError: unknown;
 	try {
-		return await bridge.command<SessionSummary>(
+		sessionState = await bridge.command<SessionSummary>(
 			{ type: "get_state", activeSessionId: selector },
 			DAEMON_GET_TIMEOUT_MS,
 		);
 	} catch (error) {
 		stateError = error;
 	}
-	let sessions: SessionSummary[];
-	try {
-		sessions = await listSessions(bridge, false);
-	} catch (error) {
-		// Both reads failed, so the daemon is the problem, not the selector.
+
+	if (sessionState && publicState) {
+		return {
+			...sessionState,
+			attachedClients: publicState.attachedClients,
+			...(publicState.workerState ? { workerState: publicState.workerState } : {}),
+			...(publicState.workerPid !== undefined ? { workerPid: publicState.workerPid } : {}),
+		};
+	}
+	if (publicState) return publicState;
+	if (sessionState) return sessionState;
+	if (listError) {
 		throw new Error(
-			`Cannot read session "${selector}": ${errorMessage(error)} (state read: ${errorMessage(stateError)})`,
+			`Cannot read session "${selector}": ${errorMessage(listError)} (state read: ${errorMessage(stateError)})`,
 		);
 	}
-	return resolveSessionSummary(sessions, selector);
+	return undefined;
 }
 
 /**
@@ -734,7 +754,12 @@ export function resolveSessionSummary(
 }
 
 function matchesSessionSelectorExactly(summary: SessionSummary, selector: string): boolean {
-	return sessionSelector(summary) === selector || summary.sessionId === selector || summary.sessionName === selector;
+	return (
+		sessionSelector(summary) === selector ||
+		summary.sessionId === selector ||
+		summary.sessionName === selector ||
+		summary.sessionFile === selector
+	);
 }
 
 function matchesSessionIdTail(summary: SessionSummary, selector: string): boolean {

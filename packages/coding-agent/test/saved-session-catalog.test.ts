@@ -145,8 +145,19 @@ describe("saved session catalog", () => {
 		});
 
 		expect(fakeClient.commands).toEqual([
-			{ type: "rename_saved_session", sessionPath: "/tmp/sessions/one.jsonl", name: "One" },
-			{ type: "delete_saved_session", sessionPath: "/tmp/sessions/one.jsonl" },
+			{
+				type: "rename_saved_session",
+				cwd: "/tmp/project",
+				sessionDir: "/tmp/sessions",
+				sessionPath: "/tmp/sessions/one.jsonl",
+				name: "One",
+			},
+			{
+				type: "delete_saved_session",
+				cwd: "/tmp/project",
+				sessionDir: "/tmp/sessions",
+				sessionPath: "/tmp/sessions/one.jsonl",
+			},
 		]);
 	});
 });

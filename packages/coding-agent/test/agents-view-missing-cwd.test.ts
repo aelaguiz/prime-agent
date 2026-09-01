@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createAgentSessionRuntime } from "../src/core/agent-session-runtime.js";
 import { MissingSessionCwdError } from "../src/core/session-cwd.js";
-import { SessionLease } from "../src/core/session-lease.js";
+import type { SessionLease } from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { createAgentsViewResumeConfig, resolveAgentsViewOpenCwd } from "../src/modes/agents-view/agents-view-mode.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
@@ -31,8 +31,11 @@ describe("agents view open with a missing session cwd", () => {
 			};
 
 			const stripped = await SessionManager.openAsync(sessionFile, sessionDir);
-			const suppliedLease = new SessionLease(sessionFile, join(root, "missing-cwd-lease"), "lease-token");
-			const releaseLease = vi.spyOn(suppliedLease, "release");
+			const releaseLease = vi.fn();
+			const suppliedLease = {
+				sessionPath: sessionFile,
+				release: releaseLease,
+			} satisfies Pick<SessionLease, "sessionPath" | "release"> as unknown as SessionLease;
 			await expect(
 				createAgentSessionRuntime(factory, {
 					cwd: stripped.getCwd(),

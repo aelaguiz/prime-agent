@@ -1,6 +1,6 @@
 ---
 name: edit
-description: Replace an exact, unique string in an existing file. Use for targeted single-occurrence edits to files from the IPython kernel instead of rewriting the whole file.
+description: Replace an exact, unique string in an existing file. Use for targeted single-occurrence edits to files from the Python kernel instead of rewriting the whole file.
 ---
 
 # Edit
@@ -17,6 +17,6 @@ triple single-quoted variables (`old = '''...'''`) or build `old`/`new` from
 inspected file slices. Returns a short confirmation; raises if `old_str` is
 missing or matches more than once (widen the snippet to make it unique).
 
-Or from a shell cell:
+Or through the managed shell interface:
 
-    !edit --path pkg/file.py --old-str "..." --new-str "..."
+    await bash('edit --path pkg/file.py --old-str "..." --new-str "..."')

@@ -409,10 +409,7 @@ function renderMessageText(message: AgentMessage): string {
 			const text = clip(contentText(message.content), maxChars);
 			const calls = message.content
 				.filter((block): block is ToolCall => block.type === "toolCall")
-				.map(
-					(block) =>
-						`\n  -> ${block.name}(${clip(formatToolArguments(block.arguments), TOOL_CALL_ARGUMENTS_MAX_CHARS)})`,
-				)
+				.map((block) => `\n  -> ${formatToolCall(block)}`)
 				.join("");
 			return `[assistant] ${text}${calls}`;
 		}
@@ -504,6 +501,17 @@ function contentText(content: MessageContent): string {
 		})
 		.filter(Boolean)
 		.join("\n");
+}
+
+function formatToolCall(call: ToolCall): string {
+	// `ipython` remains the external tool name after the CPython cutover. Show the
+	// cell itself instead of wrapping it in JSON so remote transcripts match the
+	// model-facing Python REPL surface without leaking an internal runtime name.
+	const argumentsText =
+		call.name === "ipython" && typeof call.arguments.code === "string"
+			? call.arguments.code
+			: formatToolArguments(call.arguments);
+	return `${call.name}(${clip(argumentsText, TOOL_CALL_ARGUMENTS_MAX_CHARS)})`;
 }
 
 function formatToolArguments(args: Record<string, unknown>): string {

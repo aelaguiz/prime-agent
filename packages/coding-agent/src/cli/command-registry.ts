@@ -120,7 +120,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 	},
 	{
 		path: ["mcp-serve"],
-		usage: "mcp-serve [--port <n>] [--bind <addr>] [--stdio] [--daemon-socket <path>]",
+		usage: "mcp-serve [--port <n>] [--bind <addr>] [--stdio] [--daemon-socket <path>] [--socket <path>]",
 		summary: "Serve MCP remote-control for this machine's agents",
 		description:
 			"Exposes this machine's agent sessions to an MCP client. The HTTP transport has no authentication; only serve it on a trusted network.",
@@ -129,6 +129,7 @@ export const COMMAND_SPECS: readonly CommandSpec[] = [
 			"--bind <addr>           Bind to this address (default: 0.0.0.0)",
 			"--stdio                 Serve on stdio instead of HTTP",
 			"--daemon-socket <path>  Use a specific daemon socket",
+			"--socket <path>         Alias for --daemon-socket",
 		],
 	},
 	{
@@ -326,7 +327,7 @@ export function formatTopLevelHelp(): string {
 	const commands = COMMAND_SPECS.filter((spec) => spec.path.length === 1);
 	const commandWidth = Math.max(...commands.map((spec) => spec.path[0]!.length));
 	const options = TOP_LEVEL_OPTION_GROUPS.map((group) => formatOptionGroup(group.heading, group.options)).join("\n\n");
-	return `${APP_NAME} - AI coding assistant with an IPython tool
+	return `${APP_NAME} - AI coding assistant with a Python REPL tool
 
 Usage:
   ${APP_NAME} [options] [@files...] [message...]

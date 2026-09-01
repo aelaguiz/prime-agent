@@ -32,7 +32,7 @@ export interface DaemonBridgeOptions {
 	daemonSocket?: string;
 }
 
-export type DaemonProbeStatus = "absent" | "current" | "stale" | "unavailable";
+export type DaemonProbeStatus = "absent" | "current" | "stale" | "unresponsive";
 
 export interface DaemonConnectionPlan {
 	/** Spawn or refresh a daemon before connecting. */
@@ -52,7 +52,7 @@ export interface DaemonConnectionPlan {
  * introspectable older daemon into a startup crash. Connect and let
  * `DaemonClient.request` gate individual commands against the daemon's hello.
  */
-export function planDaemonConnection(status: DaemonProbeStatus): DaemonConnectionPlan {
+export function planDaemonConnection(status: DaemonProbeStatus | "unavailable"): DaemonConnectionPlan {
 	switch (status) {
 		case "absent":
 		case "current":
@@ -60,6 +60,7 @@ export function planDaemonConnection(status: DaemonProbeStatus): DaemonConnectio
 		case "stale":
 			return { ensure: false, stale: true };
 		case "unavailable":
+		case "unresponsive":
 			return {
 				ensure: false,
 				stale: false,
@@ -103,8 +104,7 @@ export class DaemonBridge {
 		const probe = await probeDaemonVersion(this.socketPath);
 		const plan = planDaemonConnection(probe.status);
 		if (plan.fatal) {
-			const detail = probe.status === "unavailable" ? `: ${probe.error.message}` : "";
-			throw new Error(`Cannot use the Prime Agent daemon at ${this.socketPath} because ${plan.fatal}${detail}`);
+			throw new Error(`Cannot use the Prime Agent daemon at ${this.socketPath} because ${plan.fatal}`);
 		}
 		this.staleDaemon = plan.stale;
 		if (plan.ensure) {

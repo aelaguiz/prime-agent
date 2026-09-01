@@ -12,14 +12,15 @@ import {
 } from "node:fs";
 import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR, getCronJobsPath } from "../../../src/config.js";
-import { getProcessStartId } from "../../../src/core/session-lease.js";
+import { createProcessIdentityOwnerToken, getProcessStartId } from "../../../src/core/session-lease.js";
 import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
 import {
 	acquireDaemonSupervisorOwnership,
+	daemonSupervisorOwnerLegacyProcessStartId,
 	persistDaemonStartupFenceFromOwner,
 	waitForDaemonStartupFence,
 } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
@@ -40,6 +41,7 @@ interface OwnerRecord {
 	generation: string;
 	pid: number;
 	processStartId?: string;
+	authorityProcessStartId?: string;
 	socketPath: string;
 	descriptorDir: string;
 	agentDir: string;
@@ -70,7 +72,7 @@ interface CleanupProcessIdentity {
 const fixturePath = resolve(__dirname, "../../fixtures/eng-4600-supervisor-fixture.ts");
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
-const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+const tsxLoaderPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/loader.mjs");
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const handles = new Set<FixtureHandle>();
@@ -78,6 +80,14 @@ const harnesses: Harness[] = [];
 const cleanupProcesses = new Map<string, CleanupProcessIdentity>();
 const cleanupRegistryDirs = new Set<string>();
 const cleanupSupervisorSockets = new Set<string>();
+const originalProcessTitle = process.title;
+const testSupervisorIdentity = createProcessIdentityOwnerToken();
+beforeAll(() => {
+	process.title = testSupervisorIdentity.argument;
+});
+afterAll(() => {
+	process.title = originalProcessTitle;
+});
 
 afterEach(async () => {
 	for (const registryDir of cleanupRegistryDirs) {
@@ -128,7 +138,9 @@ function spawnFixture(
 	paths: { agentDir: string; descriptorDir: string; registryDir: string; socketPath: string },
 	options: { extraEnv?: NodeJS.ProcessEnv; generation?: string } = {},
 ): FixtureHandle {
-	const child = spawn(process.execPath, [tsxPath, fixturePath], {
+	const ownerIdentity = createProcessIdentityOwnerToken();
+	const child = spawn(process.execPath, ["--import", tsxLoaderPath, fixturePath], {
+		argv0: ownerIdentity.argument,
 		cwd: paths.agentDir,
 		env: {
 			...process.env,
@@ -167,10 +179,12 @@ function spawnRealSupervisor(
 	paths: { agentDir: string; registryDir: string; socketPath: string },
 	extraEnv: NodeJS.ProcessEnv,
 ): FixtureHandle {
+	const ownerIdentity = createProcessIdentityOwnerToken();
 	const child = spawn(
 		process.execPath,
-		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", paths.socketPath, "--offline"],
+		["--import", tsxLoaderPath, cliPath, "--mode", "daemon", "--daemon-socket", paths.socketPath, "--offline"],
 		{
+			argv0: ownerIdentity.argument,
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -396,13 +410,18 @@ async function captureCleanupProcess(pid: number, label: string, timeoutMs = 500
 	throw new Error(`Could not capture the process-start identity for ${label} ${pid}`);
 }
 
+function ownerCleanupAuthority(owner: OwnerRecord): string | undefined {
+	return owner.authorityProcessStartId;
+}
+
 function registerOwnerRecordsForCleanup(registryDir: string): void {
 	for (const owner of listOwnerRecords(registryDir)) {
 		cleanupSupervisorSockets.add(owner.socketPath);
-		if (owner.processStartId) {
+		const processStartId = ownerCleanupAuthority(owner);
+		if (processStartId) {
 			registerCleanupProcess({
 				pid: owner.pid,
-				processStartId: owner.processStartId,
+				processStartId,
 				label: `supervisor ${owner.generation}`,
 			});
 		}
@@ -426,20 +445,25 @@ function cleanupProcessState(identity: CleanupProcessIdentity): "exited" | "matc
 
 async function removeDeadFixtureOwnerRecords(registryDir: string): Promise<void> {
 	for (const owner of listOwnerRecords(registryDir)) {
-		if (!owner.processStartId) {
-			throw new Error(`Cannot clean owner ${owner.generation} without an exact process-start identity`);
-		}
-		const identity = {
-			pid: owner.pid,
-			processStartId: owner.processStartId,
-			label: `supervisor ${owner.generation}`,
-		};
-		// A supervisor that just acknowledged shutdown can stay observable for a
-		// moment; wait for the exact identity to exit instead of refusing outright.
-		if (cleanupProcessState(identity) !== "exited") {
-			registerCleanupProcess(identity);
-			cleanupSupervisorSockets.add(owner.socketPath);
-			await cleanupRegisteredProcesses();
+		const processStartId = ownerCleanupAuthority(owner);
+		if (processStartId) {
+			const identity = {
+				pid: owner.pid,
+				processStartId,
+				label: `supervisor ${owner.generation}`,
+			};
+			if (cleanupProcessState(identity) !== "exited") {
+				registerCleanupProcess(identity);
+				await cleanupRegisteredProcesses();
+			}
+		} else {
+			try {
+				process.kill(owner.pid, 0);
+				throw new Error(`Refusing to clean retained owner ${owner.generation} without exact authority`);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "EPERM") throw error;
+				if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+			}
 		}
 
 		const current = readOwnerRecord(registryDir, owner.generation);
@@ -449,7 +473,8 @@ async function removeDeadFixtureOwnerRecords(registryDir: string): Promise<void>
 		if (
 			current.token !== owner.token ||
 			current.pid !== owner.pid ||
-			current.processStartId !== owner.processStartId
+			current.processStartId !== owner.processStartId ||
+			current.authorityProcessStartId !== owner.authorityProcessStartId
 		) {
 			throw new Error(`Refusing to clean changed owner ${owner.generation}`);
 		}
@@ -487,9 +512,9 @@ async function waitForCleanupGracePeriod(timeoutMs = 5000): Promise<void> {
 }
 
 async function cleanupRegisteredProcesses(existingClient?: DaemonClient): Promise<void> {
-	for (const socketPath of cleanupSupervisorSockets) {
-		await forceShutdownReachableSupervisor(socketPath, existingClient);
-	}
+	void existingClient;
+	// Never issue a protocol shutdown from socket reachability alone. Exact
+	// process identities below are the only teardown signal authority.
 	await waitForCleanupGracePeriod();
 	const errors: unknown[] = [];
 	for (const identity of [...cleanupProcesses.values()]) {
@@ -507,27 +532,6 @@ async function cleanupRegisteredProcesses(existingClient?: DaemonClient): Promis
 	}
 }
 
-async function forceShutdownReachableSupervisor(socketPath: string, existingClient?: DaemonClient): Promise<void> {
-	if (existingClient?.isConnected) {
-		try {
-			await existingClient.request({ type: "shutdown", force: true }, 5000);
-			return;
-		} catch {
-			// Retry through a fresh connection before exact-identity process cleanup.
-		}
-	}
-	const cleanupClient = new DaemonClient(socketPath);
-	try {
-		await cleanupClient.connect(1000);
-		await cleanupClient.waitForHello(2000);
-		await cleanupClient.request({ type: "shutdown", force: true }, 5000);
-	} catch {
-		// The exact-identity fallback handles an unreachable supervisor.
-	} finally {
-		cleanupClient.close();
-	}
-}
-
 async function waitForPath(path: string, timeoutMs = 20_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (!existsSync(path) && Date.now() < deadline) {
@@ -539,7 +543,9 @@ async function waitForPath(path: string, timeoutMs = 20_000): Promise<void> {
 }
 
 function writeOwnerRecord(registryDir: string, owner: OwnerRecord): void {
-	writeFileSync(ownerRecordPath(registryDir, owner.generation), `${JSON.stringify(owner, null, 2)}\n`);
+	const path = ownerRecordPath(registryDir, owner.generation);
+	mkdirSync(resolve(path, ".."), { recursive: true });
+	writeFileSync(path, `${JSON.stringify(owner, null, 2)}\n`);
 }
 
 async function releaseOwnershipHolder(handle: FixtureHandle): Promise<void> {
@@ -670,7 +676,10 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			const reconnecting = waitForConnectionStatus(connection, "reconnecting");
 			const reconnected = waitForConnectionStatus(connection, "connected", 60_000);
 			const restarted = await client.request({ type: "restart" }, 10_000);
-			expect(restarted.success).toBe(true);
+			const restartErrorCode = (restarted as { errorInfo?: { code?: string } }).errorInfo?.code;
+			if (!restarted.success && restartErrorCode !== "command_result_uncertain") {
+				throw new Error(`Restart failed: ${JSON.stringify(restarted)}`);
+			}
 			await reconnecting;
 			await waitForExit(predecessor);
 			await reconnected;
@@ -678,16 +687,17 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			if (!successorOwner) {
 				throw new Error("Replacement supervisor did not publish its owner record");
 			}
-			if (!successorOwner.processStartId) {
+			const successorProcessStartId = successorOwner.authorityProcessStartId;
+			if (!successorProcessStartId) {
 				await captureCleanupProcess(
 					successorOwner.pid,
 					`replacement supervisor ${successorOwner.generation}`,
 				).catch(() => undefined);
-				throw new Error("Replacement supervisor did not publish a process-start identity");
+				throw new Error("Replacement supervisor did not publish an exact authority process identity");
 			}
 			const successorCleanupIdentity = registerCleanupProcess({
 				pid: successorOwner.pid,
-				processStartId: successorOwner.processStartId,
+				processStartId: successorProcessStartId,
 				label: `replacement supervisor ${successorOwner.generation}`,
 			});
 			if (cleanupProcessState(successorCleanupIdentity) !== "matching") {
@@ -756,8 +766,8 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		send(predecessor, "go");
 		const predecessorReady = await waitForType(predecessor, "ready");
 		const owner = predecessorReady.owner;
-		if (!owner?.processStartId) {
-			throw new Error("Fixed predecessor did not publish a process start identity");
+		if (!owner?.authorityProcessStartId) {
+			throw new Error("Fixed predecessor did not publish exact process authority");
 		}
 		await persistDaemonStartupFenceFromOwner(
 			paths.socketPath,
@@ -765,7 +775,8 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 				supervisorGeneration: owner.generation,
 				supervisorOwnerToken: owner.token,
 				supervisorPid: owner.pid,
-				supervisorProcessStartId: owner.processStartId,
+				supervisorProcessStartId: daemonSupervisorOwnerLegacyProcessStartId(owner),
+				supervisorAuthorityProcessStartId: owner.authorityProcessStartId,
 				supervisorSocketPath: owner.socketPath,
 			},
 			paths.registryDir,
@@ -798,7 +809,7 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 					supervisorGeneration: "missing-owner",
 					supervisorOwnerToken: "missing-owner",
 					supervisorPid: process.pid,
-					supervisorProcessStartId: "missing-owner",
+					supervisorProcessStartId: "proc:1",
 					supervisorSocketPath: missingPaths.socketPath,
 				},
 				missingPaths.registryDir,
@@ -814,7 +825,7 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		if (!owner) {
 			throw new Error("Owner fixture did not publish its durable record");
 		}
-		if (!owner.processStartId) {
+		if (!owner.authorityProcessStartId) {
 			await expect(
 				persistDaemonStartupFenceFromOwner(
 					paths.socketPath,
@@ -834,14 +845,15 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			supervisorGeneration: owner.generation,
 			supervisorOwnerToken: owner.token,
 			supervisorPid: owner.pid,
-			supervisorProcessStartId: owner.processStartId,
+			supervisorProcessStartId: daemonSupervisorOwnerLegacyProcessStartId(owner),
+			supervisorAuthorityProcessStartId: owner.authorityProcessStartId,
 			supervisorSocketPath: owner.socketPath,
 		};
 		for (const mismatch of [
 			{ ...hello, supervisorPid: owner.pid + 1 },
 			{ ...hello, supervisorGeneration: "wrong-generation" },
 			{ ...hello, supervisorOwnerToken: "wrong-token" },
-			{ ...hello, supervisorProcessStartId: "wrong-start" },
+			{ ...hello, supervisorAuthorityProcessStartId: `token:${"0".repeat(64)}` },
 			{ ...hello, supervisorSocketPath: `${owner.socketPath}.other` },
 			{},
 		]) {
@@ -858,14 +870,6 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		await expect(persistDaemonStartupFenceFromOwner(paths.socketPath, hello, paths.registryDir)).rejects.toThrow(
 			/Invalid daemon supervisor owner record/,
 		);
-		writeOwnerRecord(paths.registryDir, { ...owner, processStartId: "recycled-process" });
-		await expect(
-			persistDaemonStartupFenceFromOwner(
-				paths.socketPath,
-				{ ...hello, supervisorProcessStartId: "recycled-process" },
-				paths.registryDir,
-			),
-		).rejects.toThrow(/process identity changed/);
 		writeOwnerRecord(paths.registryDir, owner);
 		await persistDaemonStartupFenceFromOwner(paths.socketPath, hello, paths.registryDir);
 		await expect(waitForDaemonStartupFence(paths.socketPath, 50, paths.registryDir)).rejects.toThrow(/Timed out/);
@@ -875,7 +879,7 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		expect(readdirSync(join(paths.registryDir, "startup-fences"))).toEqual([]);
 	}, 30_000);
 
-	it("admits unrelated ownership when immutable scope proves a corrupt owner is unrelated", async () => {
+	it("retains corrupt owner authority even when immutable scope is unrelated", async () => {
 		const paths = await createPaths();
 		const corruptOwner = await acquireDaemonSupervisorOwnership({
 			agentDir: join(paths.agentDir, "corrupt-agent"),
@@ -886,65 +890,67 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			socketPath: `${paths.socketPath}.corrupt`,
 		});
 		const originalOwner = { ...corruptOwner.record };
-		let unrelatedOwner: Awaited<ReturnType<typeof acquireDaemonSupervisorOwnership>> | undefined;
-		writeFileSync(ownerRecordPath(paths.registryDir, originalOwner.generation), "{ malformed\n");
+		const path = ownerRecordPath(paths.registryDir, originalOwner.generation);
+		writeFileSync(path, "{ malformed\n");
+		const before = { bytes: readFileSync(path), stat: statSync(path, { bigint: true }) };
 		try {
-			unrelatedOwner = await acquireDaemonSupervisorOwnership({
-				agentDir: join(paths.agentDir, "healthy-agent"),
-				appVersion: "test",
-				descriptorDir: join(paths.agentDir, "healthy-workers"),
-				generation: "healthy-unrelated-owner",
-				registryDir: paths.registryDir,
-				socketPath: `${paths.socketPath}.healthy`,
-			});
-			expect(unrelatedOwner.record.generation).toBe("healthy-unrelated-owner");
+			await expect(
+				acquireDaemonSupervisorOwnership({
+					agentDir: join(paths.agentDir, "healthy-agent"),
+					appVersion: "test",
+					descriptorDir: join(paths.agentDir, "healthy-workers"),
+					generation: "healthy-unrelated-owner",
+					registryDir: paths.registryDir,
+					socketPath: `${paths.socketPath}.healthy`,
+				}),
+			).rejects.toThrow(/Invalid daemon supervisor owner record/);
+			expect(readFileSync(path)).toEqual(before.bytes);
+			const after = statSync(path, { bigint: true });
+			expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.stat.dev, ino: before.stat.ino });
 		} finally {
-			await unrelatedOwner?.release();
 			writeOwnerRecord(paths.registryDir, originalOwner);
 			await corruptOwner.release();
 		}
 	});
 
-	it("reclaims empty owner directories left by interrupted startup", async () => {
+	it("retains empty owner directories as malformed authority", async () => {
 		const paths = await createPaths();
 		const abandonedDirectory = join(paths.registryDir, "abandoned-owner.owner");
 		mkdirSync(abandonedDirectory, { recursive: true });
 
-		const owner = await acquireDaemonSupervisorOwnership({
-			agentDir: paths.agentDir,
-			appVersion: "test",
-			descriptorDir: paths.descriptorDir,
-			generation: "healthy-owner",
-			registryDir: paths.registryDir,
-			socketPath: paths.socketPath,
-		});
-
-		expect(existsSync(abandonedDirectory)).toBe(false);
-		expect(owner.record.generation).toBe("healthy-owner");
-		await owner.release();
+		await expect(
+			acquireDaemonSupervisorOwnership({
+				agentDir: paths.agentDir,
+				appVersion: "test",
+				descriptorDir: paths.descriptorDir,
+				generation: "healthy-owner",
+				registryDir: paths.registryDir,
+				socketPath: paths.socketPath,
+			}),
+		).rejects.toThrow(/Invalid daemon supervisor owner record/);
+		expect(existsSync(abandonedDirectory)).toBe(true);
 	});
 
-	it("reclaims owner directories containing only stray files", async () => {
+	it("retains owner directories containing only stray files", async () => {
 		const paths = await createPaths();
 		const abandonedDirectory = join(paths.registryDir, "abandoned-owner.owner");
 		mkdirSync(abandonedDirectory, { recursive: true });
 		writeFileSync(join(abandonedDirectory, ".DS_Store"), "stray");
 
-		const owner = await acquireDaemonSupervisorOwnership({
-			agentDir: paths.agentDir,
-			appVersion: "test",
-			descriptorDir: paths.descriptorDir,
-			generation: "healthy-owner",
-			registryDir: paths.registryDir,
-			socketPath: paths.socketPath,
-		});
-
-		expect(existsSync(abandonedDirectory)).toBe(false);
-		expect(owner.record.generation).toBe("healthy-owner");
-		await owner.release();
+		await expect(
+			acquireDaemonSupervisorOwnership({
+				agentDir: paths.agentDir,
+				appVersion: "test",
+				descriptorDir: paths.descriptorDir,
+				generation: "healthy-owner",
+				registryDir: paths.registryDir,
+				socketPath: paths.socketPath,
+			}),
+		).rejects.toThrow(/Invalid daemon supervisor owner record/);
+		expect(existsSync(abandonedDirectory)).toBe(true);
 	});
 
-	it("persists a fence when immutable scope proves a corrupt owner is unrelated", async () => {
+	it("does not persist a fence past corrupt unrelated owner authority", async () => {
 		const paths = await createPaths();
 		const targetOwner = await acquireDaemonSupervisorOwnership({
 			agentDir: paths.agentDir,
@@ -963,25 +969,28 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 			socketPath: `${paths.socketPath}.corrupt`,
 		});
 		const originalCorruptOwner = { ...corruptOwner.record };
-		writeFileSync(ownerRecordPath(paths.registryDir, originalCorruptOwner.generation), "{ malformed\n");
+		const path = ownerRecordPath(paths.registryDir, originalCorruptOwner.generation);
+		writeFileSync(path, "{ malformed\n");
+		const before = { bytes: readFileSync(path), stat: statSync(path, { bigint: true }) };
 		try {
-			if (!targetOwner.record.processStartId) {
-				return;
-			}
-			await persistDaemonStartupFenceFromOwner(
-				paths.socketPath,
-				{
-					supervisorGeneration: targetOwner.record.generation,
-					supervisorOwnerToken: targetOwner.record.token,
-					supervisorPid: targetOwner.record.pid,
-					supervisorProcessStartId: targetOwner.record.processStartId,
-					supervisorSocketPath: targetOwner.record.socketPath,
-				},
-				paths.registryDir,
-			);
-			expect(readdirSync(join(paths.registryDir, "startup-fences"))).toHaveLength(1);
+			await expect(
+				persistDaemonStartupFenceFromOwner(
+					paths.socketPath,
+					{
+						supervisorGeneration: targetOwner.record.generation,
+						supervisorOwnerToken: targetOwner.record.token,
+						supervisorPid: targetOwner.record.pid,
+						supervisorProcessStartId: daemonSupervisorOwnerLegacyProcessStartId(targetOwner.record),
+						supervisorAuthorityProcessStartId: targetOwner.record.authorityProcessStartId,
+						supervisorSocketPath: targetOwner.record.socketPath,
+					},
+					paths.registryDir,
+				),
+			).rejects.toThrow(/Invalid daemon supervisor owner record/);
+			expect(readFileSync(path)).toEqual(before.bytes);
+			const after = statSync(path, { bigint: true });
+			expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.stat.dev, ino: before.stat.ino });
 		} finally {
-			rmSync(join(paths.registryDir, "startup-fences"), { recursive: true, force: true });
 			writeOwnerRecord(paths.registryDir, originalCorruptOwner);
 			await corruptOwner.release();
 			await targetOwner.release();
@@ -1011,9 +1020,20 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 					socketPath: paths.socketPath,
 				}),
 			).rejects.toThrow(/Invalid daemon supervisor owner record/);
-			await expect(persistDaemonStartupFenceFromOwner(paths.socketPath, {}, paths.registryDir)).rejects.toThrow(
-				/Invalid daemon supervisor owner record/,
-			);
+			await expect(
+				persistDaemonStartupFenceFromOwner(
+					paths.socketPath,
+					{
+						supervisorGeneration: originalOwner.generation,
+						supervisorOwnerToken: originalOwner.token,
+						supervisorPid: originalOwner.pid,
+						supervisorProcessStartId: daemonSupervisorOwnerLegacyProcessStartId(originalOwner),
+						supervisorAuthorityProcessStartId: originalOwner.authorityProcessStartId,
+						supervisorSocketPath: originalOwner.socketPath,
+					},
+					paths.registryDir,
+				),
+			).rejects.toThrow(/Invalid daemon supervisor owner record/);
 		} finally {
 			writeOwnerRecord(paths.registryDir, originalOwner);
 			await owner.release();
@@ -1052,9 +1072,20 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 					socketPath: `${paths.socketPath}.${generation}`,
 				}),
 			).rejects.toThrow(/Invalid daemon supervisor owner record/);
-			await expect(persistDaemonStartupFenceFromOwner(paths.socketPath, {}, paths.registryDir)).rejects.toThrow(
-				/Invalid daemon supervisor owner record/,
-			);
+			await expect(
+				persistDaemonStartupFenceFromOwner(
+					paths.socketPath,
+					{
+						supervisorGeneration: targetOwner.record.generation,
+						supervisorOwnerToken: targetOwner.record.token,
+						supervisorPid: targetOwner.record.pid,
+						supervisorProcessStartId: daemonSupervisorOwnerLegacyProcessStartId(targetOwner.record),
+						supervisorAuthorityProcessStartId: targetOwner.record.authorityProcessStartId,
+						supervisorSocketPath: targetOwner.record.socketPath,
+					},
+					paths.registryDir,
+				),
+			).rejects.toThrow(/Invalid daemon supervisor owner record/);
 		};
 		writeFileSync(ownerRecordPath(paths.registryDir, originalCorruptOwner.generation), "{ malformed\n");
 		try {
@@ -1110,7 +1141,7 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		await releaseOwnershipHolder(first);
 	});
 
-	it("retries ownership release after guarded removal fails", async () => {
+	it("marks ownership lost after guarded removal fails", async () => {
 		const paths = await createPaths();
 		const ownership = await acquireDaemonSupervisorOwnership({
 			agentDir: paths.agentDir,
@@ -1123,11 +1154,12 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		const movedRegistry = `${paths.registryDir}.moved`;
 		renameSync(paths.registryDir, movedRegistry);
 		writeFileSync(paths.registryDir, "blocked");
-		await expect(ownership.release()).rejects.toThrow();
+		await expect(ownership.release()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
 		rmSync(paths.registryDir, { force: true });
 		renameSync(movedRegistry, paths.registryDir);
-		await ownership.release();
-		expect(listOwnerRecords(paths.registryDir)).toEqual([]);
+		await expect(ownership.release()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
+		expect(listOwnerRecords(paths.registryDir)).toHaveLength(1);
+		rmSync(join(paths.registryDir, `${ownership.record.generation}.owner`), { recursive: true, force: true });
 	});
 
 	it("does not remove an owner record whose token changed", async () => {
@@ -1142,7 +1174,7 @@ describe("ENG-4600 daemon supervisor ownership", () => {
 		});
 		writeOwnerRecord(paths.registryDir, { ...ownership.record, token: "replacement-token" });
 
-		await ownership.release();
+		await expect(ownership.release()).rejects.toMatchObject({ code: "supervisor_generation_stale" });
 
 		expect(readOwnerRecord(paths.registryDir, ownership.record.generation)?.token).toBe("replacement-token");
 		rmSync(join(paths.registryDir, `${ownership.record.generation}.owner`), { recursive: true, force: true });

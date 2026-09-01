@@ -318,6 +318,27 @@ describe("mcp-serve message rendering", () => {
 		expect(rendered).toContain('-> bash({"command":"npm test"})');
 	});
 
+	it("renders CPython cells under the external ipython tool label", () => {
+		const assistant = fauxAssistantMessage([
+			fauxText("checking"),
+			fauxToolCall("ipython", { code: 'print("hello")\n6 * 7' }),
+		]);
+		expect(renderMessage(assistant, 300)).toContain('-> ipython(print("hello") 6 * 7)');
+
+		const result = renderMessage(
+			{
+				role: "toolResult",
+				toolCallId: "python-1",
+				toolName: "ipython",
+				content: [{ type: "text", text: "hello\n42" }],
+				isError: false,
+				timestamp: 1,
+			},
+			300,
+		);
+		expect(result).toBe("[toolResult:ipython] hello 42");
+	});
+
 	it("renders tool results, including errors and images", () => {
 		expect(
 			renderMessage(
@@ -442,6 +463,11 @@ describe("mcp-serve session selector resolution", () => {
 
 	it("prefers an exact match anywhere in the fleet over an earlier suffix match", () => {
 		expect(resolveSessionSummary(fleet, "1111aaaa")?.activeSessionId).toBe("3333bbbb");
+	});
+
+	it("matches a live session by its saved file path", () => {
+		const withPath = [summary({ sessionFile: "/tmp/session.jsonl" })];
+		expect(resolveSessionSummary(withPath, "/tmp/session.jsonl")?.activeSessionId).toBe("aaaabbbbccc1");
 	});
 
 	it("matches by id suffix when nothing matches exactly", () => {

@@ -5,7 +5,7 @@ Connect external services (Linear, Notion, …) to Prime Agent over the
 
 Consistent with Prime Agent's single-tool design, MCP integrations are **not**
 exposed as new agent tools. Each integration is a [Python-backed skill](skills.md)
-that the model imports and calls from the IPython kernel:
+that the model imports and calls from the Python kernel:
 
 ```python
 import linear
@@ -20,11 +20,9 @@ credentials in `auth.json`.
 
 - [Using a built-in integration](#using-a-built-in-integration)
 - [How a call works](#how-a-call-works)
-- [Authoring your own integration](#authoring-your-own-integration)
-  - [1. Declare the server](#1-declare-the-server)
-  - [2. Ship the skill package](#2-ship-the-skill-package)
-  - [Authentication](#authentication)
-- [The `McpIntegration` API](#the-mcpintegration-api)
+- [Generic MCP servers](#generic-mcp-servers)
+- [Remote-controlling Prime Agent over MCP](#remote-controlling-prime-agent-over-mcp)
+- [Authored wrapper API](#authored-wrapper-api)
 - [Enable-by-login lifecycle](#enable-by-login-lifecycle)
 - [Caveats](#caveats)
 
@@ -123,7 +121,7 @@ to the user settings file:
 }
 ```
 
-The generic `mcp` module is pre-imported in IPython. Server and tool names are
+The generic `mcp` module is pre-imported in the Python REPL. Server and tool names are
 passed through unchanged:
 
 ```python
@@ -147,6 +145,42 @@ and terminates stdio children.
 
 Authored Linear and Notion skills remain available as optional typed wrappers.
 They use the same existing login and credential behavior.
+
+## Remote-controlling Prime Agent over MCP
+
+`mcp-serve` exports the local Prime Agent fleet to an MCP client. This is the
+opposite direction from the integrations above: it controls agent sessions and
+does not add model-facing tools to those sessions.
+
+```bash
+# HTTP on 0.0.0.0:7717
+prime-agent mcp-serve
+
+# Local stdio transport, or an explicit daemon socket
+prime-agent mcp-serve --stdio
+prime-agent mcp-serve --daemon-socket /path/to/daemon.sock
+# --socket is retained as an alias for --daemon-socket
+```
+
+The HTTP transport has no authentication. Bind it only on a trusted network, or
+use `--bind 127.0.0.1`; use `--port <n>` to change the port. The exact exported
+tool set is:
+
+| Tool | Purpose |
+|---|---|
+| `status` | List the fleet with derived `worker_failed`, `waiting_on_user`, `stalled`, `working`, `idle`, and `inactive` states. |
+| `session_detail` | Read one live session's state, stats, queue, children, heartbeats, and pending question. |
+| `transcript` | Read a bounded, pageable transcript window. |
+| `send` | Admit, steer, or queue a message for one or more live sessions. |
+| `interrupt` | Stop a turn, bash command, or compaction. |
+| `start_session` | Create a resident session and send its required first prompt. |
+| `resume_session` | Wake a saved session by selector or file path, or reuse it if already live. |
+| `restart_session` | Retry a failed worker or stop and resume a healthy one from its file. |
+| `kill_session` | Stop a live session while retaining its saved file. |
+
+Empty unnamed workers can be passivated after their last attached client leaves.
+A retained session file remains resumable with `resume_session`; MCP does not add
+a separate ownership or keep-alive field.
 
 ## Authored wrapper API
 

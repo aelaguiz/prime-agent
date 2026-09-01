@@ -1,11 +1,13 @@
 import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { Container, type MarkdownTheme, type TUI } from "@earendil-works/pi-tui";
+import { render as renderMermaid } from "grok-mermaid";
 import stripAnsi from "strip-ansi";
 import { beforeAll, describe, expect, test, vi } from "vitest";
 import type { AgentConnectionSessionEvent } from "../src/modes/agent-connection/index.js";
 import { AgentActivityTracker } from "../src/modes/interactive/agent-activity.js";
 import type { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.js";
 import type { FileChangeSummary } from "../src/modes/interactive/components/edit-summary.js";
+import { createMermaidMarkdownTransform } from "../src/modes/interactive/components/mermaid.js";
 import type { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.js";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 import { getMarkdownTheme, initTheme } from "../src/modes/interactive/theme/theme.js";
@@ -51,7 +53,6 @@ type HandleEventThis = {
 	checkShutdownRequested(): Promise<void>;
 	applyOptimisticContextUsage(): void;
 	refreshConnectionContextUsage(): Promise<void>;
-	setSessionHasMessages(hasMessages: boolean): void;
 	clearShortcutGuide(): void;
 	addMessageToChat(): void;
 };
@@ -102,7 +103,6 @@ function createFakeInteractiveModeThis(): HandleEventThis {
 		checkShutdownRequested: vi.fn(async () => {}),
 		applyOptimisticContextUsage: vi.fn(),
 		refreshConnectionContextUsage: vi.fn(async () => {}),
-		setSessionHasMessages: vi.fn(),
 		clearShortcutGuide: vi.fn(),
 		addMessageToChat: vi.fn(),
 	};
@@ -208,6 +208,56 @@ describe("InteractiveMode streaming events", () => {
 		expect(renderChat(fakeThis.chatContainer)).toContain("partial response");
 		expect(fakeThis.streamingComponent).toBeUndefined();
 		expect(fakeThis.streamingMessage).toBeUndefined();
+	});
+
+	test("defers mermaid rendering to message_end in final mode", async () => {
+		const fakeThis = createFakeInteractiveModeThis() as HandleEventThis & {
+			mermaidMarkdownTransform?: ReturnType<typeof createMermaidMarkdownTransform>;
+		};
+		fakeThis.mermaidMarkdownTransform = createMermaidMarkdownTransform({ getMode: () => "final" });
+		const handleEvent = (InteractiveMode.prototype as unknown as { handleEvent: HandleEvent }).handleEvent;
+		const mermaidText = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
+
+		await handleEvent.call(fakeThis, {
+			type: "message_update",
+			message: createAssistantMessage(mermaidText),
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: 0,
+				delta: mermaidText,
+				partial: createAssistantMessage(mermaidText),
+			},
+		});
+
+		expect(renderChat(fakeThis.chatContainer)).not.toContain("───▶");
+
+		await handleEvent.call(fakeThis, {
+			type: "message_end",
+			message: createAssistantMessage(mermaidText),
+		});
+
+		expect(renderChat(fakeThis.chatContainer)).toContain("───▶");
+	});
+
+	test("renders Mermaid at the exact content width and falls back when one column too wide", () => {
+		const source = "```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```";
+		const art = renderMermaid("flowchart LR\n  A[Start] --> B[Done]");
+		expect(art).not.toBeNull();
+		const transform = createMermaidMarkdownTransform({ getMode: () => "final" });
+
+		expect(transform(source, art!.width, false)).not.toContain("```mermaid");
+		expect(transform(source, art!.width - 1, false)).toBe(source);
+	});
+
+	test("keeps a partial final Mermaid source while streaming mode draws its parseable prefix", () => {
+		const source = "```mermaid\nflowchart LR\n  A[Start --> B\n```";
+		const finalTransform = createMermaidMarkdownTransform({ getMode: () => "final" });
+		const streamingTransform = createMermaidMarkdownTransform({ getMode: () => "streaming" });
+
+		const final = finalTransform(source, 200, false);
+		expect(final).toContain(source);
+		expect(final).toContain("Mermaid diagram not rendered:");
+		expect(streamingTransform(source, 200, true)).not.toContain("```mermaid");
 	});
 
 	test("renders one agent-run edit total only when files changed", async () => {
