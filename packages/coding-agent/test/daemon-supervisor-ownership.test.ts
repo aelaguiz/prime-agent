@@ -503,6 +503,37 @@ describe("daemon supervisor ownership registry", () => {
 		await legacyOwner.release();
 	});
 
+	it("verifies authority without waiting for a held registry guard", async () => {
+		const paths = createPaths();
+		const ownership = await acquire(paths);
+		const processStartId = ownership.record.authorityProcessStartId ?? ownership.record.processStartId;
+		const identity = {
+			generation: ownership.record.generation,
+			pid: ownership.record.pid,
+			...(processStartId ? { processStartId } : {}),
+			socketPath: ownership.record.socketPath,
+		};
+		// proper-lockfile holds the canonical guard path as a directory, so a caller
+		// that takes the mutation guard would spin through its whole retry budget.
+		const dropGuard = await lockfile.lock(paths.registryDir, {
+			realpath: false,
+			lockfilePath: join(paths.registryDir, ".guard"),
+		});
+		try {
+			const startedAt = Date.now();
+			await ownership.assertCurrent();
+			if (processStartId) {
+				await expect(assertDaemonSupervisorOwnerCurrent(identity, undefined, paths.registryDir)).resolves.toEqual(
+					expect.any(String),
+				);
+			}
+			expect(Date.now() - startedAt).toBeLessThan(1500);
+		} finally {
+			await dropGuard();
+		}
+		await ownership.release();
+	});
+
 	it("legacy registry reads never reclaim abandoned legacy directories", async () => {
 		const paths = createPaths();
 		const legacyDir = join(paths.root, "legacy-registry");

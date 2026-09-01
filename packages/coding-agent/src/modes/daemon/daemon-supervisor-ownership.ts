@@ -275,7 +275,7 @@ class DaemonSupervisorOwnership {
 	async assertCurrent(): Promise<void> {
 		this.assertAvailable();
 		try {
-			await withRegistryGuards(this.registryDirs, () => {
+			await withConsistentRegistryRead(() => {
 				requireOwnerCopies(this.registryDirs, this.record);
 				assertSelfOwnedAuthority(this.record, () => this.ownershipLostError());
 			});
@@ -633,6 +633,28 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 	);
 }
 
+// Read-only authority checks never take the mutation guard. Every record is
+// published by atomic rename, so a reader sees a whole old or new copy of each
+// file; only a mirror write in flight can make copies disagree for a moment,
+// and the bounded re-read rides through that instead of reporting a false loss.
+// Taking the guard for reads made every worker fence poll and every command
+// admission contend with each other and with the supervisor on one lock.
+const CONSISTENT_READ_ATTEMPTS = 3;
+const CONSISTENT_READ_RETRY_MS = 25;
+
+async function withConsistentRegistryRead<T>(action: () => T): Promise<T> {
+	let lastError: unknown;
+	for (let attempt = 0; attempt < CONSISTENT_READ_ATTEMPTS; attempt++) {
+		if (attempt > 0) await delay(CONSISTENT_READ_RETRY_MS);
+		try {
+			return action();
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw lastError;
+}
+
 /** Acquire canonical registry guards in one global order and release in reverse. */
 export async function withRegistryGuards<T>(
 	registryDirs: readonly string[],
@@ -968,7 +990,7 @@ export async function assertDaemonSupervisorOwnerCurrent(
 	void validatedFingerprint; // Fingerprints are diagnostics, never cached authorization.
 	const registryDirs = configuredRegistryDirs(registryDir, legacyRegistryDir);
 	try {
-		return await withRegistryGuards(registryDirs, () => {
+		return await withConsistentRegistryRead(() => {
 			const copies: DaemonSupervisorOwnerRecord[] = [];
 			for (const currentRegistryDir of registryDirs) {
 				const directory = ownerDirectoryPath(currentRegistryDir, owner.generation);
@@ -1031,7 +1053,7 @@ export async function assertDaemonSupervisorOwnerCurrentForWorkerAuthentication(
 	void validatedFingerprint;
 	const registryDirs = configuredRegistryDirs(registryDir, legacyRegistryDir);
 	try {
-		return await withRegistryGuards(registryDirs, () => {
+		return await withConsistentRegistryRead(() => {
 			const copies: DaemonSupervisorOwnerRecord[] = [];
 			for (const currentRegistryDir of registryDirs) {
 				const directory = ownerDirectoryPath(currentRegistryDir, claim.supervisorGeneration);
@@ -1143,6 +1165,17 @@ export async function isDaemonShutdownAdmissionActive(
 	legacyRegistryDir: string | undefined = registryDir === undefined ? legacyDaemonSupervisorRegistryDir() : undefined,
 ): Promise<boolean> {
 	const registryDirs = configuredRegistryDirs(registryDir, legacyRegistryDir);
+	// No admission on disk, or a live one, answers without the mutation guard.
+	// Only an admission left by an exactly dead process needs the guarded reclaim.
+	const admissions = registryDirs.map((currentRegistryDir) =>
+		readShutdownAdmission(shutdownAdmissionPath(currentRegistryDir)),
+	);
+	if (admissions.every((admission) => admission === undefined)) return false;
+	if (
+		admissions.some((admission) => admission !== undefined && shutdownAdmissionAuthority(admission) !== "exact-dead")
+	) {
+		return true;
+	}
 	return withRegistryGuards(registryDirs, (guard) =>
 		registryDirs.some((currentRegistryDir) => readRetainedShutdownAdmission(currentRegistryDir, guard) !== undefined),
 	);

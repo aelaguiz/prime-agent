@@ -1,0 +1,2 @@
+- Fixed session starts, resumes, and prompts slowing down and timing out as resident workers accumulated: read-only supervisor authority checks (worker fence polls, command admission, the supervisor's own ownership assertion, and the shutdown-admission read) no longer take the global registry mutation guard.
+- Added `scripts/bench-daemon-fleet.ts`, an isolated fleet load reproduction that reports create latency, relayed command latency, fleet CPU, and the daemon's own startup and lock timings.
