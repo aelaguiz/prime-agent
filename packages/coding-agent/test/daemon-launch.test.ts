@@ -609,7 +609,7 @@ process.exit(0);
 			await connected[0];
 			await vi.advanceTimersByTimeAsync(2000);
 			await connected[1];
-			await vi.advanceTimersByTimeAsync(30_000);
+			await vi.advanceTimersByTimeAsync(120_000);
 			await rejected;
 			expect(commands).not.toContain("list");
 			expect(commands).not.toContain("shutdown");
@@ -672,7 +672,7 @@ process.exit(0);
 
 		try {
 			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
-				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
+				/exited during startup \(code 7\)\. The daemon wrote nothing new to its log/,
 			);
 		} finally {
 			process.argv[1] = originalEntrypoint;
@@ -753,7 +753,7 @@ process.exit(0);
 
 		try {
 			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(
-				/exited during startup \(code 7\)\. The daemon wrote nothing to its log/,
+				/exited during startup \(code 7\)\. The daemon wrote nothing new to its log/,
 			);
 		} finally {
 			process.argv[1] = originalEntrypoint;

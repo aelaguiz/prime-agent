@@ -400,6 +400,11 @@ interface ResidentWorker {
 	rosterRepairPull?: Promise<void>;
 }
 
+interface WorkerStartupTrace {
+	startedAt: number;
+	previousStageAt: number;
+}
+
 interface SnapshotDuplicateValidation {
 	promise: Promise<void>;
 	resolve: () => void;
@@ -546,15 +551,33 @@ function signalSafeLegacyProcessStartId(
 		: undefined;
 }
 
-async function observeSpawnedWorkerProcessStartId(pid: number, darwinOwnerToken: string): Promise<string> {
+interface SpawnedWorkerProcessIdentityObservation {
+	processStartId: string;
+	attempts: number;
+	totalQueryMs: number;
+	maxQueryMs: number;
+}
+
+async function observeSpawnedWorkerProcessStartId(
+	pid: number,
+	darwinOwnerToken: string,
+): Promise<SpawnedWorkerProcessIdentityObservation> {
 	const deadline = Date.now() + WORKER_PROCESS_IDENTITY_TIMEOUT_MS;
+	let attempts = 0;
+	let totalQueryMs = 0;
+	let maxQueryMs = 0;
 	do {
+		attempts++;
+		const queryStartedAt = Date.now();
 		const observed = getProcessStartId(pid);
+		const queryMs = Date.now() - queryStartedAt;
+		totalQueryMs += queryMs;
+		maxQueryMs = Math.max(maxQueryMs, queryMs);
 		if (observed !== undefined) {
 			if (process.platform === "darwin" && observed !== darwinOwnerToken) {
 				throw new Error("Daemon session worker argv owner token did not match its observed Darwin identity");
 			}
-			return observed;
+			return { processStartId: observed, attempts, totalQueryMs, maxQueryMs };
 		}
 		if (!processIdExists(pid)) {
 			throw new Error("Daemon session worker exited before its exact process identity could be observed");
@@ -748,6 +771,11 @@ export class DaemonSupervisor {
 	private cleanupPromise?: Promise<void>;
 	private shuttingDown = false;
 	private startupComplete = false;
+	private startupDiagnosticStartedAt = Date.now();
+	private startupDiagnosticStageAt = this.startupDiagnosticStartedAt;
+	private startupDiagnosticPhase = "constructed";
+	private startupDeferredConnectionCount = 0;
+	private startupDeferredConnectionLogAt = 0;
 	private updateRestartPhase?: "draining" | "fencing" | "prepared";
 	private readonly mutationDrain = new MutationDrainLatch();
 	private readonly clients = new Set<DaemonSocketClient>();
@@ -812,11 +840,14 @@ export class DaemonSupervisor {
 	}
 
 	async start(): Promise<void> {
+		this.startupDiagnosticStartedAt = Date.now();
+		this.startupDiagnosticStageAt = this.startupDiagnosticStartedAt;
 		try {
 			const agentDir = this.defaultSessionConfig.agentDir;
 			if (!agentDir) {
 				throw new Error("Daemon supervisor config is missing agentDir");
 			}
+			this.traceSupervisorStartup("begin", { pid: process.pid });
 			this.socketLease = await acquireDaemonSocketPathLease(this.socketPath);
 			this.socketLease?.onCompromised((error) => this.handleSocketLeaseCompromised(error));
 			this.assertSocketAuthority();
@@ -831,6 +862,7 @@ export class DaemonSupervisor {
 			});
 			this.assertSocketAuthority();
 			await prepareDaemonSocketPath(this.socketPath, this.socketLease);
+			this.traceSupervisorStartup("socket_authority_acquired");
 
 			this.assertSocketAuthority();
 			mkdirSync(this.descriptorDir, { recursive: true, mode: 0o700 });
@@ -856,6 +888,7 @@ export class DaemonSupervisor {
 			this.loadWorkerDescriptors(this.socketLease);
 			this.assertSocketAuthority();
 			const workersToAdopt = [...this.workers.values()];
+			this.traceSupervisorStartup("descriptors_loaded", { workerCount: workersToAdopt.length });
 
 			this.server = createServer((socket) => this.handleConnection(socket));
 			await this.listen();
@@ -866,6 +899,7 @@ export class DaemonSupervisor {
 			}
 			this.ownsSocketPath = true;
 			restrictDaemonSocketPath(this.socketPath, this.socketLease);
+			this.traceSupervisorStartup("socket_listening", { workerCount: workersToAdopt.length });
 
 			this.registerSignalHandlers();
 			const ownedSessionFiles = new Set(
@@ -882,21 +916,44 @@ export class DaemonSupervisor {
 			}
 			await this.catalog.start().catch((error) => this.log(`Could not start daemon catalog: ${String(error)}`));
 			this.assertSocketLeaseHeld();
+			this.traceSupervisorStartup("catalog_started");
 			await this.seedRosterLedger();
+			this.traceSupervisorStartup("roster_seeded", { rosterSize: [...this.roster().values()].length });
 			let adoptionFailure: unknown;
 			let adoptionFailed = false;
 			this.startupWorkerConnectionSemaphore = new Semaphore(STARTUP_WORKER_CONNECTION_CONCURRENCY);
+			this.traceSupervisorStartup("worker_adoption_started", {
+				workerCount: workersToAdopt.length,
+				concurrency: STARTUP_WORKER_CONNECTION_CONCURRENCY,
+			});
 			try {
 				await Promise.all(
 					workersToAdopt.map(async (worker) => {
+						const workerStartedAt = Date.now();
+						this.log(
+							`Supervisor startup trace=${this.generation.slice(0, 8)} phase=worker_adoption_wait ` +
+								`worker=${worker.descriptor.workerId} pid=${worker.descriptor.pid} ` +
+								`lifecycle=${worker.descriptor.lifecycle}`,
+						);
 						try {
 							await this.adoptOrRecoverWorker(worker);
 						} catch (error) {
+							this.log(
+								`Supervisor startup trace=${this.generation.slice(0, 8)} phase=worker_adoption_result ` +
+									`worker=${worker.descriptor.workerId} status=failed elapsedMs=${Date.now() - workerStartedAt} ` +
+									`error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+							);
 							if (!adoptionFailed) {
 								adoptionFailed = true;
 								adoptionFailure = error;
 							}
+							return;
 						}
+						this.log(
+							`Supervisor startup trace=${this.generation.slice(0, 8)} phase=worker_adoption_result ` +
+								`worker=${worker.descriptor.workerId} status=${worker.descriptor.lifecycle} ` +
+								`elapsedMs=${Date.now() - workerStartedAt}`,
+						);
 					}),
 				);
 			} finally {
@@ -905,6 +962,7 @@ export class DaemonSupervisor {
 			if (adoptionFailed) {
 				throw adoptionFailure;
 			}
+			this.traceSupervisorStartup("worker_adoption_finished", { workerCount: workersToAdopt.length });
 			for (const worker of this.workers.values()) {
 				this.scheduleOwnedWorkerCleanup(worker);
 			}
@@ -915,10 +973,12 @@ export class DaemonSupervisor {
 			await this.ownership.updatePhase("owner");
 			this.assertSocketAuthority();
 			this.startupComplete = true;
+			this.traceSupervisorStartup("ready", { workerCount: this.workers.size });
 			this.log(`Prime Agent daemon supervisor ${this.generation} listening on ${this.socketPath}`);
 			this.markReady();
 		} catch (error) {
 			const startupError = error instanceof Error ? error : new Error(String(error));
+			this.traceSupervisorStartup("failed", { error: startupError.message });
 			this.log(`Daemon supervisor startup failed: ${startupError.stack ?? startupError.message}`);
 			await this.cleanupSupervisorResources();
 			this.rejectReady(startupError);
@@ -953,6 +1013,59 @@ export class DaemonSupervisor {
 		console.error(message);
 		structuredLog.warn(message, { socketPath: this.socketPath });
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] supervisor: ${message}`);
+	}
+
+	private traceSupervisorStartup(phase: string, details: Record<string, string | number | undefined> = {}): void {
+		const now = Date.now();
+		const elapsedMs = now - this.startupDiagnosticStartedAt;
+		const sincePreviousMs = now - this.startupDiagnosticStageAt;
+		this.startupDiagnosticPhase = phase;
+		this.startupDiagnosticStageAt = now;
+		const suffix = Object.entries(details)
+			.filter((entry): entry is [string, string | number] => entry[1] !== undefined)
+			.map(([key, value]) => `${key}=${typeof value === "string" ? JSON.stringify(value) : value}`)
+			.join(" ");
+		this.log(
+			`Supervisor startup trace=${this.generation.slice(0, 8)} phase=${phase} elapsedMs=${elapsedMs} ` +
+				`sincePreviousMs=${sincePreviousMs}${suffix ? ` ${suffix}` : ""}`,
+		);
+		recordProcessLifecycle("daemon_supervisor_startup_stage", {
+			phase,
+			elapsedMs,
+			sincePreviousMs,
+			supervisorGeneration: this.generation,
+			supervisorSocketPath: this.socketPath,
+			...details,
+		});
+	}
+
+	private traceWorkerStartup(
+		workerId: string,
+		trace: WorkerStartupTrace,
+		phase: string,
+		details: Record<string, string | number | undefined> = {},
+	): void {
+		const now = Date.now();
+		const elapsedMs = now - trace.startedAt;
+		const sincePreviousMs = now - trace.previousStageAt;
+		trace.previousStageAt = now;
+		const suffix = Object.entries(details)
+			.filter((entry): entry is [string, string | number] => entry[1] !== undefined)
+			.map(([key, value]) => `${key}=${typeof value === "string" ? JSON.stringify(value) : value}`)
+			.join(" ");
+		this.log(
+			`Worker startup trace=${workerId} phase=${phase} elapsedMs=${elapsedMs} sincePreviousMs=${sincePreviousMs}` +
+				`${suffix ? ` ${suffix}` : ""}`,
+		);
+		recordProcessLifecycle("daemon_worker_launch_stage", {
+			phase,
+			workerId,
+			elapsedMs,
+			sincePreviousMs,
+			supervisorGeneration: this.generation,
+			supervisorSocketPath: this.socketPath,
+			...details,
+		});
 	}
 
 	private clearIdleEvictionTimer(): void {
@@ -1458,6 +1571,7 @@ export class DaemonSupervisor {
 	}
 
 	private handleConnection(socket: Socket): void {
+		const connectedAt = Date.now();
 		const client: DaemonSocketClient = {
 			id: createActiveSessionId(),
 			socket,
@@ -1474,9 +1588,28 @@ export class DaemonSupervisor {
 		this.sessionInputPauseEpochs.set(client, 0);
 		this.detachingInputPauseSessions.set(client, new Set());
 		this.clients.add(client);
+		if (!this.startupComplete) {
+			this.startupDeferredConnectionCount++;
+			if (connectedAt - this.startupDeferredConnectionLogAt >= 5000) {
+				this.startupDeferredConnectionLogAt = connectedAt;
+				this.log(
+					`Supervisor startup trace=${this.generation.slice(0, 8)} phase=${this.startupDiagnosticPhase} ` +
+						`hello=deferred acceptedDuringStartup=${this.startupDeferredConnectionCount} ` +
+						`connectedClients=${this.clients.size}`,
+				);
+			}
+		}
 		void this.ready.then(
 			() => {
 				if (!client.socket.destroyed && this.clients.has(client)) {
+					const helloDelayMs = Date.now() - connectedAt;
+					if (helloDelayMs >= 1000) {
+						this.log(
+							`Supervisor startup trace=${this.generation.slice(0, 8)} phase=ready hello=released ` +
+								`client=${client.id} delayMs=${helloDelayMs} ` +
+								`acceptedDuringStartup=${this.startupDeferredConnectionCount}`,
+						);
+					}
 					const owner = this.ownership?.record;
 					const authorityProcessStartId = owner ? daemonSupervisorOwnerAuthorityProcessStartId(owner) : undefined;
 					const legacyProcessStartId = owner ? daemonSupervisorOwnerLegacyProcessStartId(owner) : undefined;
@@ -1900,6 +2033,15 @@ export class DaemonSupervisor {
 		// Attach is intentionally read-only and is not fence-gated. If eviction wins
 		// the race, attach fails cleanly with "Session worker is not connected" and
 		// the client retries through the saved-session path instead of mutating state.
+		const traceCreate = command.type === "create";
+		const commandStartedAt = Date.now();
+		let commandOutcome = "completed";
+		if (traceCreate) {
+			this.log(
+				`Supervisor command trace=${command.id ?? "none"} type=create phase=started ` +
+					`client=${this.protocolClientId(client)}`,
+			);
+		}
 		if (mutation) this.mutationDrain.begin();
 		try {
 			const response = await this.handleCommand(client, command, cancellationAdmission);
@@ -1911,6 +2053,7 @@ export class DaemonSupervisor {
 				this.write(client, response);
 			}
 		} catch (error) {
+			commandOutcome = "failed";
 			this.log(`Supervisor command ${command.type} failed: ${error instanceof Error ? error.stack : String(error)}`);
 			let response = failure(command.id, command.type, error, serializeDaemonError(error));
 			if (journalIdentity && !isSupervisorGenerationStale(error)) {
@@ -1924,6 +2067,12 @@ export class DaemonSupervisor {
 			this.write(client, response);
 		} finally {
 			if (mutation) this.mutationDrain.end();
+			if (traceCreate) {
+				this.log(
+					`Supervisor command trace=${command.id ?? "none"} type=create phase=${commandOutcome} ` +
+						`elapsedMs=${Date.now() - commandStartedAt} clientConnected=${this.clients.has(client)}`,
+				);
+			}
 		}
 	}
 
@@ -3261,7 +3410,16 @@ export class DaemonSupervisor {
 	): Promise<ResidentWorker> {
 		const workerId = existing?.descriptor.workerId ?? createActiveSessionId();
 		const descriptorPath = existing?.descriptorPath ?? join(this.descriptorDir, `${workerId}.json`);
+		const startupStartedAt = Date.now();
+		const startupTrace: WorkerStartupTrace = {
+			startedAt: startupStartedAt,
+			previousStageAt: startupStartedAt,
+		};
+		this.traceWorkerStartup(workerId, startupTrace, "mutation_guard_wait", {
+			trigger: existing ? "worker_recovery" : ownerClientId ? "owned_session_create" : "session_create",
+		});
 		const mutationGuard = await acquireDaemonWorkerMutationGuard(descriptorPath);
+		this.traceWorkerStartup(workerId, startupTrace, "mutation_guard_acquired");
 		let worker: ResidentWorker;
 		try {
 			worker = await this.launchWorkerWithGuard(
@@ -3271,8 +3429,12 @@ export class DaemonSupervisor {
 				workerId,
 				descriptorPath,
 				mutationGuard,
+				startupTrace,
 			);
 		} catch (error) {
+			this.traceWorkerStartup(workerId, startupTrace, "failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
 			try {
 				mutationGuard.release();
 			} catch (releaseError) {
@@ -3291,6 +3453,7 @@ export class DaemonSupervisor {
 		workerId: string,
 		descriptorPath: string,
 		mutationGuard: HeldAuthorityMutationGuard,
+		startupTrace: WorkerStartupTrace,
 	): Promise<ResidentWorker> {
 		mutationGuard.assertCurrent();
 		await this.assertRecoveryAllowed();
@@ -3340,6 +3503,7 @@ export class DaemonSupervisor {
 				)
 			: initializeOrphanProcessJournal(orphanProcessJournalPath);
 		const trigger = existing ? "worker_recovery" : ownerClientId ? "owned_session_create" : "session_create";
+		this.traceWorkerStartup(workerId, startupTrace, "preparing_process", { trigger });
 		let preparedLaunch: ReturnType<typeof prepareProcessLifecycleLaunch>;
 		try {
 			const workerEnvironment = createCliSubprocessEnv({
@@ -3395,6 +3559,7 @@ export class DaemonSupervisor {
 		}
 		let child: ChildProcess;
 		const childIdentity = createProcessIdentityOwnerToken();
+		this.traceWorkerStartup(workerId, startupTrace, "spawning_process", { trigger });
 		try {
 			child = spawn(launch.command, launch.args, {
 				argv0: childIdentity.argument,
@@ -3452,6 +3617,12 @@ export class DaemonSupervisor {
 		const childClosed = new Promise<void>((resolveClose) =>
 			child.once("close", (code, signal) => {
 				const expected = this.shuttingDown || worker?.intentionalStop === true;
+				this.traceWorkerStartup(workerId, startupTrace, "process_closed", {
+					childPid: child.pid,
+					expected: expected ? 1 : 0,
+					code: code ?? undefined,
+					signal: signal ?? undefined,
+				});
 				recordProcessLifecycle("daemon_worker_close", {
 					childProcessInstanceId: preparedLaunch.childProcessInstanceId,
 					childPid: child.pid,
@@ -3512,7 +3683,16 @@ export class DaemonSupervisor {
 				throw new Error("Failed to create daemon session worker startup gate");
 			}
 			childPid = child.pid;
-			childProcessStartId = await observeSpawnedWorkerProcessStartId(childPid, childIdentity.processStartId);
+			this.traceWorkerStartup(workerId, startupTrace, "process_spawned", { childPid });
+			this.traceWorkerStartup(workerId, startupTrace, "observing_process_identity", { childPid });
+			const processIdentity = await observeSpawnedWorkerProcessStartId(childPid, childIdentity.processStartId);
+			childProcessStartId = processIdentity.processStartId;
+			this.traceWorkerStartup(workerId, startupTrace, "process_identity_observed", {
+				childPid,
+				attempts: processIdentity.attempts,
+				totalQueryMs: processIdentity.totalQueryMs,
+				maxQueryMs: processIdentity.maxQueryMs,
+			});
 			childLegacyProcessStartId = signalSafeLegacyProcessStartId(childProcessStartId, childProcessStartId);
 			await this.assertRecoveryAllowed();
 
@@ -3559,9 +3739,11 @@ export class DaemonSupervisor {
 			worker.launchEnv = launchEnv;
 			worker.transientCreateCommand = descriptor.ownerClientId ? createCommand : undefined;
 			descriptorAssigned = true;
+			this.traceWorkerStartup(workerId, startupTrace, "persisting_descriptor", { childPid });
 			this.persistWorker(worker, mutationGuard);
 			worker.intentionalStop = false;
 			this.workers.set(workerId, worker);
+			this.traceWorkerStartup(workerId, startupTrace, "descriptor_published", { childPid });
 		} catch (error) {
 			recordProcessLifecycle("daemon_worker_launch_result", {
 				status: child.pid ? "registration_failed" : "spawn_error",
@@ -3633,6 +3815,9 @@ export class DaemonSupervisor {
 
 		try {
 			try {
+				this.traceWorkerStartup(workerId, startupTrace, "verifying_published_descriptor", {
+					childPid: child.pid,
+				});
 				await this.assertRecoveryAllowed();
 				mutationGuard.assertCurrent();
 				if (!launchDescriptor) throw new Error("Worker launch descriptor was not published");
@@ -3651,7 +3836,12 @@ export class DaemonSupervisor {
 							`(${publishedFingerprint ?? publishedFailureReason} != ${launchFingerprint})`,
 					);
 				}
+				this.traceWorkerStartup(workerId, startupTrace, "published_descriptor_verified", {
+					childPid: child.pid,
+				});
+				this.traceWorkerStartup(workerId, startupTrace, "releasing_startup_gate", { childPid: child.pid });
 				await commitWorkerStartupGate(startupGate);
+				this.traceWorkerStartup(workerId, startupTrace, "startup_gate_committed", { childPid: child.pid });
 			} catch (error) {
 				startupGate.destroy();
 				await childClosed;
@@ -3659,7 +3849,10 @@ export class DaemonSupervisor {
 			} finally {
 				child.unref();
 			}
-			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS);
+			this.traceWorkerStartup(workerId, startupTrace, "waiting_for_worker_hello", { childPid: child.pid });
+			const client = await this.connectWorker(worker, WORKER_CONNECT_TIMEOUT_MS, startupTrace);
+			this.traceWorkerStartup(workerId, startupTrace, "worker_authenticated", { childPid: child.pid });
+			this.traceWorkerStartup(workerId, startupTrace, "creating_root_session", { childPid: child.pid });
 			const response = await client.request(withoutCommandId(createCommand), WORKER_REQUEST_TIMEOUT_MS);
 			if (!response.success) {
 				throw deserializeDaemonError(response);
@@ -3671,11 +3864,19 @@ export class DaemonSupervisor {
 			if ((summary.activeSessionId ?? summary.id) !== rootActiveSessionId) {
 				throw new Error("Session worker did not preserve its assigned active session id");
 			}
+			this.traceWorkerStartup(workerId, startupTrace, "root_session_created", {
+				childPid: child.pid,
+				sessionId: summary.sessionId,
+			});
 			this.writeRosterEntry(workerRosterEntryFromSummary(summary), worker);
 			worker.descriptor.rootSessionId = summary.sessionId;
 			worker.descriptor.sessionFile = summary.sessionFile;
+			this.traceWorkerStartup(workerId, startupTrace, "subscribing_root", { childPid: child.pid });
 			await this.subscribeWorker(worker, rootActiveSessionId);
+			this.traceWorkerStartup(workerId, startupTrace, "root_subscribed", { childPid: child.pid });
+			this.traceWorkerStartup(workerId, startupTrace, "refreshing_roster", { childPid: child.pid });
 			await this.refreshWorkerSummaries(worker, true, true, false, mutationGuard);
+			this.traceWorkerStartup(workerId, startupTrace, "roster_refreshed", { childPid: child.pid });
 			if (existing && (this.isWorkerRecoveryCancelled(worker) || worker.stopRevision !== recoveryStopRevision)) {
 				throw new Error(`Session worker ${workerId} recovery was cancelled`);
 			}
@@ -3690,6 +3891,10 @@ export class DaemonSupervisor {
 				worker.transientCreateCommand = undefined;
 			}
 			this.broadcastHeartbeatsChanged();
+			this.traceWorkerStartup(workerId, startupTrace, "ready", {
+				childPid: child.pid,
+				sessionId: summary.sessionId,
+			});
 			recordProcessLifecycle("daemon_worker_launch_result", {
 				status: "ready",
 				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
@@ -3703,6 +3908,10 @@ export class DaemonSupervisor {
 			});
 			return worker;
 		} catch (error) {
+			this.traceWorkerStartup(workerId, startupTrace, "startup_operation_failed", {
+				childPid: child.pid,
+				error: error instanceof Error ? error.message : String(error),
+			});
 			recordProcessLifecycle("daemon_worker_launch_result", {
 				status: isSupervisorRecoveryCancelled(error) ? "cancelled" : "failed",
 				childProcessInstanceId: preparedLaunch.childProcessInstanceId,
@@ -3789,22 +3998,49 @@ export class DaemonSupervisor {
 		}
 	}
 
-	private async connectWorker(worker: ResidentWorker, timeoutMs: number): Promise<DaemonWorkerClient> {
+	private async connectWorker(
+		worker: ResidentWorker,
+		timeoutMs: number,
+		startupTrace?: WorkerStartupTrace,
+	): Promise<DaemonWorkerClient> {
 		const connect = async (): Promise<DaemonWorkerClient> => {
 			const deadline = Date.now() + timeoutMs;
 			let lastError: unknown;
+			let attempt = 0;
 			while (Date.now() < deadline) {
+				attempt++;
+				const attemptStartedAt = Date.now();
 				await this.assertRecoveryAllowed();
 				const client = new DaemonWorkerClient(worker.descriptor.socketPath);
 				try {
+					if (startupTrace) {
+						this.traceWorkerStartup(worker.descriptor.workerId, startupTrace, "worker_connect_attempt", {
+							attempt,
+						});
+					}
 					await client.connect(Math.min(500, Math.max(50, deadline - Date.now())));
+					if (startupTrace) {
+						this.traceWorkerStartup(worker.descriptor.workerId, startupTrace, "worker_socket_connected", {
+							attempt,
+						});
+					}
 					const hello = await client.waitForHello(1000);
+					if (startupTrace) {
+						this.traceWorkerStartup(worker.descriptor.workerId, startupTrace, "worker_hello_received", {
+							attempt,
+						});
+					}
 					assertDaemonWorkerRuntimeIdentity(hello.runtime);
 					// Listen before authenticating: the worker flushes its roster snapshot right after auth succeeds.
 					client.onFrame((frame) => this.handleWorkerFrame(worker, frame, client));
 					client.onClose((error) => void this.handleWorkerClose(worker, client, error));
 					worker.pendingClient = client;
 					try {
+						if (startupTrace) {
+							this.traceWorkerStartup(worker.descriptor.workerId, startupTrace, "worker_auth_started", {
+								attempt,
+							});
+						}
 						const authResponse = await client.authenticateWorker(
 							worker.descriptor.authenticationToken,
 							{
@@ -3815,6 +4051,11 @@ export class DaemonSupervisor {
 							},
 							1000,
 						);
+						if (startupTrace) {
+							this.traceWorkerStartup(worker.descriptor.workerId, startupTrace, "worker_auth_completed", {
+								attempt,
+							});
+						}
 						await this.assertRecoveryAllowed();
 						if (!workerAuthAdvertisesRoster(authResponse.data)) {
 							throw new PreRosterWorkerError(
@@ -3831,6 +4072,13 @@ export class DaemonSupervisor {
 					}
 				} catch (error) {
 					lastError = error;
+					if (startupTrace) {
+						this.traceWorkerStartup(worker.descriptor.workerId, startupTrace, "worker_connect_attempt_failed", {
+							attempt,
+							attemptElapsedMs: Date.now() - attemptStartedAt,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 					client.close();
 					if (
 						isSupervisorRecoveryCancelled(error) ||
@@ -4808,17 +5056,9 @@ export class DaemonSupervisor {
 		}
 		if (root) {
 			if (recovery) await this.assertRecoveryAllowed();
-			await this.chainWorkerRosterApply(worker, pullSource, () => {
+			await this.chainWorkerRosterApply(worker, pullSource, async () => {
 				if ((worker.rosterEpoch ?? 0) !== epochAtStart) return;
-				worker.descriptor.rootSessionId = root.sessionId;
-				worker.descriptor.sessionFile = root.sessionFile;
-				worker.descriptor.sessionDir = this.workerSessionsDir(worker);
-				worker.descriptor.createCommand = durableDaemonCreateCommand({
-					type: "create",
-					sessionPath: root.sessionFile,
-					noSession: worker.descriptor.createCommand.noSession,
-				});
-				this.persistWorker(worker, mutationGuard);
+				await this.persistRootDescriptorFromSummary(worker, root, mutationGuard);
 			});
 		}
 	}
@@ -5350,14 +5590,58 @@ export class DaemonSupervisor {
 		) {
 			return;
 		}
-		worker.descriptor.rootSessionId = summary.sessionId;
-		worker.descriptor.sessionFile = summary.sessionFile;
-		worker.descriptor.createCommand = durableDaemonCreateCommand({
-			type: "create",
-			sessionPath: summary.sessionFile,
-			noSession: worker.descriptor.createCommand.noSession,
-		});
-		this.persistWorker(worker);
+		// Root session identity participates in the worker's immutable authority fingerprint.
+		// A launch already owns the mutation guard and commits this identity from its create/list
+		// response. Every other roster-discovered change is reconciled through the guarded pull path.
+		if (worker.descriptor.lifecycle !== "starting" && !this.isWorkerStopping(worker)) {
+			this.scheduleRosterRepairPull(worker);
+		}
+	}
+
+	private async persistRootDescriptorFromSummary(
+		worker: ResidentWorker,
+		summary: SessionSummary,
+		mutationGuard?: HeldAuthorityMutationGuard,
+	): Promise<void> {
+		const sessionDir = this.workerSessionsDir(worker);
+		if (
+			worker.descriptor.rootSessionId === summary.sessionId &&
+			worker.descriptor.sessionFile === summary.sessionFile &&
+			worker.descriptor.sessionDir === sessionDir
+		) {
+			return;
+		}
+
+		const acquiredGuard = mutationGuard ? undefined : await acquireDaemonWorkerMutationGuard(worker.descriptorPath);
+		const guard = mutationGuard ?? acquiredGuard!;
+		try {
+			guard.assertCurrent();
+			await this.assertRecoveryAllowed();
+			guard.assertCurrent();
+			if (this.workers.get(worker.descriptor.workerId) !== worker || this.isWorkerStopping(worker)) return;
+
+			const previousDescriptor = worker.descriptor;
+			const nextDescriptor: DaemonWorkerDescriptor = {
+				...previousDescriptor,
+				rootSessionId: summary.sessionId,
+				sessionFile: summary.sessionFile,
+				sessionDir,
+				createCommand: durableDaemonCreateCommand({
+					type: "create",
+					sessionPath: summary.sessionFile,
+					noSession: previousDescriptor.createCommand.noSession,
+				}),
+			};
+			worker.descriptor = nextDescriptor;
+			try {
+				this.persistWorker(worker, guard);
+			} catch (error) {
+				worker.descriptor = previousDescriptor;
+				throw error;
+			}
+		} finally {
+			acquiredGuard?.release();
+		}
 	}
 
 	// Behind the pull-epoch guard the pull is never staler than the row it replaces; never steal another worker's claim.

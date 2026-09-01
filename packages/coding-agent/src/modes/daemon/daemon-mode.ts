@@ -447,6 +447,12 @@ function delay(ms: number): Promise<void> {
 }
 
 type RuntimeOpenGuard = () => boolean | Promise<boolean>;
+
+interface RuntimeCreateTrace {
+	id: string;
+	startedAt: number;
+	previousStageAt: number;
+}
 type SupervisorGenerationClaim = Omit<Extract<DaemonWorkerCommand, { type: "worker_auth" }>, "id" | "type" | "token">;
 
 interface BoundSupervisorGenerationClaim {
@@ -711,6 +717,33 @@ export class AgentDaemon {
 		appendRotatingLog(getDaemonLogPath(this.socketPath), `[${new Date().toISOString()}] ${message}`);
 	}
 
+	private traceRuntimeCreate(
+		trace: RuntimeCreateTrace,
+		phase: string,
+		details: Record<string, string | number | undefined> = {},
+	): void {
+		const now = Date.now();
+		const elapsedMs = now - trace.startedAt;
+		const sincePreviousMs = now - trace.previousStageAt;
+		trace.previousStageAt = now;
+		const suffix = Object.entries(details)
+			.filter((entry): entry is [string, string | number] => entry[1] !== undefined)
+			.map(([key, value]) => `${key}=${typeof value === "string" ? JSON.stringify(value) : value}`)
+			.join(" ");
+		this.log(
+			`Runtime create trace=${trace.id} phase=${phase} elapsedMs=${elapsedMs} sincePreviousMs=${sincePreviousMs}` +
+				`${suffix ? ` ${suffix}` : ""}`,
+		);
+		recordProcessLifecycle("daemon_runtime_create_stage", {
+			traceId: trace.id,
+			phase,
+			elapsedMs,
+			sincePreviousMs,
+			socketPath: this.socketPath,
+			...details,
+		});
+	}
+
 	// A crash thrown outside a command handler would otherwise vanish with the
 	// detached stdio; capture its stack before the process goes down.
 	private installCrashHandlers(): void {
@@ -879,12 +912,25 @@ export class AgentDaemon {
 
 	private async checkSupervisorFences(): Promise<void> {
 		for (const [client, boundClaim] of this.supervisorClaims) {
+			const startedAt = Date.now();
 			try {
 				boundClaim.ownerFingerprint = await this.assertSupervisorClaimCurrent(
 					boundClaim.claim,
 					boundClaim.ownerFingerprint,
 				);
-			} catch {
+				const elapsedMs = Date.now() - startedAt;
+				if (elapsedMs >= 100) {
+					this.log(
+						`Worker fence phase=supervisor_claim_check_completed elapsedMs=${elapsedMs} ` +
+							`supervisorGeneration=${boundClaim.claim.supervisorGeneration?.slice(0, 8) ?? "unknown"}`,
+					);
+				}
+			} catch (error) {
+				this.log(
+					`Worker fence phase=supervisor_claim_check_failed elapsedMs=${Date.now() - startedAt} ` +
+						`supervisorGeneration=${boundClaim.claim.supervisorGeneration?.slice(0, 8) ?? "unknown"} ` +
+						`error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+				);
 				if (this.revokeSupervisorClaim(client, boundClaim)) client.socket.end();
 			}
 		}
@@ -2129,7 +2175,9 @@ export class AgentDaemon {
 	private async createRuntime(
 		command: Extract<DaemonCommand, { type: "create" }>,
 		runtimeOpenGuard?: RuntimeOpenGuard,
+		runtimeCreateTrace?: RuntimeCreateTrace,
 	): Promise<ActiveSessionState> {
+		if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "resolving_config");
 		const config = this.bindWorkerSessionsDir(
 			command,
 			mergeAgentSessionRuntimeConfig(this.options.defaultSessionConfig, command.config),
@@ -2148,16 +2196,23 @@ export class AgentDaemon {
 		const sessionPath = command.sessionPath
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
+		if (runtimeCreateTrace) {
+			this.traceRuntimeCreate(runtimeCreateTrace, "session_target_resolved", {
+				hasSessionPath: sessionPath ? 1 : 0,
+			});
+		}
 		const sessionKey = sessionPath ? this.sessionPathOperationKey(sessionPath) : undefined;
 		if (sessionKey && this.findPassivationBySessionFile(sessionKey)) {
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "waiting_for_passivation");
 			await this.waitForPassivation(sessionKey);
-			return this.createRuntime(command, runtimeOpenGuard);
+			return this.createRuntime(command, runtimeOpenGuard, runtimeCreateTrace);
 		}
 		if (sessionKey && (await this.waitForSessionPathMutation(sessionKey))) {
-			return this.createRuntime(command, runtimeOpenGuard);
+			return this.createRuntime(command, runtimeOpenGuard, runtimeCreateTrace);
 		}
 		const pending = sessionKey ? this.openingSessions.get(sessionKey) : undefined;
 		if (pending && sessionKey) {
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "joining_open_runtime");
 			// Join the in-process open before attempting the filesystem lease. The
 			// creator owns that lease until its runtime is ready.
 			let state: ActiveSessionState;
@@ -2168,7 +2223,7 @@ export class AgentDaemon {
 					if (this.openingSessions.get(sessionKey) === pending) {
 						this.openingSessions.delete(sessionKey);
 					}
-					return this.createRuntime(command);
+					return this.createRuntime(command, undefined, runtimeCreateTrace);
 				}
 				throw error;
 			}
@@ -2183,6 +2238,7 @@ export class AgentDaemon {
 			return state;
 		}
 
+		if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "checking_passive_session");
 		const passiveSubagent = sessionPath ? await this.findPassiveRlmSubagent(sessionPath) : undefined;
 		if (passiveSubagent) {
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
@@ -2205,6 +2261,7 @@ export class AgentDaemon {
 					ignoreSessionId: passiveSubagent.info.id,
 				});
 			}
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "hydrating_passive_session");
 			const state = await this.hydratePassiveRlmSubagent(passiveSubagent, clientEnv);
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				throw new RuntimeOpenCancelledError();
@@ -2220,18 +2277,19 @@ export class AgentDaemon {
 		// Hydration may have started while the async registry walk above was in
 		// progress. Re-enter so the explicit opener joins its published promise.
 		if (sessionKey && this.openingSessions.has(sessionKey)) {
-			return this.createRuntime(command, runtimeOpenGuard);
+			return this.createRuntime(command, runtimeOpenGuard, runtimeCreateTrace);
 		}
 
 		let releaseOpenReservation = () => {};
 		if (sessionKey) {
 			if (await this.waitForSessionPathMutation(sessionKey)) {
-				return this.createRuntime(command, runtimeOpenGuard);
+				return this.createRuntime(command, runtimeOpenGuard, runtimeCreateTrace);
 			}
 			const reservation = this.reservingSessionOpens.get(sessionKey);
 			if (reservation) {
+				if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "waiting_for_open_reservation");
 				await reservation;
-				return this.createRuntime(command, runtimeOpenGuard);
+				return this.createRuntime(command, runtimeOpenGuard, runtimeCreateTrace);
 			}
 			let release!: () => void;
 			const reserved = new Promise<void>((resolveReservation) => {
@@ -2266,6 +2324,7 @@ export class AgentDaemon {
 
 		let sessionLease: SessionLease | undefined;
 		let sessionManager: SessionManager;
+		if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "opening_session_manager");
 		try {
 			sessionLease = acquireSessionLease(sessionPath, agentDir);
 			sessionManager = sessionPath
@@ -2279,6 +2338,11 @@ export class AgentDaemon {
 			sessionLease?.release();
 			releaseOpenReservation();
 			throw error;
+		}
+		if (runtimeCreateTrace) {
+			this.traceRuntimeCreate(runtimeCreateTrace, "session_manager_ready", {
+				hasSessionFile: sessionManager.getSessionFile() ? 1 : 0,
+			});
 		}
 		const createState = async (): Promise<ActiveSessionState> => {
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
@@ -2306,6 +2370,7 @@ export class AgentDaemon {
 			// Extensions capture client env (e.g. herdr pane identity) synchronously
 			// while the runtime loads them, so it must be in process.env for the
 			// duration; withClientEnv restores it after.
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "creating_agent_runtime");
 			const runtime = await withClientEnv(clientEnv, () =>
 				createAgentSessionRuntime(this.options.createRuntime, {
 					cwd: sessionManager.getCwd(),
@@ -2346,10 +2411,12 @@ export class AgentDaemon {
 					},
 				}),
 			);
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "agent_runtime_created");
 			if (runtimeOpenGuard && !(await runtimeOpenGuard())) {
 				await runtime.dispose().catch(() => undefined);
 				throw new RuntimeOpenCancelledError();
 			}
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "registering_runtime");
 			const state = await this.addRuntime(
 				runtime,
 				command.name,
@@ -2359,6 +2426,7 @@ export class AgentDaemon {
 				},
 				runtimeOpenGuard,
 			);
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "runtime_registered");
 			return state;
 		};
 
@@ -2371,17 +2439,18 @@ export class AgentDaemon {
 		if (await this.waitForSessionPathMutation(openedSessionKey)) {
 			sessionLease?.release();
 			releaseOpenReservation();
-			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard);
+			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard, runtimeCreateTrace);
 		}
 		if (this.openingSessions.has(openedSessionKey)) {
 			sessionLease?.release();
 			releaseOpenReservation();
-			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard);
+			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard, runtimeCreateTrace);
 		}
 		const opening = Promise.resolve().then(createState);
 		this.openingSessions.set(openedSessionKey, opening);
 		releaseOpenReservation();
 		try {
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "waiting_for_runtime_registration");
 			return await opening;
 		} finally {
 			releaseOpenReservation();
@@ -3974,6 +4043,7 @@ export class AgentDaemon {
 
 	private async handleLine(client: DaemonSocketClient, line: string): Promise<void> {
 		let command: DaemonCommand;
+		let runtimeCreateTrace: RuntimeCreateTrace | undefined;
 		let clearParsedAdmission = () => {};
 		let promptHandlerOwnsAdmission = false;
 		try {
@@ -3995,6 +4065,17 @@ export class AgentDaemon {
 				supportsExtensionUi?: unknown;
 				job?: unknown;
 			};
+			if (this.options.worker && parsed.type === "create") {
+				const receivedAt = Date.now();
+				runtimeCreateTrace = {
+					id: typeof parsed.id === "string" ? parsed.id : randomUUID().slice(0, 8),
+					startedAt: receivedAt,
+					previousStageAt: receivedAt,
+				};
+				this.traceRuntimeCreate(runtimeCreateTrace, "wire_received", {
+					clientAuthenticated: client.authenticated === true ? 1 : 0,
+				});
+			}
 			const parsedAdmission =
 				(parsed.type === "prompt" || parsed.type === "prompt_and_wait") &&
 				typeof parsed.activeSessionId === "string" &&
@@ -4094,9 +4175,22 @@ export class AgentDaemon {
 					supervisorSocketPath: parsed.supervisorSocketPath,
 				};
 				let ownerFingerprint: string;
+				const authClaimStartedAt = Date.now();
+				this.log(
+					`Worker auth trace=${commandId ?? "none"} phase=supervisor_claim_check_started ` +
+						`supervisorGeneration=${claim.supervisorGeneration?.slice(0, 8) ?? "unknown"} supervisorPid=${claim.supervisorPid}`,
+				);
 				try {
 					ownerFingerprint = await this.assertSupervisorClaimCurrent(claim);
-				} catch {
+					this.log(
+						`Worker auth trace=${commandId ?? "none"} phase=supervisor_claim_check_completed ` +
+							`elapsedMs=${Date.now() - authClaimStartedAt}`,
+					);
+				} catch (error) {
+					this.log(
+						`Worker auth trace=${commandId ?? "none"} phase=supervisor_claim_check_failed ` +
+							`elapsedMs=${Date.now() - authClaimStartedAt} error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+					);
 					const authenticationError = claim.supervisorAuthorityProcessStartId
 						? "supervisor_generation_stale"
 						: "worker_auth_version_incompatible";
@@ -4170,18 +4264,47 @@ export class AgentDaemon {
 					client.socket.end();
 					return;
 				}
+				if (runtimeCreateTrace) {
+					this.traceRuntimeCreate(runtimeCreateTrace, "supervisor_claim_check_started", {
+						supervisorGeneration: boundClaim.claim.supervisorGeneration?.slice(0, 8) ?? "unknown",
+						supervisorPid: boundClaim.claim.supervisorPid,
+					});
+				}
+				const commandClaimStartedAt = Date.now();
 				const claimCheck = this.assertSupervisorClaimCurrent(boundClaim.claim, boundClaim.ownerFingerprint);
 				// Observe the already-running fence check even if admission cancellation
 				// wins the command wait below.
 				void claimCheck.catch(() => {});
 				try {
 					const ownerFingerprint = await waitForPromptAdmission(claimCheck, parsedAdmission?.controller?.signal);
+					const commandClaimElapsedMs = Date.now() - commandClaimStartedAt;
+					if (commandClaimElapsedMs >= 100) {
+						this.log(
+							`Worker command admission type=${typeof parsed.type === "string" ? parsed.type : "unknown"} ` +
+								`id=${typeof parsed.id === "string" ? parsed.id : "none"} phase=supervisor_claim_check_completed ` +
+								`elapsedMs=${commandClaimElapsedMs}`,
+						);
+					}
+					if (runtimeCreateTrace) {
+						this.traceRuntimeCreate(runtimeCreateTrace, "supervisor_claim_check_completed");
+					}
 					if (this.supervisorClaims.get(client) !== boundClaim || client.socket.destroyed) {
 						clearParsedAdmission();
 						return;
 					}
 					boundClaim.ownerFingerprint = ownerFingerprint;
 				} catch (error) {
+					this.log(
+						`Worker command admission type=${typeof parsed.type === "string" ? parsed.type : "unknown"} ` +
+							`id=${typeof parsed.id === "string" ? parsed.id : "none"} phase=supervisor_claim_check_failed ` +
+							`elapsedMs=${Date.now() - commandClaimStartedAt} ` +
+							`error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`,
+					);
+					if (runtimeCreateTrace) {
+						this.traceRuntimeCreate(runtimeCreateTrace, "supervisor_claim_check_failed", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
 					const admissionCancelled = error instanceof PromptAdmissionCancelledError;
 					if (admissionCancelled) {
 						// The fence check remains authoritative after cancellation. Its rejection
@@ -4237,6 +4360,7 @@ export class AgentDaemon {
 				return;
 			}
 			command = parsed as DaemonCommand;
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "command_validated");
 		} catch (error) {
 			this.write(client, failure(salvageDaemonCommandId(line), "parse", error, serializeDaemonError(error)));
 			return;
@@ -4259,13 +4383,20 @@ export class AgentDaemon {
 		if (mutation) this.mutationDrain.begin();
 		let releaseWorkAdmission = () => {};
 		try {
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "work_admission_started");
 			releaseWorkAdmission = this.beginDaemonWorkAdmission(
 				command.type,
 				this.daemonCommandWorkAdmissionSelectors(command),
 			);
-			const response = await this.handleCommand(client, command, () => {
-				promptHandlerOwnsAdmission = true;
-			});
+			if (runtimeCreateTrace) this.traceRuntimeCreate(runtimeCreateTrace, "handler_dispatch_started");
+			const response = await this.handleCommand(
+				client,
+				command,
+				() => {
+					promptHandlerOwnsAdmission = true;
+				},
+				runtimeCreateTrace,
+			);
 			if (response) {
 				this.write(client, response);
 			}
@@ -4444,6 +4575,7 @@ export class AgentDaemon {
 		client: DaemonSocketClient,
 		command: DaemonCommand,
 		onPromptHandlerOwnsAdmission: () => void = () => {},
+		runtimeCreateTrace?: RuntimeCreateTrace,
 	): Promise<DaemonResponse | undefined> {
 		if ("agentMessageId" in command && command.agentMessageId === "") {
 			throw new Error("agentMessageId must not be empty");
@@ -4546,8 +4678,28 @@ export class AgentDaemon {
 			}
 
 			case "create": {
-				const state = await this.createRuntime(command);
-				return success(command.id, "create", summaryForActiveSession(state));
+				const startedAt = Date.now();
+				const trace = runtimeCreateTrace ?? {
+					id: command.id ?? randomUUID().slice(0, 8),
+					startedAt,
+					previousStageAt: startedAt,
+				};
+				this.traceRuntimeCreate(trace, "accepted", {
+					mode: command.sessionPath ? "resume" : command.continueRecent ? "continue" : "new",
+				});
+				try {
+					const state = await this.createRuntime(command, undefined, trace);
+					this.traceRuntimeCreate(trace, "ready", {
+						activeSessionId: state.activeSessionId,
+						sessionId: state.runtime.session.sessionId,
+					});
+					return success(command.id, "create", summaryForActiveSession(state));
+				} catch (error) {
+					this.traceRuntimeCreate(trace, "failed", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					throw error;
+				}
 			}
 
 			case "attach": {

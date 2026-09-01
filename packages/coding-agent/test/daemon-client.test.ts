@@ -1,5 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DaemonClient, getDaemonSocketCloseReason } from "../src/modes/daemon/daemon-client.js";
+import {
+	DAEMON_CREATE_REQUEST_TIMEOUT_MS,
+	DaemonClient,
+	getDaemonSocketCloseReason,
+} from "../src/modes/daemon/daemon-client.js";
 import {
 	DAEMON_COMMAND_COMPATIBILITY,
 	DAEMON_PROTOCOL_VERSION,
@@ -496,6 +500,37 @@ describe("DaemonClient", () => {
 			protocol: { version: DAEMON_PROTOCOL_VERSION },
 			command: { type: "ack_result", commandId: request.id },
 		});
+		client.close();
+	});
+
+	it("keeps a cold create request alive for two minutes and identifies a real timeout", async () => {
+		vi.useFakeTimers();
+		const client = new DaemonClient("/tmp/prime-agent.sock");
+		const connect = client.connect();
+		const socket = netMock.sockets[0]!;
+		socket.emit("connect");
+		await connect;
+		emitHello(socket);
+
+		const response = client.request({ type: "create" });
+		let settled = false;
+		const rejection = response.then(
+			() => new Error("create unexpectedly succeeded"),
+			(error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+		);
+		void rejection.then(() => {
+			settled = true;
+		});
+
+		await vi.advanceTimersByTimeAsync(30_000);
+		expect(settled).toBe(false);
+		await vi.advanceTimersByTimeAsync(DAEMON_CREATE_REQUEST_TIMEOUT_MS - 30_000);
+		const error = await rejection;
+		expect(error.message).toContain(`Timed out after ${DAEMON_CREATE_REQUEST_TIMEOUT_MS}ms`);
+		expect(error.message).toContain('response to "create"');
+		expect(error.message).toContain("request daemon_1");
+		expect(error.message).toContain("The daemon may still complete this request");
+
 		client.close();
 	});
 

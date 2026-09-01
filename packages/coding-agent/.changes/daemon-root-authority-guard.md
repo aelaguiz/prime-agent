@@ -1,0 +1,3 @@
+- Fixed daemon startup loops when worker recovery fills in root session identity.
+- Added correlated daemon/worker startup phase traces and allowed cold supervisor and session creation to run for up to two minutes.
+- Added permanent slow-path timings for Darwin process-identity probes, supervisor-registry lock contention, worker authentication and command admission, descriptor publication, startup-gate commit, runtime creation, and worker exits.

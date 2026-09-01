@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, resolve, win32 } from "node:path";
 import { type AuthorityMutationGuard, acquireAuthorityMutationGuard } from "./authority-mutation-guard.js";
+import { recordProcessLifecycle } from "./process-lifecycle.js";
 
 export { AuthorityGuardCompromisedError } from "./authority-mutation-guard.js";
 
@@ -416,13 +417,36 @@ function boundedProcessQuery(
 	args: string[],
 	options: ProcessQueryOptions,
 ): string {
-	const output = query(command, args, options);
-	if (Buffer.byteLength(output) > PROCESS_IDENTITY_PROBE_MAX_BUFFER) {
-		throw new ProcessIdentityOutputTooLargeError(
-			`Process identity query exceeds ${PROCESS_IDENTITY_PROBE_MAX_BUFFER} bytes`,
-		);
+	const startedAt = Date.now();
+	let outcome = "success";
+	try {
+		const output = query(command, args, options);
+		if (Buffer.byteLength(output) > PROCESS_IDENTITY_PROBE_MAX_BUFFER) {
+			outcome = "output_too_large";
+			throw new ProcessIdentityOutputTooLargeError(
+				`Process identity query exceeds ${PROCESS_IDENTITY_PROBE_MAX_BUFFER} bytes`,
+			);
+		}
+		return output;
+	} catch (error) {
+		if (outcome === "success") outcome = "error";
+		throw error;
+	} finally {
+		const elapsedMs = Date.now() - startedAt;
+		if (elapsedMs >= 100) {
+			const pidFlagIndex = args.indexOf("-p");
+			const targetPid = pidFlagIndex >= 0 ? Number(args[pidFlagIndex + 1]) : undefined;
+			recordProcessLifecycle("process_identity_query_timing", {
+				platform: process.platform,
+				executable: basename(command),
+				probe: args.includes("command=") ? "command" : args.includes("lstart=") ? "start_time" : "other",
+				...(Number.isInteger(targetPid) ? { targetPid } : {}),
+				elapsedMs,
+				timeoutMs: options.timeout,
+				outcome,
+			});
+		}
 	}
-	return output;
 }
 
 function defaultProcessKillProbe(pid: number, signal: 0): void {

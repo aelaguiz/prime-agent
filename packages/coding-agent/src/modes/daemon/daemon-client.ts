@@ -47,6 +47,7 @@ interface PendingDaemonRequest {
 	resolve: (response: DaemonResponse) => void;
 	reject: (error: Error) => void;
 	timeout?: ReturnType<typeof setTimeout>;
+	startedAt: number;
 	timeoutMs: number;
 	commandType: string;
 	onProgress?: DaemonClientProgressListener;
@@ -131,6 +132,13 @@ const DEFAULT_RECONNECT_TIMEOUT_MS = 60_000;
 const RECONNECT_CONNECT_TIMEOUT_MS = 1000;
 const RECONNECT_HELLO_TIMEOUT_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 2000;
+const DEFAULT_DAEMON_REQUEST_TIMEOUT_MS = 30_000;
+/** Cold worker startup includes provider discovery and root-session hydration. */
+export const DAEMON_CREATE_REQUEST_TIMEOUT_MS = 120_000;
+
+function defaultDaemonRequestTimeoutMs(command: DaemonCommandBody): number {
+	return command.type === "create" ? DAEMON_CREATE_REQUEST_TIMEOUT_MS : DEFAULT_DAEMON_REQUEST_TIMEOUT_MS;
+}
 
 export class DaemonClient {
 	private socket?: Socket;
@@ -320,7 +328,7 @@ export class DaemonClient {
 
 	async request(
 		command: DaemonCommandBody,
-		timeoutMs = 30000,
+		timeoutMs = defaultDaemonRequestTimeoutMs(command),
 		options: DaemonClientRequestOptions = {},
 	): Promise<DaemonResponse> {
 		if (!this.socket || this.socket.destroyed) {
@@ -389,6 +397,7 @@ export class DaemonClient {
 			const pending: PendingDaemonRequest = {
 				resolve,
 				reject,
+				startedAt: Date.now(),
 				timeoutMs,
 				commandType: command.type,
 				onProgress: options.onProgress,
@@ -407,9 +416,13 @@ export class DaemonClient {
 	private armPendingRequestTimeout(id: string, pending: PendingDaemonRequest): void {
 		pending.timeout = setTimeout(() => {
 			this.pendingRequests.delete(id);
+			const elapsedMs = Date.now() - pending.startedAt;
 			pending.reject(
 				new Error(
-					`Timed out after ${pending.timeoutMs}ms waiting for the Prime Agent daemon response to "${pending.commandType}". ${daemonEndpointDetails(this.socketPath)}`,
+					`Timed out after ${pending.timeoutMs}ms waiting for the Prime Agent daemon response to "${pending.commandType}" ` +
+						`(elapsedMs=${elapsedMs}, client ${this.protocolClientId}, request ${id}). ` +
+						`The daemon may still complete this request. ` +
+						daemonEndpointDetails(this.socketPath),
 				),
 			);
 		}, pending.timeoutMs);

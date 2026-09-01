@@ -569,6 +569,7 @@ describe("daemon worker supervisor monitoring", () => {
 			supervisorClaims: new Map([[client, oldClaim]]),
 			updateRestart: transaction,
 			shuttingDown: false,
+			log: vi.fn(),
 			scheduleSupervisorFenceCheck: vi.fn(),
 			assertSupervisorClaimCurrent: vi.fn(async () => {
 				assertionReached.resolve();

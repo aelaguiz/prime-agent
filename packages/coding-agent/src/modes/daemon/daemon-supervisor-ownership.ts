@@ -9,6 +9,7 @@ import {
 	acquireAuthorityMutationGuard,
 	type HeldAuthorityMutationGuard,
 } from "../../core/authority-mutation-guard.js";
+import { recordProcessLifecycle } from "../../core/process-lifecycle.js";
 import {
 	classifyProcessIdentityAuthority,
 	getLegacyProcessStartId,
@@ -639,10 +640,17 @@ export async function withRegistryGuards<T>(
 	...invalidAsyncAction: T extends PromiseLike<unknown> ? [never] : []
 ): Promise<T> {
 	void invalidAsyncAction;
+	const startedAt = Date.now();
 	const directories = canonicalRegistryDirs(registryDirs);
 	if (directories.length === 0) throw new Error("At least one registry guard is required");
+	const identityStartedAt = Date.now();
 	const identity = currentProcessIdentityFields();
+	const identityMs = Date.now() - identityStartedAt;
 	const held: HeldAuthorityMutationGuard[] = [];
+	const acquireMs: number[] = [];
+	const contentionRetries: number[] = [];
+	let actionMs = 0;
+	let releaseMs = 0;
 	let active = true;
 	const guard: RegistryMutationGuard = {
 		assertCurrent(): void {
@@ -654,6 +662,8 @@ export async function withRegistryGuards<T>(
 	let failure: unknown;
 	try {
 		for (const registryDir of directories) {
+			const acquireStartedAt = Date.now();
+			let retries = 0;
 			let current: HeldAuthorityMutationGuard | undefined;
 			for (let attempt = 0; attempt <= REGISTRY_LOCK_RETRIES; attempt++) {
 				try {
@@ -672,20 +682,26 @@ export async function withRegistryGuards<T>(
 					break;
 				} catch (error) {
 					if (!(error instanceof AuthorityGuardContentionError) || attempt === REGISTRY_LOCK_RETRIES) throw error;
+					retries++;
 					await delay(REGISTRY_LOCK_RETRY_MS);
 				}
 			}
+			acquireMs.push(Date.now() - acquireStartedAt);
+			contentionRetries.push(retries);
 			if (!current) throw new Error(`Could not coordinate daemon supervisor registry: ${registryDir}`);
 			held.push(current);
 			guard.assertCurrent();
 		}
+		const actionStartedAt = Date.now();
 		result = action(guard);
+		actionMs = Date.now() - actionStartedAt;
 		if (isPromiseLike(result)) throw new Error("Registry guard actions must be synchronous");
 		guard.assertCurrent();
 	} catch (error) {
 		failure = error;
 	} finally {
 		active = false;
+		const releaseStartedAt = Date.now();
 		for (const current of held.reverse()) {
 			try {
 				current.release();
@@ -693,6 +709,21 @@ export async function withRegistryGuards<T>(
 				failure ??= error;
 			}
 		}
+		releaseMs = Date.now() - releaseStartedAt;
+	}
+	const elapsedMs = Date.now() - startedAt;
+	if (elapsedMs >= 100 || contentionRetries.some((count) => count > 0)) {
+		recordProcessLifecycle("daemon_registry_guard_timing", {
+			elapsedMs,
+			identityMs,
+			directoryCount: directories.length,
+			acquireMs,
+			contentionRetries,
+			actionMs,
+			releaseMs,
+			outcome: failure ? "failed" : "success",
+			...(failure instanceof Error ? { errorName: failure.name } : {}),
+		});
 	}
 	if (failure) throw failure;
 	return result as T;

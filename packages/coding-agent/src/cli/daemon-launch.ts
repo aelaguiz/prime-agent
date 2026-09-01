@@ -6,6 +6,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
@@ -38,7 +39,7 @@ import {
 import { isHelpCommandRequest, PUBLIC_COMMAND_NAMES, REMOVED_COMMAND_NAMES } from "./command-registry.js";
 import { createCliSubprocessEnv, createCliSubprocessLaunchSpec, formatCurrentCliCommand } from "./subprocess-launch.js";
 
-const DAEMON_STARTUP_TIMEOUT_MS = 30_000;
+const DAEMON_STARTUP_TIMEOUT_MS = 120_000;
 const DAEMON_STARTUP_EXIT_GRACE_MS = 2_000;
 const DAEMON_STARTUP_LOG_TAIL_BYTES = 4 * 1024;
 
@@ -59,6 +60,25 @@ function delay(ms: number): Promise<void> {
 // client-errors log so replacements are attributable after the fact.
 function logDaemonLaunch(message: string): void {
 	appendRotatingLog(getClientErrorLogPath(), `[${new Date().toISOString()}] daemon-launch: ${message}`);
+}
+
+interface DaemonStartupTrace {
+	id: string;
+	startedAt: number;
+	logOffset: number;
+}
+
+function startupTraceDetails(
+	trace: DaemonStartupTrace,
+	phase: string,
+	lastProbe: DaemonVersionProbe["status"],
+	leaseWaitStartedAt?: number,
+): string {
+	const elapsedMs = Date.now() - trace.startedAt;
+	const lease = leaseWaitStartedAt
+		? `launchLease=contended:${Date.now() - leaseWaitStartedAt}ms`
+		: "launchLease=acquired-or-not-needed";
+	return `trace=${trace.id} phase=${phase} elapsedMs=${elapsedMs} clientPid=${process.pid} lastProbe=${lastProbe} ${lease}`;
 }
 
 async function canConnectToDaemon(socketPath: string, timeoutMs: number): Promise<boolean> {
@@ -120,7 +140,6 @@ export async function probeDaemonVersion(socketPath: string, helloTimeoutMs = 20
 		return { status: "current", hello };
 	} catch {
 		// The supervisor accepts connections before startup and worker adoption finish.
-		logDaemonLaunch(`running daemon on ${socketPath} sent no recognizable hello; waiting for startup`);
 		return { status: "unresponsive" };
 	} finally {
 		client.close();
@@ -387,24 +406,30 @@ async function ensureDaemonRunningAsLeader(
 	socketPath: string,
 	spawnCwd: string | undefined,
 	deadline: number,
+	trace: DaemonStartupTrace,
 ): Promise<void> {
 	let probe = await probeDaemonVersion(socketPath);
+	logDaemonLaunch(startupTraceDetails(trace, "leader_probe", probe.status));
 	if (probe.status === "unresponsive") {
 		const remainingStartupMs = Math.max(1, deadline - Date.now());
+		logDaemonLaunch(
+			`${startupTraceDetails(trace, "waiting_for_daemon_hello", probe.status)} remainingMs=${remainingStartupMs}`,
+		);
 		probe = await probeDaemonVersion(socketPath, remainingStartupMs);
 	}
 	if (probe.status === "current") {
+		logDaemonLaunch(
+			`${startupTraceDetails(trace, "ready", probe.status)} daemonPid=${probe.hello.supervisorPid ?? "unknown"} ` +
+				`generation=${probe.hello.supervisorGeneration ?? "unknown"} build=${probe.hello.runtime?.buildId ?? "unknown"}`,
+		);
 		return;
 	}
 	if (probe.status === "unresponsive") {
 		throw new Error(
 			`Prime Agent daemon on ${socketPath} accepted connections but did not finish startup within ${DAEMON_STARTUP_TIMEOUT_MS / 1000} seconds. ` +
-				`It was left running to avoid interrupting active work.
-
-Run:
-${formatCurrentCliCommand(["shutdown", "--force"])}
-
-Then retry the original command.`,
+				`It was left running to avoid interrupting active work. ` +
+				startupTraceDetails(trace, "hello_timeout", probe.status) +
+				readDaemonLogTail(socketPath, trace.logOffset),
 		);
 	}
 	if (probe.status === "stale") {
@@ -444,6 +469,14 @@ Then retry the original command.`,
 		trigger,
 		socketPath,
 	});
+	logDaemonLaunch(
+		`${startupTraceDetails(trace, "spawning_supervisor", probe.status)} command=${formatCurrentCliCommand([
+			"--mode",
+			"daemon",
+			"--daemon-socket",
+			socketPath,
+		])} executable=${JSON.stringify(launch.command)} args=${JSON.stringify(launch.args)}`,
+	);
 	let child: ReturnType<typeof spawn>;
 	try {
 		child = spawn(launch.command, launch.args, {
@@ -542,6 +575,10 @@ Then retry the original command.`,
 				trigger,
 				socketPath,
 			});
+			logDaemonLaunch(
+				`${startupTraceDetails(trace, "ready", started.status)} daemonPid=${started.hello.supervisorPid ?? "unknown"} ` +
+					`generation=${started.hello.supervisorGeneration ?? "unknown"} build=${started.hello.runtime?.buildId ?? "unknown"}`,
+			);
 			return;
 		}
 		if (childFailure) exitDeadline ??= Date.now() + DAEMON_STARTUP_EXIT_GRACE_MS;
@@ -557,36 +594,85 @@ Then retry the original command.`,
 		socketPath,
 	});
 	throw new Error(
-		`Timed out waiting for daemon to start on ${socketPath}.${readDaemonLogTail(socketPath, logOffset)}`,
+		`Timed out waiting for daemon to start on ${socketPath}. ` +
+			startupTraceDetails(trace, "spawn_timeout", "absent") +
+			readDaemonLogTail(socketPath, logOffset),
 	);
 }
 
 async function ensureDaemonRunning(socketPath: string, spawnCwd?: string): Promise<void> {
-	const deadline = Date.now() + DAEMON_STARTUP_TIMEOUT_MS;
+	const startedAt = Date.now();
+	const trace: DaemonStartupTrace = {
+		id: randomUUID().slice(0, 8),
+		startedAt,
+		logOffset: currentDaemonLogSize(socketPath),
+	};
+	const deadline = startedAt + DAEMON_STARTUP_TIMEOUT_MS;
 	let lastProbe = await probeDaemonVersion(socketPath);
-	if (lastProbe.status === "current") return;
+	const clientRuntime = getDaemonRuntimeIdentity();
+	logDaemonLaunch(
+		`${startupTraceDetails(trace, "initial_probe", lastProbe.status)} clientVersion=${VERSION} ` +
+			`clientBuild=${clientRuntime.buildId} ` +
+			`clientExecutable=${JSON.stringify(clientRuntime.launcherPath ?? clientRuntime.entrypointPath ?? clientRuntime.executablePath)}`,
+	);
+	if (lastProbe.status === "current") {
+		logDaemonLaunch(
+			`${startupTraceDetails(trace, "ready", lastProbe.status)} daemonPid=${lastProbe.hello.supervisorPid ?? "unknown"} ` +
+				`generation=${lastProbe.hello.supervisorGeneration ?? "unknown"} build=${lastProbe.hello.runtime?.buildId ?? "unknown"}`,
+		);
+		return;
+	}
+	let leaseWaitStartedAt: number | undefined;
+	let lastLoggedProbeStatus: DaemonVersionProbe["status"] = lastProbe.status;
 
 	while (Date.now() < deadline) {
 		const lease = tryAcquireDaemonLaunchLease(socketPath);
 		if (lease) {
 			try {
-				return await ensureDaemonRunningAsLeader(socketPath, spawnCwd, deadline);
+				logDaemonLaunch(
+					`${startupTraceDetails(trace, "launch_lease_acquired", lastProbe.status, leaseWaitStartedAt)}`,
+				);
+				return await ensureDaemonRunningAsLeader(socketPath, spawnCwd, deadline, trace);
 			} finally {
 				lease.release();
 			}
 		}
+		if (leaseWaitStartedAt === undefined) {
+			leaseWaitStartedAt = Date.now();
+			logDaemonLaunch(startupTraceDetails(trace, "waiting_for_launch_lease", lastProbe.status, leaseWaitStartedAt));
+		}
 		await delay(250);
 		lastProbe = await probeDaemonVersion(socketPath);
-		if (lastProbe.status === "current") return;
+		if (lastProbe.status !== lastLoggedProbeStatus) {
+			lastLoggedProbeStatus = lastProbe.status;
+			logDaemonLaunch(startupTraceDetails(trace, "probe_transition", lastProbe.status, leaseWaitStartedAt));
+		}
+		if (lastProbe.status === "current") {
+			logDaemonLaunch(
+				`${startupTraceDetails(trace, "ready", lastProbe.status, leaseWaitStartedAt)} ` +
+					`daemonPid=${lastProbe.hello.supervisorPid ?? "unknown"} ` +
+					`generation=${lastProbe.hello.supervisorGeneration ?? "unknown"} ` +
+					`build=${lastProbe.hello.runtime?.buildId ?? "unknown"}`,
+			);
+			return;
+		}
 	}
 
 	if (lastProbe.status === "unresponsive") {
-		throw new Error(`Timed out waiting for the running Prime Agent daemon on ${socketPath} to finish startup.`);
+		throw new Error(
+			`Timed out waiting for the running Prime Agent daemon on ${socketPath} to finish startup. ` +
+				startupTraceDetails(trace, "follower_hello_timeout", lastProbe.status, leaseWaitStartedAt) +
+				readDaemonLogTail(socketPath, trace.logOffset),
+		);
 	}
 	if (lastProbe.status === "stale") {
 		throw new StaleDaemonError(socketPath, lastProbe.hello);
 	}
-	throw new Error(`Timed out waiting for the elected Prime Agent daemon launcher on ${socketPath}.`);
+	throw new Error(
+		`Timed out waiting for the elected Prime Agent daemon launcher on ${socketPath}. ` +
+			startupTraceDetails(trace, "launch_lease_timeout", lastProbe.status, leaseWaitStartedAt) +
+			readDaemonLogTail(socketPath, trace.logOffset),
+	);
 }
 
 function currentDaemonLogSize(socketPath: string): number {
@@ -612,7 +698,7 @@ function readDaemonLogTail(socketPath: string, offset: number): string {
 	} catch {
 		// Missing log means the daemon crashed before logging was set up.
 	}
-	return tail ? ` Recent daemon log (${logPath}):\n${tail}` : ` The daemon wrote nothing to its log (${logPath}).`;
+	return tail ? ` Recent daemon log (${logPath}):\n${tail}` : ` The daemon wrote nothing new to its log (${logPath}).`;
 }
 
 const ensurePromises = new Map<string, Promise<void>>();

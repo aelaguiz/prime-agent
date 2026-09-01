@@ -590,6 +590,56 @@ function rosterDelta(entries: WorkerRosterEntry[], removedAgentIds?: string[], s
 }
 
 describe("supervisor roster ledger", () => {
+	it("reconciles roster-discovered root authority through a guarded refresh", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "prime-roster-root-authority-"));
+		tempDirs.push(directory);
+		const sessionDir = join(directory, "sessions");
+		const sessionFile = join(sessionDir, "root.jsonl");
+		const worker = makeWorker("worker-1");
+		Object.assign(worker, { descriptorPath: join(directory, "worker-1.json") });
+		Object.assign(worker.descriptor, {
+			createCommand: { type: "create" },
+			sessionDir,
+		});
+		const root = summary({
+			id: worker.descriptor.rootActiveSessionId,
+			sessionId: "root-session",
+			activeSessionId: worker.descriptor.rootActiveSessionId,
+			sessionFile,
+		});
+		worker.client = {
+			request: vi.fn(async () => ({
+				type: "response",
+				command: "list",
+				success: true,
+				data: { sessions: [root] },
+			})),
+		};
+		const guardedPersists: boolean[] = [];
+		const persistWorker = vi.fn((_worker: WorkerFixture, guard?: { assertCurrent(): void }) => {
+			guard?.assertCurrent();
+			guardedPersists.push(guard !== undefined);
+			if (!guard) throw new Error("root authority was persisted without its mutation guard");
+		});
+		const supervisor = makeSupervisor([worker], {
+			refreshWorkerSummaries: DaemonSupervisor.prototype["refreshWorkerSummaries" as never],
+			streamReconstructor: { seed: vi.fn(), clear: vi.fn() },
+			assertRecoveryAllowed: vi.fn(async () => {}),
+			persistWorker,
+		});
+
+		expect(() =>
+			supervisor.consumeWorkerRosterDelta(worker, rosterDelta([workerRosterEntryFromSummary(root)])),
+		).not.toThrow();
+		await vi.waitFor(() => {
+			expect(worker.descriptor).toMatchObject({
+				rootSessionId: "root-session",
+				sessionFile,
+			});
+			expect(guardedPersists).toEqual([true]);
+		});
+	});
+
 	it("serves list from the ledger with zero worker round-trips and exact busy counts", async () => {
 		const visible = makeWorker("visible");
 		const owned = makeWorker("owned", {
