@@ -16,6 +16,7 @@ import { confirmDaemonSessionLoss, type DaemonSessionLossCopy, pluralizeSessions
 import {
 	acquireDaemonUpdateRestartCoordinator,
 	buildDaemonUpdateRestartReport,
+	createDaemonUpdateRestartProcessIdentity,
 	DAEMON_UPDATE_RESTART_COORDINATOR_FLAG,
 	DAEMON_UPDATE_RESTART_ORIGIN_FLAG,
 	DAEMON_UPDATE_RESTART_STATUS_FLAG,
@@ -47,6 +48,7 @@ import { SESSION_ACTION_RECOVERY_FORMAT_VERSION } from "./core/agent-session.js"
 import type { AgentSessionRuntimeMetadata } from "./core/agent-session-runtime.js";
 import { type CustomMessage, isSessionSlashCommand } from "./core/messages.js";
 import { DefaultPackageManager } from "./core/package-manager.js";
+import { matchesExactProcessIdentity } from "./core/session-lease.js";
 import { SettingsManager } from "./core/settings-manager.js";
 import { DaemonClient, type DaemonHello } from "./modes/daemon/daemon-client.js";
 import {
@@ -56,6 +58,7 @@ import {
 	type DaemonUpdateRestartManifest,
 	type DaemonUpdateRestartSession,
 	isUnknownDaemonCommandError,
+	parseDaemonSupervisorHelloIdentity,
 } from "./modes/daemon/daemon-protocol.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "./modes/daemon/daemon-socket.js";
 import {
@@ -268,7 +271,7 @@ function parsePackageCommand(args: string[]): PackageCommandOptions | undefined 
 				conflictingOptions = conflictingOptions ?? "--daemon-socket can only be provided once";
 				index++;
 			} else {
-				daemonSocketPath = normalizeSocketPath(value);
+				daemonSocketPath = resolveUpdateDaemonSocketPath(value);
 				index++;
 			}
 			continue;
@@ -391,10 +394,11 @@ function updateTargetIncludesExtensions(target: UpdateTarget): boolean {
 	return target.type === "all" || target.type === "extensions";
 }
 
+/** Preserve the live endpoint's lexical AF_UNIX path; authority consumers canonicalize it. */
 export function resolveUpdateDaemonSocketPath(explicitSocketPath?: string): string {
-	return normalizeSocketPath(
-		explicitSocketPath ?? process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] ?? defaultDaemonSocketPath(),
-	);
+	const requestedSocketPath =
+		explicitSocketPath ?? process.env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV] ?? defaultDaemonSocketPath();
+	return process.platform === "win32" ? normalizeSocketPath(requestedSocketPath) : resolve(requestedSocketPath);
 }
 
 function reportDaemonUpdateRestartStatus(status: DaemonUpdateRestartStatus): void {
@@ -828,20 +832,20 @@ interface FixedDaemonSupervisorOwnerIdentity {
 	supervisorGeneration: string;
 	supervisorOwnerToken: string;
 	supervisorPid: number;
-	supervisorProcessStartId: string;
+	supervisorProcessStartId?: string;
+	supervisorAuthorityProcessStartId: string;
 	supervisorSocketPath: string;
 }
 
 function hasFixedDaemonSupervisorOwnerIdentity(value: unknown): value is FixedDaemonSupervisorOwnerIdentity {
-	if (!isRecord(value)) {
-		return false;
-	}
+	if (!isRecord(value)) return false;
+	const identity = parseDaemonSupervisorHelloIdentity(value);
 	return (
+		identity.status === "exact" &&
 		typeof value.supervisorGeneration === "string" &&
 		typeof value.supervisorOwnerToken === "string" &&
 		Number.isInteger(value.supervisorPid) &&
 		(value.supervisorPid as number) > 0 &&
-		typeof value.supervisorProcessStartId === "string" &&
 		typeof value.supervisorSocketPath === "string"
 	);
 }
@@ -1170,12 +1174,23 @@ function processIdentityFromDaemonHello(
 	if (!hello?.supervisorPid || !Number.isInteger(hello.supervisorPid) || hello.supervisorPid <= 0) {
 		return undefined;
 	}
-	return {
-		pid: hello.supervisorPid,
-		...(hello.supervisorProcessStartId ? { processStartId: hello.supervisorProcessStartId } : {}),
+	const parsedIdentity = parseDaemonSupervisorHelloIdentity(hello);
+	if (parsedIdentity.status === "invalid") {
+		throw new Error(`Daemon hello contains an invalid supervisor process identity: ${parsedIdentity.reason}`);
+	}
+	const extra = {
 		...(hello.supervisorGeneration ? { supervisorGeneration: hello.supervisorGeneration } : {}),
 		...(hello.supervisorOwnerToken ? { supervisorOwnerToken: hello.supervisorOwnerToken } : {}),
 	};
+	if (parsedIdentity.status === "exact") {
+		return createDaemonUpdateRestartProcessIdentity(
+			hello.supervisorPid,
+			parsedIdentity.authorityProcessStartId,
+			extra,
+		);
+	}
+	// Legacy-only hello identity is compatibility evidence, never new-reader authority.
+	return { pid: hello.supervisorPid, processStartId: parsedIdentity.legacyProcessStartId, ...extra };
 }
 
 function validateReplacementDaemon(
@@ -1200,8 +1215,13 @@ function validateReplacementDaemon(
 		throw new Error(`Replacement daemon identity does not match ${socketPath}`);
 	}
 	const successor = processIdentityFromDaemonHello(hello);
-	if (!successor?.supervisorGeneration || !successor.supervisorOwnerToken) {
-		throw new Error(`Replacement daemon on ${socketPath} did not provide an identity fence`);
+	if (
+		!successor?.supervisorGeneration ||
+		!successor.supervisorOwnerToken ||
+		!successor.authorityProcessStartId ||
+		!matchesExactProcessIdentity(successor.pid, successor.authorityProcessStartId)
+	) {
+		throw new Error(`Replacement daemon on ${socketPath} did not provide a current exact identity fence`);
 	}
 	if (
 		predecessor &&
@@ -1210,8 +1230,8 @@ function validateReplacementDaemon(
 			(predecessor.supervisorOwnerToken !== undefined &&
 				successor.supervisorOwnerToken === predecessor.supervisorOwnerToken) ||
 			(successor.pid === predecessor.pid &&
-				predecessor.processStartId !== undefined &&
-				successor.processStartId === predecessor.processStartId))
+				predecessor.authorityProcessStartId !== undefined &&
+				successor.authorityProcessStartId === predecessor.authorityProcessStartId))
 	) {
 		throw new Error(`Replacement daemon on ${socketPath} still has the predecessor identity`);
 	}

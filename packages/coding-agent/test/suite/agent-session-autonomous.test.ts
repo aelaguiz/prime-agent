@@ -5,13 +5,34 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	addAutonomousUsage,
+	containedChildArgv,
 	createAutonomousRuntimeState,
 	DEFAULT_AUTONOMOUS_CONTINUATION_PROMPT,
 	nextAutonomousContinuation,
 	shouldAutonomouslyContinue,
 } from "../../src/core/autonomous.js";
 import type { AgentCronJob } from "../../src/core/cron-jobs.js";
+import { createProcessIdentityOwnerToken, observeProcessIdentity } from "../../src/core/session-lease.js";
 import { createHarness, getAssistantTexts, getMessageText, getUserTexts, type Harness } from "./harness.js";
+
+for (const name of Object.keys(process.env)) {
+	if (name.startsWith("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL")) delete process.env[name];
+}
+
+function requireExactProcessIdentity(pid: number): string {
+	const observation = observeProcessIdentity(pid);
+	if (observation.status !== "present-exact") throw new Error(`Process ${pid} exact teardown authority unavailable`);
+	return observation.id;
+}
+
+function signalExactProcess(pid: number, exactId: string, signal: NodeJS.Signals): void {
+	const observation = observeProcessIdentity(pid);
+	if (observation.status === "absent") return;
+	if (observation.status !== "present-exact" || observation.id !== exactId) {
+		throw new Error(`Retained cleanup artifact for pid ${pid}: exact identity mismatch or unavailable`);
+	}
+	process.kill(pid, signal);
+}
 
 function isProcessRunning(pid: number): boolean {
 	try {
@@ -47,6 +68,31 @@ describe("AgentSession autonomous mode", () => {
 	afterEach(() => {
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
+		}
+	});
+
+	it("uses the canonical Windows shell and rejects separate shell arguments", () => {
+		const previousComSpec = process.env.ComSpec;
+		const previousUpperComSpec = process.env.COMSPEC;
+		process.env.ComSpec = String.raw`C:\hostile\cmd.exe`;
+		process.env.COMSPEC = String.raw`C:\also-hostile\cmd.exe`;
+		try {
+			expect(containedChildArgv("echo safe", [], true, "win32")).toEqual([
+				String.raw`C:\Windows\System32\cmd.exe`,
+				"/d",
+				"/s",
+				"/c",
+				"echo safe",
+			]);
+			expect(() => containedChildArgv("echo safe", ["& hostile"], true, "win32")).toThrow(
+				"requires one complete command and no separate arguments",
+			);
+			expect(containedChildArgv("git", ["status", "--short"], false, "win32")).toEqual(["git", "status", "--short"]);
+		} finally {
+			if (previousComSpec === undefined) delete process.env.ComSpec;
+			else process.env.ComSpec = previousComSpec;
+			if (previousUpperComSpec === undefined) delete process.env.COMSPEC;
+			else process.env.COMSPEC = previousUpperComSpec;
 		}
 	});
 
@@ -410,6 +456,21 @@ describe("AgentSession autonomous mode", () => {
 		}
 	});
 
+	it("keeps both autonomous gate output streams diagnostic", async () => {
+		const gate = `${process.execPath} -e "process.stdout.write('gate-out'); process.stderr.write('gate-error'); process.exit(9)"`;
+		const state = createAutonomousRuntimeState({
+			enabled: true,
+			maxContinuations: 1,
+			gates: { commands: [gate], maxRetries: 1 },
+		});
+
+		await nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: process.cwd() });
+
+		expect(state.lastGateFailure).toMatchObject({ exitText: "exited 9" });
+		expect(state.lastGateFailure?.output).toContain("gate-out");
+		expect(state.lastGateFailure?.output).toContain("gate-error");
+	});
+
 	it("bounds captured autonomous gate output", async () => {
 		const gate = `${process.execPath} -e "process.stdout.write('x'.repeat(20000)); process.exit(1)"`;
 		const state = createAutonomousRuntimeState({
@@ -432,16 +493,18 @@ describe("AgentSession autonomous mode", () => {
 		execFileSync("mkdir", ["-p", tempDir]);
 		execFileSync("git", ["init"], { cwd: tempDir, stdio: "ignore" });
 		const pidFile = join(tempDir, "descendant.pid");
+		const descendantIdentity = createProcessIdentityOwnerToken();
 		const script = join(tempDir, "gate.cjs");
 		writeFileSync(
 			script,
 			`const { spawn } = require("node:child_process");\n` +
 				`const { writeFileSync } = require("node:fs");\n` +
-				`const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "inherit" });\n` +
+				`const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)", ${JSON.stringify(descendantIdentity.argument)}], { stdio: "inherit" });\n` +
 				`writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));\n` +
 				`setTimeout(() => {}, 60000);\n`,
 		);
 		let descendantPid: number | undefined;
+		let descendantExactId: string | undefined;
 		try {
 			const state = createAutonomousRuntimeState({
 				enabled: true,
@@ -450,22 +513,25 @@ describe("AgentSession autonomous mode", () => {
 			});
 			const startedAt = Date.now();
 
-			await nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: tempDir });
-			descendantPid = Number.parseInt(readFileSync(pidFile, "utf8"), 10);
+			const continuation = nextAutonomousContinuation(state, fauxAssistantMessage("Done."), { cwd: tempDir });
+			descendantPid = await waitForPidFile(pidFile);
+			descendantExactId = requireExactProcessIdentity(descendantPid);
+			await continuation;
 
 			expect(Date.now() - startedAt).toBeLessThan(3000);
 			expect(state.lastGateFailure?.exitText).toBe("timed out");
 			expect(await waitForProcessExit(descendantPid)).toBe(true);
 		} finally {
-			if (descendantPid && isProcessRunning(descendantPid)) {
-				process.kill(descendantPid, "SIGKILL");
+			if (descendantPid && descendantExactId && isProcessRunning(descendantPid)) {
+				signalExactProcess(descendantPid, descendantExactId, "SIGKILL");
 			}
 			rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
 
 	it("terminates an autonomous gate without mutating retry state when the session is aborted", async () => {
-		const gate = `${process.execPath} -e "const fs=require('fs'); fs.writeFileSync('gate.pid', String(process.pid)); setTimeout(() => {}, 60000)"`;
+		const gateIdentity = createProcessIdentityOwnerToken();
+		const gate = `${process.execPath} -e "const fs=require('fs'); fs.writeFileSync('gate.pid', String(process.pid)); setTimeout(() => {}, 60000)" ${gateIdentity.argument}`;
 		const harness = await createHarness({
 			autonomous: {
 				enabled: true,
@@ -477,11 +543,13 @@ describe("AgentSession autonomous mode", () => {
 		execFileSync("git", ["init"], { cwd: harness.tempDir, stdio: "ignore" });
 		const pidFile = join(harness.tempDir, "gate.pid");
 		let gatePid: number | undefined;
+		let gateExactId: string | undefined;
 		try {
 			harness.setResponses([fauxAssistantMessage("Done.")]);
 
 			const prompt = harness.session.prompt("make the change");
 			gatePid = await waitForPidFile(pidFile);
+			gateExactId = requireExactProcessIdentity(gatePid);
 			await harness.session.abort();
 			await prompt;
 
@@ -492,8 +560,8 @@ describe("AgentSession autonomous mode", () => {
 				lastGateFailure: undefined,
 			});
 		} finally {
-			if (gatePid && isProcessRunning(gatePid)) {
-				process.kill(gatePid, "SIGKILL");
+			if (gatePid && gateExactId && isProcessRunning(gatePid)) {
+				signalExactProcess(gatePid, gateExactId, "SIGKILL");
 			}
 		}
 	});

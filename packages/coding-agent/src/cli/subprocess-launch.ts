@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isBunBinary } from "../config.js";
+import { withoutOrphanProcessJournalAuthority } from "../core/orphan-process-journal.js";
 
 export interface CliSubprocessLaunchSpec {
 	command: string;
@@ -12,7 +13,7 @@ export function createCliSubprocessEnv(
 	entrypoint = process.argv[1],
 	execArgs: readonly string[] = process.execArgv,
 ): NodeJS.ProcessEnv {
-	const environment = { ...source };
+	const environment = withoutOrphanProcessJournalAuthority(source);
 	if (environment.TSX_TSCONFIG_PATH !== undefined || !entrypoint || !execArgs.some((arg) => arg.includes("tsx"))) {
 		return environment;
 	}

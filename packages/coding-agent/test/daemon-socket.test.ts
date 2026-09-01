@@ -1,11 +1,12 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import lockfile from "proper-lockfile";
 import { describe, expect, it } from "vitest";
 import {
+	acquireDaemonSocketPathLease,
 	cleanupDaemonSocketPath,
 	defaultDaemonSocketPath,
 	getDaemonSocketIdentity,
@@ -17,6 +18,32 @@ describe("normalizeSocketPath", () => {
 	it("normalizes equivalent Unix spellings", () => {
 		if (process.platform === "win32") return;
 		expect(normalizeSocketPath("/a//b.sock/")).toBe("/a/b.sock");
+	});
+
+	it.runIf(process.platform !== "win32")("resolves a real symlinked parent before appending a missing suffix", () => {
+		const root = mkdtempSync(join(tmpdir(), "pa-socket-physical-"));
+		const physicalParent = join(root, "physical");
+		const aliasParent = join(root, "alias");
+		mkdirSync(physicalParent);
+		symlinkSync(physicalParent, aliasParent, "dir");
+		try {
+			expect(normalizeSocketPath(join(aliasParent, "missing", "daemon.sock"))).toBe(
+				join(realpathSync(physicalParent), "missing", "daemon.sock"),
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it.runIf(process.platform !== "win32")("rejects a broken symlink as unresolved socket authority", () => {
+		const root = mkdtempSync(join(tmpdir(), "pa-socket-broken-alias-"));
+		const brokenParent = join(root, "broken");
+		symlinkSync(join(root, "missing-target"), brokenParent, "dir");
+		try {
+			expect(() => normalizeSocketPath(join(brokenParent, "daemon.sock"))).toThrow();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -69,25 +96,36 @@ describe("defaultDaemonSocketPath", () => {
 		}
 	});
 
-	it("does not wait on a stale lock when no socket path exists", async () => {
-		if (process.platform === "win32") {
-			return;
-		}
+	it("retains an old proper-lock directory even when no socket path exists", async () => {
+		if (process.platform === "win32") return;
 
 		const dir = mkdtempSync(join(tmpdir(), "pa-socket-stale-lock-"));
 		const socketPath = join(dir, "daemon.sock");
 		mkdirSync(`${socketPath}.lock`);
-		let prepared = false;
 		try {
-			await Promise.race([
-				prepareDaemonSocketPath(socketPath).then(() => {
-					prepared = true;
-				}),
-				new Promise<void>((resolve) => setTimeout(resolve, 250)),
-			]);
-			expect(prepared).toBe(true);
+			await expect(prepareDaemonSocketPath(socketPath)).rejects.toThrow(/already owned/i);
+			expect(existsSync(`${socketPath}.lock`)).toBe(true);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.runIf(process.platform !== "win32")("does not steal a durable lease through an alias or old mtime", async () => {
+		const root = mkdtempSync(join(tmpdir(), "pa-socket-alias-lease-"));
+		const physicalParent = join(root, "physical");
+		const aliasParent = join(root, "alias");
+		mkdirSync(physicalParent);
+		symlinkSync(physicalParent, aliasParent, "dir");
+		const physicalSocketPath = join(physicalParent, "daemon.sock");
+		const aliasSocketPath = join(aliasParent, "daemon.sock");
+		const lease = await acquireDaemonSocketPathLease(aliasSocketPath);
+		expect(lease?.socketPath).toBe(normalizeSocketPath(physicalSocketPath));
+		try {
+			utimesSync(`${physicalSocketPath}.lock`, new Date(0), new Date(0));
+			await expect(acquireDaemonSocketPathLease(physicalSocketPath)).rejects.toThrow(/already owned/i);
+		} finally {
+			await lease?.release();
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 

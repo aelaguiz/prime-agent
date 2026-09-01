@@ -7,6 +7,15 @@ import {
 	maybeRunOwnedSessionWorkerFrontend,
 } from "./cli/owned-session-worker.js";
 import { APP_NAME } from "./config.js";
+import { PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX } from "./core/session-lease.js";
+
+export function processTitleForArgv0(argv0: string): string {
+	if (!argv0.startsWith(PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX)) return APP_NAME;
+	const token = argv0.slice(PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX.length);
+	return /^[0-9a-f]{64}$/.test(token)
+		? `${APP_NAME} ${PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX}${token}`
+		: APP_NAME;
+}
 
 export async function runCli(): Promise<void> {
 	try {
@@ -15,7 +24,7 @@ export async function runCli(): Promise<void> {
 		// Read-only cache dir; startup just skips the cache.
 	}
 
-	process.title = APP_NAME;
+	process.title = processTitleForArgv0(process.argv0);
 	process.env.PI_CODING_AGENT = "true";
 	process.emitWarning = (() => {}) as typeof process.emitWarning;
 

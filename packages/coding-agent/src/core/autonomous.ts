@@ -1,11 +1,11 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { lstat, readlink } from "node:fs/promises";
 import { resolve } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { AssistantMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
-import { waitForChildProcess } from "../utils/child-process.js";
-import { killProcessTree, trackDetachedChildPid, untrackDetachedChildPid } from "../utils/shell.js";
+import { executeContainedProcess } from "../utils/contained-shell.js";
+import { getShellEnv } from "../utils/shell.js";
 
 export interface AgentAutonomousConfig {
 	enabled?: boolean;
@@ -478,7 +478,23 @@ interface ChildProcessResult {
 	outputTruncated: boolean;
 }
 
-function runChildProcess(
+export function containedChildArgv(
+	command: string,
+	args: string[],
+	useShell: boolean,
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	if (!useShell) return [command, ...args];
+	if (args.length > 0) {
+		throw new Error("Contained shell execution requires one complete command and no separate arguments");
+	}
+	if (platform === "win32") {
+		return [String.raw`C:\Windows\System32\cmd.exe`, "/d", "/s", "/c", command];
+	}
+	return ["/bin/sh", "-c", command];
+}
+
+async function runChildProcess(
 	command: string,
 	args: string[],
 	options: {
@@ -490,82 +506,59 @@ function runChildProcess(
 	} = {},
 ): Promise<ChildProcessResult> {
 	options.signal?.throwIfAborted();
-	return new Promise((resolve) => {
-		const child = spawn(command, args, {
-			cwd: options.cwd,
-			detached: process.platform !== "win32",
-			shell: options.shell === true,
-			stdio: ["ignore", "pipe", "pipe"],
+	let stdout = "";
+	let stderr = "";
+	let outputTruncated = false;
+	const maxOutputChars = options.maxOutputChars ?? MAX_CHILD_PROCESS_OUTPUT_CHARS;
+	const stdoutDecoder = new StringDecoder("utf8");
+	const stderrDecoder = new StringDecoder("utf8");
+	const appendStdout = (chunk: string) => {
+		const remaining = maxOutputChars - stdout.length;
+		if (remaining > 0) stdout += chunk.slice(0, remaining);
+		outputTruncated ||= chunk.length > remaining;
+	};
+	const appendStderr = (chunk: string) => {
+		const remaining = maxOutputChars - stderr.length;
+		if (remaining > 0) stderr += chunk.slice(0, remaining);
+		outputTruncated ||= chunk.length > remaining;
+	};
+	const finishDecoding = () => {
+		appendStdout(stdoutDecoder.end());
+		appendStderr(stderrDecoder.end());
+	};
+
+	try {
+		const result = await executeContainedProcess({
+			argv: containedChildArgv(command, args, options.shell === true),
+			cwd: options.cwd ?? process.cwd(),
+			env: getShellEnv(),
+			onStdout: (chunk) => appendStdout(stdoutDecoder.write(chunk)),
+			onStderr: (chunk) => appendStderr(stderrDecoder.write(chunk)),
+			signal: options.signal,
+			timeoutMs: options.timeoutMs,
 		});
-		if (child.pid) {
-			trackDetachedChildPid(child.pid);
-		}
-		let stdout = "";
-		let stderr = "";
-		let error: Error | undefined;
-		let timedOut = false;
-		let outputTruncated = false;
-		let settled = false;
-		const maxOutputChars = options.maxOutputChars ?? MAX_CHILD_PROCESS_OUTPUT_CHARS;
-		const finish = (result: Pick<ChildProcessResult, "status" | "signal">) => {
-			if (settled) {
-				return;
-			}
-			settled = true;
-			if (timer) {
-				clearTimeout(timer);
-			}
-			options.signal?.removeEventListener("abort", abort);
-			if (child.pid) {
-				untrackDetachedChildPid(child.pid);
-			}
-			resolve({ ...result, stdout, stderr, error, timedOut, outputTruncated });
+		finishDecoding();
+		return {
+			status: result.exitCode,
+			signal: result.signal,
+			stdout,
+			stderr,
+			error: result.error,
+			timedOut: result.timedOut,
+			outputTruncated,
 		};
-		const timer = options.timeoutMs
-			? setTimeout(() => {
-					timedOut = true;
-					if (child.pid) {
-						killProcessTree(child.pid);
-					} else {
-						child.kill("SIGKILL");
-					}
-				}, options.timeoutMs)
-			: undefined;
-		const abort = () => {
-			if (child.pid) {
-				killProcessTree(child.pid);
-			} else {
-				child.kill("SIGKILL");
-			}
+	} catch (caught) {
+		finishDecoding();
+		return {
+			status: null,
+			signal: null,
+			stdout,
+			stderr,
+			error: caught instanceof Error ? caught : new Error(String(caught)),
+			timedOut: false,
+			outputTruncated,
 		};
-		options.signal?.addEventListener("abort", abort, { once: true });
-		if (options.signal?.aborted) {
-			abort();
-		}
-		child.stdout?.setEncoding("utf8");
-		child.stderr?.setEncoding("utf8");
-		child.stdout?.on("data", (chunk: string) => {
-			const remaining = maxOutputChars - stdout.length;
-			if (remaining > 0) {
-				stdout += chunk.slice(0, remaining);
-			}
-			outputTruncated ||= chunk.length > remaining;
-		});
-		child.stderr?.on("data", (chunk: string) => {
-			const remaining = maxOutputChars - stderr.length;
-			if (remaining > 0) {
-				stderr += chunk.slice(0, remaining);
-			}
-			outputTruncated ||= chunk.length > remaining;
-		});
-		void waitForChildProcess(child).then(
-			(status) => finish({ status, signal: child.signalCode }),
-			(err: Error) => {
-				error = err;
-				finish({ status: child.exitCode, signal: child.signalCode });
-			},
-		);
-	});
+	}
 }
 
 function formatProcessExit(result: ChildProcessResult): string {

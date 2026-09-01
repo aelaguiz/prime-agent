@@ -9,12 +9,22 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { appendRotatingLog, expandTildePath, getClientErrorLogPath, getDaemonLogPath, VERSION } from "../config.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, ORPHAN_PROCESS_JOURNAL_GENERATION_ENV } from "../core/orphan-process-journal.js";
 import { prepareProcessLifecycleLaunch, recordProcessLifecycle } from "../core/process-lifecycle.js";
-import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
+import {
+	classifyProcessIdentityAuthority,
+	createProcessIdentityOwnerToken,
+	matchesExactProcessIdentity,
+	SESSION_LEASE_OWNER_ID_ENV,
+	SESSION_LEASES_ENABLED_ENV,
+} from "../core/session-lease.js";
 import { DaemonClient, type DaemonHello } from "../modes/daemon/daemon-client.js";
 import { tryAcquireDaemonLaunchLease } from "../modes/daemon/daemon-launch-lease.js";
-import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../modes/daemon/daemon-protocol.js";
+import {
+	DAEMON_PROTOCOL_VERSION,
+	DAEMON_SCHEMA_ID,
+	parseDaemonSupervisorHelloIdentity,
+} from "../modes/daemon/daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "../modes/daemon/daemon-runtime-identity.js";
 import { isSessionSummaryBusy, type SessionSummary } from "../modes/daemon/daemon-session-list.js";
 import { defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
@@ -207,8 +217,7 @@ function hasProcessIdentityExited(identity: DaemonProcessIdentity | undefined, v
 	if (!identity.processStartId || !verifyProcessStartId) {
 		return false;
 	}
-	const currentStartId = getProcessStartId(identity.pid);
-	return currentStartId !== undefined && currentStartId !== identity.processStartId;
+	return classifyProcessIdentityAuthority(identity.pid, identity.processStartId) === "exact-dead";
 }
 
 async function waitForDaemonGone(
@@ -243,15 +252,17 @@ async function waitForDaemonGone(
 	return requireSocketCleanup && !(await canConnectToDaemon(socketPath, 250)) && hasExpectedProcessExited(true);
 }
 
-function processIdentityFromDaemonHello(hello: DaemonHello | undefined): DaemonProcessIdentity | undefined {
-	if (!hello?.supervisorPid || !Number.isInteger(hello.supervisorPid) || hello.supervisorPid <= 0) {
-		return undefined;
+export function processIdentityFromDaemonHello(hello: DaemonHello | undefined): DaemonProcessIdentity | undefined {
+	if (!hello) throw new Error("Daemon did not provide a verifiable hello");
+	const pid = hello.supervisorPid;
+	if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+		throw new Error("Daemon hello contains an invalid supervisor PID");
 	}
-	const processStartId = hello.supervisorProcessStartId ?? getProcessStartId(hello.supervisorPid);
-	return {
-		pid: hello.supervisorPid,
-		...(processStartId ? { processStartId } : {}),
-	};
+	const identity = parseDaemonSupervisorHelloIdentity(hello);
+	if (identity.status === "invalid") {
+		throw new Error(`Daemon hello contains an invalid supervisor process identity: ${identity.reason}`);
+	}
+	return identity.status === "exact" ? { pid, processStartId: identity.authorityProcessStartId } : { pid };
 }
 
 export async function shutdownConnectedDaemonAndWait(
@@ -261,8 +272,15 @@ export async function shutdownConnectedDaemonAndWait(
 	hello: DaemonHello | undefined = client.hello,
 ): Promise<boolean> {
 	let shutdownAccepted = false;
-	const expectedIdentity = processIdentityFromDaemonHello(hello);
+	let expectedIdentity: DaemonProcessIdentity | undefined;
 	try {
+		expectedIdentity = processIdentityFromDaemonHello(hello);
+		if (
+			expectedIdentity?.processStartId &&
+			!matchesExactProcessIdentity(expectedIdentity.pid, expectedIdentity.processStartId)
+		) {
+			throw new Error("Daemon hello exact supervisor identity is not current");
+		}
 		const response = await client.request({ type: "shutdown" }).catch(() => undefined);
 		shutdownAccepted = response?.success === true;
 	} catch {
@@ -278,7 +296,7 @@ export async function shutdownDaemonAndWait(socketPath: string, timeoutMs = 5000
 	try {
 		await client.connect(1000);
 		const hello = await client.waitForHello(2000).catch(() => undefined);
-		return shutdownConnectedDaemonAndWait(client, socketPath, timeoutMs, hello);
+		return await shutdownConnectedDaemonAndWait(client, socketPath, timeoutMs, hello);
 	} catch {
 		client.close();
 		return waitForDaemonGone(socketPath, timeoutMs);
@@ -388,11 +406,13 @@ async function ensureDaemonRunningAsLeader(
 	delete env[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 	delete env[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 	delete env[ORPHAN_PROCESS_JOURNAL_ENV];
+	delete env[ORPHAN_PROCESS_JOURNAL_GENERATION_ENV];
 	delete env[SESSION_LEASES_ENABLED_ENV];
 	delete env[SESSION_LEASE_OWNER_ID_ENV];
 
 	const logOffset = currentDaemonLogSize(socketPath);
 	const launch = createCliSubprocessLaunchSpec(["--mode", "daemon", "--daemon-socket", socketPath]);
+	const ownerIdentity = createProcessIdentityOwnerToken();
 	const trigger = "ensure_daemon_running";
 	const preparedLaunch = prepareProcessLifecycleLaunch(env, {
 		role: "daemon-supervisor",
@@ -408,6 +428,7 @@ async function ensureDaemonRunningAsLeader(
 	let child: ReturnType<typeof spawn>;
 	try {
 		child = spawn(launch.command, launch.args, {
+			argv0: ownerIdentity.argument,
 			cwd: spawnCwd ?? process.cwd(),
 			detached: true,
 			env: preparedLaunch.environment,
@@ -697,5 +718,9 @@ export function maybeStartDaemonEarly(args: readonly string[]): void {
 	if (spawnCwd && !existsSync(spawnCwd)) {
 		return;
 	}
-	void ensureInteractiveDaemonRunning(normalizeSocketPath(rawSocketPath, spawnCwd), spawnCwd);
+	const operationalSocketPath =
+		process.platform === "win32"
+			? normalizeSocketPath(rawSocketPath, spawnCwd)
+			: resolve(spawnCwd ?? process.cwd(), expandTildePath(rawSocketPath));
+	void ensureInteractiveDaemonRunning(operationalSocketPath, spawnCwd);
 }

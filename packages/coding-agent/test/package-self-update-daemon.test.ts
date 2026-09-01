@@ -1,12 +1,15 @@
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as DaemonUpdateRestartModule from "../src/cli/daemon-update-restart.js";
 import {
 	acquireDaemonUpdateRestartCoordinator,
+	DaemonUpdateRestartCoordinatorAlreadyRunningError,
+	DaemonUpdateRestartCoordinatorCorruptError,
 	type DaemonUpdateRestartStatus,
 	DaemonUpdateRestartStatusWriter,
+	resolveDaemonUpdateRestartSocketPath,
 	waitForActiveDaemonUpdateRestartCoordinator,
 } from "../src/cli/daemon-update-restart.js";
 import {
@@ -19,11 +22,14 @@ import {
 	VERSION,
 } from "../src/config.js";
 import type { AgentSessionRuntimeMetadata } from "../src/core/agent-session-runtime.js";
+import type * as SessionLeaseModule from "../src/core/session-lease.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
 import type * as DaemonSocketModule from "../src/modes/daemon/daemon-socket.js";
+import { normalizeSocketPath } from "../src/modes/daemon/daemon-socket.js";
 import {
 	handlePackageCommand,
 	prepareDaemonUpdateRestart,
+	resolveUpdateDaemonSocketPath,
 	runDaemonUpdateRestartCoordinator,
 } from "../src/package-manager-cli.js";
 
@@ -133,9 +139,11 @@ const mockState = vi.hoisted(() => ({
 		supervisorOwnerToken?: string;
 		supervisorPid?: number;
 		supervisorProcessStartId?: string;
+		supervisorAuthorityProcessStartId?: string;
 		supervisorSocketPath?: string;
 	},
 	helloCount: 0,
+	exactIdentityMatches: true,
 	lastCoordinatorStatus: undefined as DaemonUpdateRestartStatus | undefined,
 	listResponse: undefined as MockDaemonResponse | undefined,
 	noticeError: undefined as string | undefined,
@@ -157,7 +165,8 @@ const mockState = vi.hoisted(() => ({
 	restoreActionFailures: 0,
 	restoreNextTurnFailures: 0,
 	socketPath: "",
-	successorProcessStartId: "replacement-start" as string | undefined,
+	successorAuthorityProcessStartId: `token:${"2".repeat(64)}` as string | undefined,
+	successorLegacyProcessStartId: undefined as string | undefined,
 	successorSocketPath: undefined as string | undefined,
 	spawnExitCodes: [] as number[],
 	shutdownResult: true,
@@ -170,10 +179,15 @@ function useFixedOwnerHello(): void {
 		supervisorGeneration: "fixed-owner",
 		supervisorOwnerToken: "owner-token",
 		supervisorPid: process.pid,
-		supervisorProcessStartId: "process-start",
+		supervisorAuthorityProcessStartId: `token:${"1".repeat(64)}`,
 		supervisorSocketPath: mockState.socketPath,
 	};
 }
+
+vi.mock("../src/core/session-lease.js", async (importOriginal) => ({
+	...(await importOriginal<typeof SessionLeaseModule>()),
+	matchesExactProcessIdentity: vi.fn(() => mockState.exactIdentityMatches),
+}));
 
 vi.mock("child_process", () => ({
 	spawn: vi.fn((command: string, args: string[]) => {
@@ -302,6 +316,7 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 			supervisorOwnerToken?: string;
 			supervisorPid?: number;
 			supervisorProcessStartId?: string;
+			supervisorAuthorityProcessStartId?: string;
 			supervisorSocketPath?: string;
 		}> {
 			if (mockState.helloWaitFailures > 0) {
@@ -322,8 +337,11 @@ vi.mock("../src/modes/daemon/daemon-client.js", () => ({
 							supervisorPid: 1002,
 							supervisorGeneration: "replacement-generation",
 							supervisorOwnerToken: "replacement-owner-token",
-							...(mockState.successorProcessStartId
-								? { supervisorProcessStartId: mockState.successorProcessStartId }
+							...(mockState.successorAuthorityProcessStartId
+								? { supervisorAuthorityProcessStartId: mockState.successorAuthorityProcessStartId }
+								: {}),
+							...(mockState.successorLegacyProcessStartId
+								? { supervisorProcessStartId: mockState.successorLegacyProcessStartId }
 								: {}),
 							supervisorSocketPath: mockState.successorSocketPath ?? mockState.socketPath,
 						};
@@ -413,6 +431,38 @@ describe("self-update daemon restart", () => {
 		});
 	}
 
+	async function writeCoordinatorFixture(
+		identity: Record<string, unknown>,
+		pid = 2_000_000_000,
+	): Promise<{ path: string; registryDir: string }> {
+		const registryDir = join(tempDir, `coordinator-${Math.random().toString(36).slice(2)}`);
+		const discovery = await acquireDaemonUpdateRestartCoordinator({
+			requestId: "discover",
+			socketPath: mockState.socketPath,
+			statusPath: join(tempDir, "discover-status.json"),
+			registryDir,
+		});
+		const name = readdirSync(registryDir).find((entry) => entry.endsWith(".json"));
+		expect(name).toBeDefined();
+		const path = join(registryDir, name!);
+		await discovery.release();
+		writeFileSync(
+			path,
+			`${JSON.stringify({
+				version: 1,
+				token: "fixture-token",
+				requestId: "fixture-request",
+				pid,
+				socketPath: normalizeSocketPath(mockState.socketPath),
+				statusPath: join(tempDir, "fixture-status.json"),
+				createdAt: new Date(0).toISOString(),
+				...identity,
+			})}
+`,
+		);
+		return { path, registryDir };
+	}
+
 	function createAcceptedRecoveryManifest(nextTurn: MockCustomMessage[] = []): MockUpdateRestartManifest {
 		return {
 			formatVersion: 1,
@@ -475,12 +525,14 @@ describe("self-update daemon restart", () => {
 		mockState.globalPackageRoot = join(tempDir, "global-prefix", "lib", "node_modules");
 		mockState.hello = { protocol: { version: DAEMON_PROTOCOL_VERSION }, schemaId: DAEMON_SCHEMA_ID };
 		mockState.helloCount = 0;
+		mockState.exactIdentityMatches = true;
 		mockState.lastCoordinatorStatus = undefined;
 		mockState.listResponse = undefined;
 		mockState.noticeError = undefined;
 		mockState.prepareError = undefined;
 		mockState.socketPath = join(tempDir, "daemon.sock");
-		mockState.successorProcessStartId = "replacement-start";
+		mockState.successorAuthorityProcessStartId = `token:${"2".repeat(64)}`;
+		mockState.successorLegacyProcessStartId = undefined;
 		mockState.successorSocketPath = undefined;
 		mockState.calls = [];
 		mockState.createActiveSessionIds = [];
@@ -553,6 +605,122 @@ describe("self-update daemon restart", () => {
 		);
 	});
 
+	it.runIf(process.platform === "darwin")(
+		"keeps lexical AF_UNIX operation paths while coordinator authority is physical",
+		async () => {
+			const lexicalSocketPath = join(tempDir, "lexical-daemon.sock");
+			expect(resolveUpdateDaemonSocketPath(lexicalSocketPath)).toBe(resolve(lexicalSocketPath));
+			expect(resolveDaemonUpdateRestartSocketPath(lexicalSocketPath)).toBe(resolve(lexicalSocketPath));
+			expect(resolve(lexicalSocketPath)).not.toBe(normalizeSocketPath(lexicalSocketPath));
+			const lease = await acquireDaemonUpdateRestartCoordinator({
+				requestId: "lexical-physical-invariant",
+				socketPath: lexicalSocketPath,
+				statusPath: join(tempDir, "lexical-status.json"),
+				registryDir: join(tempDir, "lexical-registry"),
+			});
+			expect(lease.record.socketPath).toBe(normalizeSocketPath(lexicalSocketPath));
+			await lease.release();
+		},
+	);
+
+	it("retains malformed coordinator authority without overwriting it", async () => {
+		const registryDir = join(tempDir, "coordinator-registry");
+		const lease = await acquireDaemonUpdateRestartCoordinator({
+			requestId: "discover-path",
+			socketPath: mockState.socketPath,
+			statusPath: join(tempDir, "status.json"),
+			registryDir,
+		});
+		const recordName = readdirSync(registryDir).find((name) => name.endsWith(".json"));
+		expect(recordName).toBeDefined();
+		const recordPath = join(registryDir, recordName!);
+		await lease.release();
+		writeFileSync(recordPath, "{ malformed\n");
+		const before = { bytes: readFileSync(recordPath), stat: statSync(recordPath, { bigint: true }) };
+
+		await expect(
+			acquireDaemonUpdateRestartCoordinator({
+				requestId: "must-not-overwrite",
+				socketPath: mockState.socketPath,
+				statusPath: join(tempDir, "other-status.json"),
+				registryDir,
+			}),
+		).rejects.toBeInstanceOf(DaemonUpdateRestartCoordinatorCorruptError);
+		expect(readFileSync(recordPath)).toEqual(before.bytes);
+		const after = statSync(recordPath, { bigint: true });
+		expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.stat.dev, ino: before.stat.ino });
+	});
+
+	it.each([
+		["malformed authority", { authorityProcessStartId: "token:bad" }],
+		[
+			"conflicting Linux dual",
+			{
+				processStartId: "proc:12",
+				authorityProcessStartId: "proc:00000000-0000-4000-8000-000000000000:11",
+			},
+		],
+		["conflicting Windows dual", { processStartId: "win:12", authorityProcessStartId: "win:11" }],
+	])("retains structurally %s coordinator authority byte-for-byte", async (_name, identity) => {
+		const fixture = await writeCoordinatorFixture(identity);
+		const before = { bytes: readFileSync(fixture.path), stat: statSync(fixture.path, { bigint: true }) };
+		await expect(
+			acquireDaemonUpdateRestartCoordinator({
+				requestId: "must-not-overwrite",
+				socketPath: mockState.socketPath,
+				statusPath: join(tempDir, "new-status.json"),
+				registryDir: fixture.registryDir,
+			}),
+		).rejects.toBeInstanceOf(DaemonUpdateRestartCoordinatorCorruptError);
+		expect(readFileSync(fixture.path)).toEqual(before.bytes);
+		const after = statSync(fixture.path, { bigint: true });
+		expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.stat.dev, ino: before.stat.ino });
+	});
+
+	it.each([
+		["authority-only qualified Linux", { authorityProcessStartId: "proc:00000000-0000-4000-8000-000000000000:11" }],
+		["authority-only token", { authorityProcessStartId: `token:${"3".repeat(64)}` }],
+		["Windows byte-identical dual", { processStartId: "win:11", authorityProcessStartId: "win:11" }],
+		[
+			"historical Linux dual",
+			{ processStartId: "proc:11", authorityProcessStartId: "proc:00000000-0000-4000-8000-000000000000:11" },
+		],
+		["historical qualified old field", { processStartId: "proc:00000000-0000-4000-8000-000000000000:11" }],
+		["historical token old field", { processStartId: `token:${"4".repeat(64)}` }],
+		["historical Windows old field", { processStartId: "win:11" }],
+	])("reclaims exact-dead %s coordinator authority", async (_name, identity) => {
+		const fixture = await writeCoordinatorFixture(identity);
+		const lease = await acquireDaemonUpdateRestartCoordinator({
+			requestId: "replacement",
+			socketPath: mockState.socketPath,
+			statusPath: join(tempDir, "replacement-status.json"),
+			registryDir: fixture.registryDir,
+		});
+		expect(lease.record.requestId).toBe("replacement");
+		await lease.release();
+	});
+
+	it("retains a live bare legacy coordinator and reclaims only after PID absence", async () => {
+		const live = await writeCoordinatorFixture({ processStartId: "proc:11" }, process.pid);
+		await expect(
+			acquireDaemonUpdateRestartCoordinator({
+				requestId: "blocked",
+				socketPath: mockState.socketPath,
+				statusPath: join(tempDir, "blocked.json"),
+				registryDir: live.registryDir,
+			}),
+		).rejects.toBeInstanceOf(DaemonUpdateRestartCoordinatorAlreadyRunningError);
+		const dead = await writeCoordinatorFixture({ processStartId: "proc:11" });
+		const lease = await acquireDaemonUpdateRestartCoordinator({
+			requestId: "absence-reclaim",
+			socketPath: mockState.socketPath,
+			statusPath: join(tempDir, "absence.json"),
+			registryDir: dead.registryDir,
+		});
+		expect(lease.record.requestId).toBe("absence-reclaim");
+		await lease.release();
+	});
+
 	it.each([
 		["unreadable", "{"],
 		["unknown-format", JSON.stringify({ formatVersion: 0, createdAt: "stale", sessions: [] })],
@@ -569,7 +737,7 @@ describe("self-update daemon restart", () => {
 		process.env[SELF_UPDATE_INTERACTIVE_CHILD_ENV] = "1";
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async () => Response.json({ version: "0.2.6" })),
+			vi.fn(async () => Response.json({ version: VERSION })),
 		);
 
 		await expect(handlePackageCommand(["update", "--self"])).resolves.toBe(true);
@@ -628,7 +796,7 @@ describe("self-update daemon restart", () => {
 
 		await expect(handlePackageCommand(["update", "--self", "--daemon-socket", customSocketPath])).resolves.toBe(true);
 
-		expect(mockState.probeSocketPaths).toEqual([customSocketPath]);
+		expect(mockState.probeSocketPaths).toEqual([resolve(customSocketPath)]);
 		expect(mockState.calls.some((call) => call.startsWith("spawn:npm "))).toBe(true);
 		expect(mockState.calls.some((call) => call.startsWith("launch-coordinator:"))).toBe(false);
 	});
@@ -737,7 +905,7 @@ describe("self-update daemon restart", () => {
 		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
 	});
 
-	it("accepts a fixed replacement owner when process start ids are unavailable", async () => {
+	it("rejects a replacement owner when exact process authority is unavailable", async () => {
 		mockState.hello = {
 			protocol: { version: 2 },
 			supervisorGeneration: "predecessor-generation",
@@ -745,18 +913,49 @@ describe("self-update daemon restart", () => {
 			supervisorPid: 1001,
 			supervisorSocketPath: mockState.socketPath,
 		};
-		mockState.successorProcessStartId = undefined;
+		mockState.successorAuthorityProcessStartId = undefined;
 
 		await performUpdateAndRunCoordinator();
 
 		expect(mockState.lastCoordinatorStatus).toMatchObject({
-			phase: "complete",
-			successor: {
-				pid: 1002,
-				supervisorGeneration: "replacement-generation",
-				supervisorOwnerToken: "replacement-owner-token",
-			},
+			phase: "failed",
+			message: expect.stringContaining("supervisor process identity is unavailable"),
 		});
+	});
+
+	it.each([
+		["malformed authority", "token:bad", undefined],
+		["conflicting signal-unsafe dual", `token:${"5".repeat(64)}`, "proc:11"],
+		["conflicting Linux dual", "proc:00000000-0000-4000-8000-000000000000:11", "proc:12"],
+		["conflicting Windows dual", "win:11", "win:12"],
+	])("rejects a successor with %s before restore", async (_name, authority, legacy) => {
+		useFixedOwnerHello();
+		mockState.successorAuthorityProcessStartId = authority;
+		mockState.successorLegacyProcessStartId = legacy;
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "failed" });
+		expect(mockState.requestPayloads.some((request) => request.type === "create")).toBe(false);
+	});
+
+	it("rejects a recycled successor whose exact identity no longer matches", async () => {
+		useFixedOwnerHello();
+		mockState.exactIdentityMatches = false;
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({
+			phase: "failed",
+			message: expect.stringContaining("current exact identity fence"),
+		});
+	});
+
+	it.each([
+		["authority-only qualified Linux", "proc:00000000-0000-4000-8000-000000000000:11", undefined],
+		["Windows byte-identical dual", "win:11", "win:11"],
+	])("accepts a current %s successor", async (_name, authority, legacy) => {
+		useFixedOwnerHello();
+		mockState.successorAuthorityProcessStartId = authority;
+		mockState.successorLegacyProcessStartId = legacy;
+		await performUpdateAndRunCoordinator();
+		expect(mockState.lastCoordinatorStatus).toMatchObject({ phase: "complete" });
 	});
 
 	it("clears the prepared manifest after fallback restoration when shutdown fails", async () => {
@@ -886,7 +1085,7 @@ describe("self-update daemon restart", () => {
 
 			expect(process.exitCode).toBeUndefined();
 			const spawnIndex = mockState.calls.findIndex((call) => call.startsWith("spawn:npm "));
-			const launchIndex = mockState.calls.indexOf(`launch-coordinator:${mockState.socketPath}`);
+			const launchIndex = mockState.calls.indexOf(`launch-coordinator:${resolve(mockState.socketPath)}`);
 			const fenceIndex = mockState.calls.indexOf("persist-daemon-startup-fence");
 			const prepareIndex = mockState.calls.indexOf("daemon-request:prepare_update_restart");
 			const admissionIndex = mockState.calls.indexOf("acquire-daemon-shutdown-admission");

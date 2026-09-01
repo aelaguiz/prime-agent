@@ -1,10 +1,12 @@
 import { closeSync, readFileSync } from "node:fs";
-import type {
-	AgentSessionMessageAgentSummary,
-	AgentSessionMessageDeliveryMode,
-	AgentSessionMessageSender,
-} from "../../core/agent-messages.js";
+import type { AgentSessionMessageDeliveryMode, AgentSessionMessageSender } from "../../core/agent-messages.js";
 import type { IdleEvictionMinutes } from "../../core/session-action-store.js";
+import {
+	isExactProcessStartId,
+	normalizePortableProcessIdentityHint,
+	normalizeRetainedLegacyProcessStartId,
+	projectLegacyProcessStartId,
+} from "../../core/session-lease.js";
 
 export { SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../../core/session-lease.js";
 
@@ -18,6 +20,16 @@ export const DAEMON_WORKER_RECOVERY_JOURNAL_ENV = "PRIME_AGENT_INTERNAL_DAEMON_W
 export const DAEMON_WORKER_STARTUP_GATE_FD_ENV = "PRIME_AGENT_INTERNAL_DAEMON_WORKER_STARTUP_GATE_FD";
 export const DAEMON_WORKER_STARTUP_GATE_COMMIT = "start\n";
 export type DaemonWorkerLifecycle = "starting" | "ready" | "recovering" | "stopping" | "failed";
+export type DaemonWorkerCleanupState = "cleanup-proven" | "journal-cleared";
+
+/** Durable crash-recovery proof for one immutable worker cleanup authority. */
+export interface DaemonWorkerCleanupProof {
+	version: 1;
+	state: DaemonWorkerCleanupState;
+	token: string;
+	authorityFingerprint: string;
+	provenAt: string;
+}
 
 export type DaemonWorkerFrameHeader =
 	| {
@@ -59,7 +71,9 @@ export type DaemonWorkerCommand =
 			token: string;
 			supervisorGeneration: string;
 			supervisorPid: number;
+			/** Legacy pre-move projection; never new exact signal authority. */
 			supervisorProcessStartId?: string;
+			supervisorAuthorityProcessStartId?: string;
 			supervisorSocketPath: string;
 	  }
 	| {
@@ -70,7 +84,6 @@ export type DaemonWorkerCommand =
 			supportsExtensionUi?: boolean;
 	  }
 	| { id?: string; type: "worker_unsubscribe"; activeSessionId: string }
-	| { id?: string; type: "worker_sync_agent_peers"; peers: AgentSessionMessageAgentSummary[] }
 	| { id?: string; type: "worker_archive_and_shutdown" }
 	| {
 			id?: string;
@@ -101,10 +114,18 @@ export interface DaemonWorkerDescriptor {
 	version: 1 | 2;
 	workerId: string;
 	pid: number;
+	/** Legacy pre-move projection; retained for mixed-version readers only. */
 	processStartId?: string;
+	/** Legacy diagnostic hint; never process identity authority. */
+	processIdentityHint?: string;
+	/** Exact new-reader process identity used for authority and signalling. */
+	authorityProcessStartId?: string;
+	/** New-reader diagnostic hint used only when exact identity was unavailable. */
+	authorityProcessIdentityHint?: string;
 	socketPath: string;
 	recoveryJournalPath: string;
 	orphanProcessJournalPath?: string;
+	orphanProcessJournalGeneration?: string;
 	supervisorSocketPath: string;
 	authenticationToken: string;
 	rootActiveSessionId: string;
@@ -123,8 +144,165 @@ export interface DaemonWorkerDescriptor {
 	stopRequestedAt?: string;
 	/** Complete the root's archived lifecycle state after its process has stopped. */
 	archiveOnStop?: boolean;
+	/** Optional internal cleanup proof. This is not part of daemon wire protocol v7. */
+	cleanup?: DaemonWorkerCleanupProof;
 	lastFailureAt?: string;
 	lastError?: string;
+}
+
+const DAEMON_WORKER_CLEANUP_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const DAEMON_WORKER_AUTHORITY_FINGERPRINT_PATTERN = /^[0-9a-f]{64}$/;
+const DAEMON_WORKER_LIFECYCLES: ReadonlySet<DaemonWorkerLifecycle> = new Set([
+	"starting",
+	"ready",
+	"recovering",
+	"stopping",
+	"failed",
+]);
+
+function isNonemptyString(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0;
+}
+
+function isValidTimestamp(value: unknown): value is string {
+	return isNonemptyString(value) && Number.isFinite(Date.parse(value));
+}
+
+export function isDaemonWorkerCleanupProof(value: unknown): value is DaemonWorkerCleanupProof {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const cleanup = value as Partial<DaemonWorkerCleanupProof>;
+	return (
+		cleanup.version === 1 &&
+		(cleanup.state === "cleanup-proven" || cleanup.state === "journal-cleared") &&
+		typeof cleanup.token === "string" &&
+		DAEMON_WORKER_CLEANUP_TOKEN_PATTERN.test(cleanup.token) &&
+		typeof cleanup.authorityFingerprint === "string" &&
+		DAEMON_WORKER_AUTHORITY_FINGERPRINT_PATTERN.test(cleanup.authorityFingerprint) &&
+		isValidTimestamp(cleanup.provenAt) &&
+		Object.keys(cleanup).length === 5 &&
+		Object.keys(cleanup).every((key) =>
+			["version", "state", "token", "authorityFingerprint", "provenAt"].includes(key),
+		)
+	);
+}
+
+/** Prefer exact new-reader authority; legacy projection is retention-only fallback. */
+export function daemonWorkerProcessAuthority(descriptor: Readonly<DaemonWorkerDescriptor>): string | undefined {
+	// New writes use the authority namespace. Exact values written by the prior
+	// schema (notably win:/token: and interim qualified Linux IDs) remain valid;
+	// bare proc:/ps: projections reduce to retained and can never authorize signal.
+	return descriptor.authorityProcessStartId ?? descriptor.processStartId;
+}
+
+function isLegacyProcessIdentityProjection(value: string): boolean {
+	return isExactProcessStartId(value) || normalizeRetainedLegacyProcessStartId(value) === value;
+}
+
+export function daemonSignalSafeLegacyProcessStartId(
+	exact: string | undefined,
+	legacy: string | undefined,
+): string | undefined {
+	return exact?.startsWith("win:") && (legacy === undefined || legacy === exact) ? exact : undefined;
+}
+
+export function hasConsistentDaemonProcessIdentityProjection(
+	legacy: string | undefined,
+	exact: string | undefined,
+): boolean {
+	if (exact === undefined) {
+		return legacy === undefined || isExactProcessStartId(legacy) || isLegacyProcessIdentityProjection(legacy);
+	}
+	if (!isExactProcessStartId(exact)) return false;
+	if (legacy === undefined) return true;
+	const projected = projectLegacyProcessStartId(exact);
+	return projected !== undefined && legacy === projected;
+}
+
+function hasConsistentDaemonWorkerIdentityNamespaces(descriptor: Partial<DaemonWorkerDescriptor>): boolean {
+	const legacyStart = descriptor.processStartId;
+	const legacyHint = descriptor.processIdentityHint;
+	const authorityStart = descriptor.authorityProcessStartId;
+	const authorityHint = descriptor.authorityProcessIdentityHint;
+	if (legacyStart !== undefined && legacyHint !== undefined) return false;
+	if (authorityStart !== undefined && authorityHint !== undefined) return false;
+	if (legacyHint !== undefined && normalizePortableProcessIdentityHint(legacyHint) !== legacyHint) return false;
+	if (authorityStart !== undefined && legacyHint !== undefined) return false;
+	if (authorityHint !== undefined) {
+		if (normalizePortableProcessIdentityHint(authorityHint) !== authorityHint || legacyStart !== undefined)
+			return false;
+		if (legacyHint !== undefined && legacyHint !== authorityHint) return false;
+	}
+	return true;
+}
+
+/** Shared structural validator. Cleanup callers add canonical-layout and inode checks. */
+export function isDaemonWorkerDescriptor(value: unknown): value is DaemonWorkerDescriptor {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const descriptor = value as Partial<DaemonWorkerDescriptor>;
+	const createCommand = descriptor.createCommand as Partial<DurableDaemonCreateCommand> | undefined;
+	return (
+		(descriptor.version === 1 || descriptor.version === 2) &&
+		isNonemptyString(descriptor.workerId) &&
+		Number.isInteger(descriptor.pid) &&
+		(descriptor.pid ?? 0) > 0 &&
+		(descriptor.processStartId === undefined || isNonemptyString(descriptor.processStartId)) &&
+		(descriptor.processIdentityHint === undefined || isNonemptyString(descriptor.processIdentityHint)) &&
+		(descriptor.authorityProcessStartId === undefined || isNonemptyString(descriptor.authorityProcessStartId)) &&
+		(descriptor.authorityProcessIdentityHint === undefined ||
+			isNonemptyString(descriptor.authorityProcessIdentityHint)) &&
+		hasConsistentDaemonWorkerIdentityNamespaces(descriptor) &&
+		hasConsistentDaemonProcessIdentityProjection(descriptor.processStartId, descriptor.authorityProcessStartId) &&
+		isNonemptyString(descriptor.socketPath) &&
+		isNonemptyString(descriptor.recoveryJournalPath) &&
+		(descriptor.orphanProcessJournalPath === undefined || isNonemptyString(descriptor.orphanProcessJournalPath)) &&
+		(descriptor.orphanProcessJournalGeneration === undefined ||
+			isNonemptyString(descriptor.orphanProcessJournalGeneration)) &&
+		isNonemptyString(descriptor.supervisorSocketPath) &&
+		isNonemptyString(descriptor.authenticationToken) &&
+		isNonemptyString(descriptor.rootActiveSessionId) &&
+		(descriptor.ownerClientId === undefined || isNonemptyString(descriptor.ownerClientId)) &&
+		(descriptor.rootSessionId === undefined || isNonemptyString(descriptor.rootSessionId)) &&
+		(descriptor.sessionFile === undefined || isNonemptyString(descriptor.sessionFile)) &&
+		(descriptor.sessionDir === undefined || isNonemptyString(descriptor.sessionDir)) &&
+		(descriptor.telemetryDisabled === undefined || descriptor.telemetryDisabled === true) &&
+		isValidTimestamp(descriptor.createdAt) &&
+		isValidTimestamp(descriptor.updatedAt) &&
+		typeof descriptor.lifecycle === "string" &&
+		DAEMON_WORKER_LIFECYCLES.has(descriptor.lifecycle as DaemonWorkerLifecycle) &&
+		createCommand !== undefined &&
+		createCommand.type === "create" &&
+		(createCommand.sessionPath === undefined || isNonemptyString(createCommand.sessionPath)) &&
+		(createCommand.noSession === undefined || typeof createCommand.noSession === "boolean") &&
+		Number.isInteger(descriptor.consecutiveFailures) &&
+		(descriptor.consecutiveFailures ?? -1) >= 0 &&
+		(descriptor.stopRequestedAt === undefined || isValidTimestamp(descriptor.stopRequestedAt)) &&
+		(descriptor.archiveOnStop === undefined || typeof descriptor.archiveOnStop === "boolean") &&
+		(descriptor.cleanup === undefined || isDaemonWorkerCleanupProof(descriptor.cleanup)) &&
+		(descriptor.lastFailureAt === undefined || isValidTimestamp(descriptor.lastFailureAt)) &&
+		(descriptor.lastError === undefined || typeof descriptor.lastError === "string")
+	);
+}
+
+/** Parses durable descriptor authority while treating malformed optional cleanup proof as absent. */
+export function parseDaemonWorkerDescriptor(value: unknown): DaemonWorkerDescriptor | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = { ...(value as Record<string, unknown>) };
+	if (
+		candidate.authorityProcessStartId === undefined &&
+		typeof candidate.processStartId === "string" &&
+		isExactProcessStartId(candidate.processStartId) &&
+		!candidate.processStartId.startsWith("win:")
+	) {
+		const exact = candidate.processStartId;
+		candidate.authorityProcessStartId = exact;
+		const legacy = projectLegacyProcessStartId(exact);
+		if (legacy === undefined) delete candidate.processStartId;
+		else candidate.processStartId = legacy;
+	}
+	if (candidate.cleanup !== undefined && !isDaemonWorkerCleanupProof(candidate.cleanup)) {
+		delete candidate.cleanup;
+	}
+	return isDaemonWorkerDescriptor(candidate) ? candidate : undefined;
 }
 
 export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor): DaemonWorkerDescriptor {
@@ -139,15 +317,28 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 		descriptor.sessionDir ??
 		(typeof versionOneConfig?.sessionDir === "string" ? versionOneConfig.sessionDir : undefined);
 	const telemetryDisabled = descriptor.telemetryDisabled === true || versionOneConfig?.telemetryDisabled === true;
+	const legacyProcessStartId = descriptor.authorityProcessStartId
+		? daemonSignalSafeLegacyProcessStartId(descriptor.authorityProcessStartId, descriptor.processStartId)
+		: descriptor.processStartId;
 	return {
 		version: 2,
 		workerId: descriptor.workerId,
 		pid: descriptor.pid,
-		...(descriptor.processStartId !== undefined ? { processStartId: descriptor.processStartId } : {}),
+		...(legacyProcessStartId !== undefined ? { processStartId: legacyProcessStartId } : {}),
+		...(descriptor.processIdentityHint !== undefined ? { processIdentityHint: descriptor.processIdentityHint } : {}),
+		...(descriptor.authorityProcessStartId !== undefined
+			? { authorityProcessStartId: descriptor.authorityProcessStartId }
+			: {}),
+		...(descriptor.authorityProcessIdentityHint !== undefined
+			? { authorityProcessIdentityHint: descriptor.authorityProcessIdentityHint }
+			: {}),
 		socketPath: descriptor.socketPath,
 		recoveryJournalPath: descriptor.recoveryJournalPath,
 		...(descriptor.orphanProcessJournalPath !== undefined
 			? { orphanProcessJournalPath: descriptor.orphanProcessJournalPath }
+			: {}),
+		...(descriptor.orphanProcessJournalGeneration !== undefined
+			? { orphanProcessJournalGeneration: descriptor.orphanProcessJournalGeneration }
 			: {}),
 		supervisorSocketPath: descriptor.supervisorSocketPath,
 		authenticationToken: descriptor.authenticationToken,
@@ -164,6 +355,17 @@ export function durableDaemonWorkerDescriptor(descriptor: DaemonWorkerDescriptor
 		consecutiveFailures: descriptor.consecutiveFailures,
 		...(descriptor.stopRequestedAt !== undefined ? { stopRequestedAt: descriptor.stopRequestedAt } : {}),
 		...(descriptor.archiveOnStop !== undefined ? { archiveOnStop: descriptor.archiveOnStop } : {}),
+		...(isDaemonWorkerCleanupProof(descriptor.cleanup)
+			? {
+					cleanup: {
+						version: descriptor.cleanup.version,
+						state: descriptor.cleanup.state,
+						token: descriptor.cleanup.token,
+						authorityFingerprint: descriptor.cleanup.authorityFingerprint,
+						provenAt: descriptor.cleanup.provenAt,
+					},
+				}
+			: {}),
 		...(descriptor.lastFailureAt !== undefined ? { lastFailureAt: descriptor.lastFailureAt } : {}),
 		...(descriptor.lifecycle === "failed" ? { lastError: "Waiting for a client with fresh runtime context" } : {}),
 	};

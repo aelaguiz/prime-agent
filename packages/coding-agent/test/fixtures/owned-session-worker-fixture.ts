@@ -6,7 +6,7 @@ import {
 } from "../../src/cli/owned-session-worker.js";
 import { attachJsonlLineReader, serializeJsonLine } from "../../src/modes/rpc/jsonl.js";
 
-const args = process.argv.slice(2);
+const args = process.argv.slice(2).filter((value) => !value.startsWith("prime-agent-owner-token="));
 if (process.env.PRIME_AGENT_TEST_STDIN_TTY) {
 	Object.defineProperty(process.stdin, "isTTY", { value: process.env.PRIME_AGENT_TEST_STDIN_TTY === "1" });
 }
@@ -18,6 +18,10 @@ if (process.env.PRIME_AGENT_INTERNAL_OWNED_WORKER === "1") {
 		writeFileSync(`${pidPath}.ppid`, `${process.ppid}\n`);
 		writeFileSync(`${pidPath}.profile`, `${process.env.PRIME_AGENT_INTERNAL_OWNED_PROFILE ?? ""}\n`);
 		writeFileSync(pidPath, `${process.pid}\n`);
+		const recoveryPath = process.env.PRIME_AGENT_INTERNAL_OWNED_RECOVERY_DESCRIPTOR;
+		const orphanPath = process.env.PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL;
+		if (recoveryPath) writeFileSync(`${pidPath}.recovery-path`, `${recoveryPath}\n`);
+		if (orphanPath) writeFileSync(`${pidPath}.orphan-path`, `${orphanPath}\n`);
 		process.once("SIGTERM", () => {
 			writeFileSync(`${pidPath}.terminated`, "terminated\n");
 			process.exit(0);
@@ -60,9 +64,15 @@ if (process.env.PRIME_AGENT_INTERNAL_OWNED_WORKER === "1") {
 								sessionId: "fixture-session",
 								sessionFile: `${pidPath}.jsonl`,
 								cwd: process.cwd(),
+								orphanProcessJournalGeneration:
+									process.env.PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL_GENERATION,
 								updatedAt: new Date().toISOString(),
 							})}\n`,
 						);
+					}
+					if (process.env.PRIME_AGENT_TEST_CORRUPT_ORPHAN_JOURNAL_ON_CRASH === "1") {
+						const orphanPath = process.env.PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL;
+						if (orphanPath) writeFileSync(orphanPath, "{not-json}\n");
 					}
 					process.exit(1);
 				}
@@ -95,5 +105,15 @@ if (process.env.PRIME_AGENT_INTERNAL_OWNED_WORKER === "1") {
 	if (pidPath) {
 		writeFileSync(`${pidPath}.frontend`, `${process.pid}\n`);
 	}
-	await maybeRunOwnedSessionWorkerFrontend(args);
+	await maybeRunOwnedSessionWorkerFrontend(
+		args,
+		false,
+		process.env.PRIME_AGENT_TEST_FAIL_OWNED_STARTUP_COMMIT === "1"
+			? {
+					beforeWorkerStartupCommit: () => {
+						throw new Error("owned startup commit failpoint");
+					},
+				}
+			: {},
+	);
 }

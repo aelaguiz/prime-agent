@@ -1,6 +1,6 @@
 # Python-Backed Skills
 
-A Python-backed skill is a regular markdown skill that also ships a Python package. Prime Agent installs the package editable into the kernel venv (`~/.prime/agent/kernel-venv` by default, `PRIME_AGENT_KERNEL_VENV` to override) and exposes it in the persistent IPython kernel, so the agent can call it directly instead of shelling out.
+A Python-backed skill is a regular markdown skill that also ships a Python package. Prime Agent installs the package editable into the kernel venv (`~/.prime/agent/kernel-venv` by default, `PRIME_AGENT_KERNEL_VENV` to override) and exposes it in the persistent Python kernel, so the agent can call it directly instead of shelling out.
 
 ## Detection Contract
 
@@ -38,9 +38,9 @@ Call directly from the kernel:
 
     await word_count("some text to analyze", top=3)
 
-Or from a shell cell:
+Or through the managed shell interface:
 
-    !word_count "some text to analyze" --top 3
+    await bash('word_count "some text to analyze" --top 3')
 ```
 
 **`pyproject.toml`**
@@ -100,14 +100,11 @@ The `[project.scripts]` entry pointing at `rlm.skill:cli` gives the skill a shel
 - `rlm.skill:cli` imports `<script_name>.run` and parses argv against its signature with `tyro`, awaits async results, and prints non-`None` return values.
 - `rlm` and `tyro` are already present in the kernel venv. Do **not** declare `prime-agent-runtime` as a dependency: it is bundled with Prime Agent, not published on PyPI, so declaring it breaks installs outside the kernel venv. The CLI entry point only works where the runtime is installed, i.e. inside the kernel venv.
 
-The agent can then use either form:
+The agent can then call the skill directly or invoke its CLI through the managed shell interface:
 
 ```python
 await word_count("prime agent", top=3)
-```
-
-```bash
-!word_count "prime agent" --top 3
+await bash('word_count "prime agent" --top 3')
 ```
 
 Omit `[project.scripts]` when a CLI is not needed.

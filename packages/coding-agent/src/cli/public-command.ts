@@ -1,5 +1,6 @@
+import { resolve } from "node:path";
 import chalk from "chalk";
-import { APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
+import { APP_NAME, expandTildePath, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
 import { AuthStorage } from "../core/auth-storage.js";
 import { runMcpManagementCommand } from "../core/mcp/mcp-command.js";
 import { SettingsManager } from "../core/settings-manager.js";
@@ -312,7 +313,7 @@ async function runMcpServeCommand(args: string[]): Promise<PublicCommandResult> 
 			} else if (arg === "--bind") {
 				bind = value;
 			} else {
-				daemonSocket = normalizeSocketPath(value);
+				daemonSocket = process.platform === "win32" ? normalizeSocketPath(value) : resolve(expandTildePath(value));
 			}
 			continue;
 		}

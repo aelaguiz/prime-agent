@@ -2,7 +2,7 @@
 
 This page collects day-to-day usage details that do not fit on the quickstart page.
 
-Prime Agent is built around one model-facing tool: a persistent IPython kernel. The kernel retains Python state across turns and acts as a control environment for file operations, project commands, installed Python skills, MCP-backed skills, and recursive subagents. The TypeScript host remains responsible for provider calls, session state, tool execution, scheduling, and child-agent lifecycles.
+Prime Agent is built around one model-facing tool: a persistent Python REPL kernel. The kernel retains Python state across turns and acts as a control environment for file operations, project commands, installed Python skills, MCP-backed skills, and recursive subagents. The TypeScript host remains responsible for provider calls, session state, tool execution, scheduling, and child-agent lifecycles.
 
 ## Interactive Mode
 
@@ -112,7 +112,7 @@ See [Sessions](sessions.md) and [Compaction](compaction.md) for details.
 
 Normal interactive sessions are persistent agents backed by isolated worker processes. `Ctrl+D` detaches and exits while leaving the current agent running; `Ctrl+X` with an empty prompt stops and archives that agent before exiting. Use `prime-agent agents`, `prime-agent list`, or `prime-agent attach <agent>` to find and reattach to running work. `prime-agent stop <agent>` stops one root agent from the shell, while `prime-agent shutdown` stops all workers and the local supervisor.
 
-Within a session, the model can delegate through the `rlm` callable already available in IPython:
+Within a session, the model can delegate through the `rlm` callable already available in the Python REPL:
 
 ```python
 # Spawn independent children. Each call returns at admission with a child handle,
@@ -190,9 +190,14 @@ prime-agent package list
 prime-agent package update [source]
 prime-agent update [--force]
 prime-agent config
+
+prime-agent mcp <add|get|list|remove>
+prime-agent mcp-serve [--stdio] [--bind <addr>] [--port <n>] [--daemon-socket <path>]
 ```
 
-See [Prime Agent Packages](packages.md) for package sources and security notes.
+See [Prime Agent Packages](packages.md) for package sources and security notes. See
+[MCP Integrations](mcp-integrations.md) for generic servers and trusted-network
+remote control; `--socket` remains an alias for `mcp-serve --daemon-socket`.
 
 ### Modes
 
@@ -352,7 +357,7 @@ prime-agent --model sonnet:high "Solve this complex problem"
 # Limit model cycling
 prime-agent --models "claude-*,gpt-4o"
 
-# Restrict to the built-in IPython tool
+# Restrict to the built-in Python REPL tool
 prime-agent --tools ipython -p "Review the code"
 ```
 
@@ -371,14 +376,14 @@ prime-agent --tools ipython -p "Review the code"
 | `PRIME_API_KEY` | Prime Inference API key; also used for trace sharing when it has `agent_traces` scope |
 | `PRIME_AGENT_TRACES_API_KEY` | Prime API key used only for opt-in trace sharing |
 | `PRIME_AGENT_TRACES_BASE_URL` | Override the Prime Agent trace upload API base URL |
-| `PRIME_AGENT_KERNEL_PYTHON` | Use an existing Python environment with `ipykernel` instead of bootstrapping `~/.prime/agent/kernel-venv` |
+| `PRIME_AGENT_KERNEL_PYTHON` | Use an existing Python environment with `prime-agent-runtime` instead of bootstrapping `~/.prime/agent/kernel-venv` |
 | `VISUAL`, `EDITOR` | External editor for Ctrl+G |
 
 The remaining `PI_*` variables are compatibility names still read by the current runtime. They do not change the application name, command, or default `~/.prime/agent` configuration path.
 
 ## Design Principles
 
-Prime Agent keeps the model-facing tool surface small while making the IPython runtime powerful and composable. The built-in `ipython` tool provides durable state, project command execution, Python skills, MCP-backed integrations, and the native `rlm` delegation API without presenting each capability as a separate model tool.
+Prime Agent keeps the model-facing tool surface small while making the Python REPL runtime powerful and composable. The built-in `ipython` tool provides durable state, project command execution, Python skills, MCP-backed integrations, and the native `rlm` delegation API without presenting each capability as a separate model tool.
 
 Recursive subagents are a core capability, not an optional extension. The TypeScript host owns every parent and child agent loop so recursion uses the same provider, session, tool, skill, scheduling, usage-accounting, and recovery infrastructure. The Python `rlm` package is a thin host bridge rather than a separate agent implementation.
 

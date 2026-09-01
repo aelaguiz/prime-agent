@@ -9,7 +9,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type Api, getLogger, type Model } from "@earendil-works/pi-ai";
@@ -39,7 +39,6 @@ import {
 	type AgentSessionMessageSender,
 	agentFamilyRelationship,
 	assertAgentFamilyReach,
-	assertAgentMessageQueueCapacity,
 	assertAgentSessionNameAvailable,
 	assertDirectAgentMessageTarget,
 	buildAgentFamilyRoster,
@@ -51,7 +50,6 @@ import {
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_CAPACITY,
 	DEFAULT_AGENT_MESSAGE_RATE_LIMIT_REFILL_MS,
 	formatAgentSessionNameUnavailable,
-	isAgentSessionMessagePrompt,
 	normalizeAgentSessionMessage,
 	sessionNameReservationKey,
 } from "../../core/agent-messages.js";
@@ -66,7 +64,7 @@ import {
 	normalizeObserveLimit,
 	normalizeObserveMaxChars,
 } from "../../core/agent-observe.js";
-import { type AgentSession, type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
+import { type PromptOptions, rlmChildLabel } from "../../core/agent-session.js";
 import { type AgentSessionRuntimeConfig, mergeAgentSessionRuntimeConfig } from "../../core/agent-session-config.js";
 import {
 	type AgentSessionRuntime,
@@ -88,7 +86,10 @@ import {
 	resolveHeartbeatStreamingBehavior,
 	shouldDeferHeartbeatCronJob,
 } from "../../core/cron-jobs.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV } from "../../core/orphan-process-journal.js";
+import {
+	ORPHAN_PROCESS_JOURNAL_ENV,
+	ORPHAN_PROCESS_JOURNAL_GENERATION_ENV,
+} from "../../core/orphan-process-journal.js";
 import {
 	markProcessLifecycleCompleted,
 	prepareProcessLifecycleLaunch,
@@ -103,7 +104,14 @@ import {
 	type SessionPassivationSnapshot,
 } from "../../core/session-action-store.js";
 import { deleteSessionArtifacts, deleteSessionFile } from "../../core/session-file-actions.js";
-import { acquireSessionLease, canonicalSessionPath, type SessionLease } from "../../core/session-lease.js";
+import { matchesSavedSessionSelector } from "../../core/session-id.js";
+import {
+	acquireSessionLease,
+	canonicalSessionPath,
+	createProcessIdentityOwnerToken,
+	isExactProcessStartId,
+	type SessionLease,
+} from "../../core/session-lease.js";
 import {
 	getSessionArtifactPathForFile,
 	readSessionInfo,
@@ -167,6 +175,7 @@ import {
 	UPDATE_RESTART_DRAIN_COMMANDS,
 } from "./daemon-protocol.js";
 import { getDaemonRuntimeIdentity } from "./daemon-runtime-identity.js";
+import { matchesSessionIdSuffix } from "./daemon-session-id.js";
 import {
 	buildRlmChildSnapshots,
 	buildSessionList,
@@ -186,7 +195,11 @@ import {
 	prepareDaemonSocketPath,
 	restrictDaemonSocketPath,
 } from "./daemon-socket.js";
-import { assertDaemonSupervisorOwnerCurrent, isDaemonShutdownAdmissionActive } from "./daemon-supervisor-ownership.js";
+import {
+	assertDaemonSupervisorOwnerCurrent,
+	assertDaemonSupervisorOwnerCurrentForWorkerAuthentication,
+	isDaemonShutdownAdmissionActive,
+} from "./daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
 	DAEMON_WORKER_RECOVERY_JOURNAL_ENV,
@@ -195,16 +208,20 @@ import {
 	DAEMON_WORKER_TOKEN_ENV,
 	type DaemonWorkerCommand,
 	type DaemonWorkerFrameHeader,
+	hasConsistentDaemonProcessIdentityProjection,
 	isDaemonWorkerFrameHeader,
 	SESSION_LEASE_OWNER_ID_ENV,
 	SESSION_LEASES_ENABLED_ENV,
 } from "./daemon-worker-protocol.js";
 import { MutationDrainLatch } from "./mutation-drain-latch.js";
 import {
+	canonicalRlmSessionsDir,
 	createRlmLedgerRegistrySeedSource,
+	type LegacyRlmSubagentRegistryEntry,
 	type RlmLedgerDeleteReason,
 	type RlmLedgerEdge,
 	RlmSpawnLedger,
+	readLegacyRlmSubagentRegistry as readLegacyRlmSubagentRegistryFile,
 } from "./rlm-ledger.js";
 import {
 	readRlmSubagentDisplayEntry,
@@ -349,6 +366,37 @@ const DAEMON_COMMAND_TYPES: ReadonlySet<string> = new Set([
 	"shutdown",
 ]);
 
+/** Commands that can open a runtime or admit new work into a session. */
+const DAEMON_WORK_ADMISSION_COMMAND_TYPES: ReadonlySet<DaemonCommand["type"]> = new Set([
+	"create",
+	"attach",
+	"prompt",
+	"prompt_and_wait",
+	"steer",
+	"follow_up",
+	"restore_next_turn",
+	"restore_actions",
+	"append_custom_message",
+	"resume_queue",
+	"send_message",
+	"start_side_question",
+	"execute_bash",
+	"execute_bash_and_wait",
+	"mutate_queued_message",
+	"cron_add",
+	"heartbeat_set",
+	"heartbeat_update",
+	"heartbeat_manage",
+	"compact",
+	"refine",
+	"reload",
+	"new_session",
+	"switch_session",
+	"fork",
+	"navigate_tree",
+	"import_jsonl",
+]);
+
 const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORTED_CLIENT_CAPABILITIES);
 const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
@@ -413,17 +461,6 @@ interface PassiveRlmSubagentEntry {
 	createdAt: number;
 }
 
-/**
- * Legacy per-parent `rlm-subagents.jsonl` entry shape, exactly as the daemon
- * wrote it before the spawn ledger became topology authority. Read-only:
- * registries are consumed only as the ledger seed source and as fallback
- * hydration metadata for pre-ledger children without a display file.
- */
-interface LegacyRlmSubagentRegistryEntry extends PassiveRlmSubagentEntry {
-	type: "rlm_subagent";
-	updatedAt: string;
-}
-
 /** Spread-ready optional metadata fields shared by display files and legacy registry entries. */
 function rlmSubagentMetadataFields(source: {
 	rlmMaxDepth?: number;
@@ -451,11 +488,36 @@ type PassiveRlmSubagent = PassiveRlmRoot & {
 	chain: PassiveRlmSubagentEntry[];
 };
 
+interface RlmDeletionAdmissionFence {
+	key: string;
+	holders: number;
+	childIds: Set<string>;
+	sessionPaths: Set<string>;
+	sessionIds: Set<string>;
+	sessionNames: Set<string>;
+	activeSessionIds: Set<string>;
+}
+
+interface DaemonWorkAdmission {
+	operation: string;
+	selectors: Set<string>;
+	states: Set<ActiveSessionState>;
+}
+
+class RlmDeletionAdmissionClosedError extends Error {}
 class RuntimeOpenCancelledError extends Error {}
 class BoundSessionUnavailableError extends Error {}
 
 export async function runDaemonMode(options: DaemonModeOptions): Promise<never> {
-	const socketPath = normalizeSocketPath(options.socketPath ?? defaultDaemonSocketPath());
+	const requestedSocketPath = options.socketPath ?? defaultDaemonSocketPath();
+	// macOS counts the lexical sockaddr_un bytes. A physical /private/var alias
+	// can exceed sun_path even when the generated /var worker address fits. Keep
+	// that short absolute bind address; every authority and comparison helper
+	// still resolves it to the one physical socket identity.
+	const socketPath =
+		options.worker && process.platform !== "win32"
+			? resolve(requestedSocketPath)
+			: normalizeSocketPath(requestedSocketPath);
 	setProcessLifecycleContext({
 		socketPath,
 		activeSessionId: options.worker?.restoreActiveSessionId,
@@ -498,6 +560,8 @@ export class AgentDaemon {
 	private readonly openingSessions = new Map<string, Promise<ActiveSessionState>>();
 	/** Covers path resolution through publication in openingSessions, before the runtime promise exists. */
 	private readonly reservingSessionOpens = new Map<string, Promise<void>>();
+	/** Canonical path fence shared by passive hydration, explicit opens, and offline mutations. */
+	private readonly mutatingSessionPaths = new Map<string, Promise<void>>();
 	private readonly bindingCompletions = new Map<string, Promise<void>>();
 	/**
 	 * Resolved-session-file keyed passivations let wake paths join after closeSessionOnce
@@ -538,13 +602,6 @@ export class AgentDaemon {
 	private readonly agentDir: string;
 	private readonly cronScheduler: AgentCronScheduler;
 	private readonly agentMessageRateLimiter = new AgentSessionMessageRateLimiter();
-	private readonly remoteAgentPeers = new Map<string, AgentSessionMessageAgentSummary>();
-	private readonly agentMessagePendingReservations = new Map<string, number>();
-	private readonly agentMessageTargetLocks = new Map<string, Promise<void>>();
-	private readonly agentMessageAcceptingTargets = new Set<string>();
-	// Refcount of prompts in preflight (accepted but not yet streaming); >0 makes
-	// concurrent agent messages queue instead of racing agent.prompt.
-	private readonly agentMessagePreparingTargets = new Map<string, number>();
 	// Sessions inserted into `sessions` but still awaiting extension binding;
 	// visible to host controllers during bind, excluded from targeting.
 	private readonly bindingSessions = new Set<string>();
@@ -572,8 +629,12 @@ export class AgentDaemon {
 	);
 	private readonly recoveryJournal?: WorkerRecoveryJournal;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
+	/** Immutable per-worker ledger/catalog directory, bound by the root create command. */
+	private canonicalWorkerSessionsDir?: string;
 	/** In-flight admission spawn appends, awaited (and consumed) by createRlmSubagentRuntime. */
 	private readonly pendingRlmSpawnAppends = new Map<string, Promise<void>>();
+	private readonly rlmDeletionAdmissionFences = new Map<string, RlmDeletionAdmissionFence>();
+	private readonly daemonWorkAdmissions = new Set<DaemonWorkAdmission>();
 
 	constructor(
 		private readonly socketPath: string,
@@ -778,12 +839,26 @@ export class AgentDaemon {
 		claim: SupervisorGenerationClaim,
 		validatedFingerprint?: string,
 	): Promise<string> {
-		return assertDaemonSupervisorOwnerCurrent(
+		if (claim.supervisorAuthorityProcessStartId) {
+			return assertDaemonSupervisorOwnerCurrent(
+				{
+					generation: claim.supervisorGeneration,
+					pid: claim.supervisorPid,
+					processStartId: claim.supervisorAuthorityProcessStartId,
+					socketPath: claim.supervisorSocketPath,
+				},
+				validatedFingerprint,
+			);
+		}
+		if (!claim.supervisorProcessStartId) {
+			return Promise.reject(new Error("worker_auth_version_incompatible"));
+		}
+		return assertDaemonSupervisorOwnerCurrentForWorkerAuthentication(
 			{
-				generation: claim.supervisorGeneration,
-				pid: claim.supervisorPid,
-				...(claim.supervisorProcessStartId ? { processStartId: claim.supervisorProcessStartId } : {}),
-				socketPath: claim.supervisorSocketPath,
+				supervisorGeneration: claim.supervisorGeneration,
+				supervisorPid: claim.supervisorPid,
+				supervisorProcessStartId: claim.supervisorProcessStartId,
+				supervisorSocketPath: claim.supervisorSocketPath,
 			},
 			validatedFingerprint,
 		);
@@ -834,6 +909,7 @@ export class AgentDaemon {
 			delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 			delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 			delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
+			delete environment[ORPHAN_PROCESS_JOURNAL_GENERATION_ENV];
 			delete environment[SESSION_LEASES_ENABLED_ENV];
 			delete environment[SESSION_LEASE_OWNER_ID_ENV];
 			const trigger = "worker_supervisor_recovery";
@@ -855,8 +931,10 @@ export class AgentDaemon {
 				socketPath: supervisorSocketPath,
 			});
 			let child: ReturnType<typeof spawn>;
+			const childIdentity = createProcessIdentityOwnerToken();
 			try {
 				child = spawn(launch.command, launch.args, {
+					argv0: childIdentity.argument,
 					cwd: this.options.defaultSessionConfig.cwd ?? process.cwd(),
 					detached: true,
 					env: preparedLaunch.environment,
@@ -976,7 +1054,44 @@ export class AgentDaemon {
 
 	/** Root sessions dir that keys this daemon's spawn ledger. */
 	private rlmLedgerSessionsDir(): string {
-		return this.options.defaultSessionConfig.sessionDir ?? getSessionsDir(this.agentDir);
+		if (this.options.worker && !this.canonicalWorkerSessionsDir) {
+			throw new Error("Daemon worker sessions directory is not bound to its root create command");
+		}
+		return (
+			this.canonicalWorkerSessionsDir ??
+			resolve(this.options.defaultSessionConfig.sessionDir ?? getSessionsDir(this.agentDir))
+		);
+	}
+
+	private workerScopedSessionsDir(requested?: string): string | undefined {
+		if (!this.options.worker) return requested;
+		const canonical = this.rlmLedgerSessionsDir();
+		if (requested !== undefined && canonicalRlmSessionsDir(requested) !== canonicalRlmSessionsDir(canonical)) {
+			throw new Error(
+				`Daemon worker is bound to sessions directory ${canonical}; refusing drift to ${resolve(requested)}`,
+			);
+		}
+		return canonical;
+	}
+
+	private bindWorkerSessionsDir(
+		command: Extract<DaemonCommand, { type: "create" }>,
+		config: AgentSessionRuntimeConfig,
+	): AgentSessionRuntimeConfig {
+		if (!this.options.worker) return config;
+		const agentDir = config.agentDir ?? this.agentDir;
+		const requested = resolve(command.config?.sessionDir ?? config.sessionDir ?? getSessionsDir(agentDir));
+		if (!this.canonicalWorkerSessionsDir) {
+			this.canonicalWorkerSessionsDir = requested;
+		} else if (
+			command.config?.sessionDir !== undefined &&
+			canonicalRlmSessionsDir(requested) !== canonicalRlmSessionsDir(this.canonicalWorkerSessionsDir)
+		) {
+			throw new Error(
+				`Daemon worker is bound to sessions directory ${this.canonicalWorkerSessionsDir}; refusing drift to ${requested}`,
+			);
+		}
+		return { ...config, sessionDir: this.canonicalWorkerSessionsDir };
 	}
 
 	/**
@@ -992,6 +1107,314 @@ export class AgentDaemon {
 			(message) => this.log(message),
 		);
 		return this.rlmSpawnLedgerInstance;
+	}
+
+	private daemonCommandWorkAdmissionSelectors(command: DaemonCommand): string[] {
+		if (!DAEMON_WORK_ADMISSION_COMMAND_TYPES.has(command.type)) return [];
+		if (command.type === "create") return command.sessionPath ? [command.sessionPath] : [];
+		if (command.type === "send_message") return [command.targetActiveSessionId];
+		return "activeSessionId" in command && typeof command.activeSessionId === "string"
+			? [command.activeSessionId]
+			: [];
+	}
+
+	private stateMatchesWorkAdmissionSelector(state: ActiveSessionState, selector: string): boolean {
+		const session = state.runtime.session;
+		const metadata = state.runtime.metadata;
+		if (
+			state.activeSessionId === selector ||
+			session.sessionId === selector ||
+			session.sessionName === selector ||
+			metadata.rlmChildId === selector ||
+			matchesSessionIdSuffix(state.activeSessionId, selector) ||
+			matchesSavedSessionSelector(session.sessionId, selector)
+		) {
+			return true;
+		}
+		return (
+			session.sessionFile !== undefined &&
+			canonicalSessionPath(session.sessionFile) === canonicalSessionPath(selector)
+		);
+	}
+
+	private stateBelongsToRlmDeletionFence(state: ActiveSessionState, fence: RlmDeletionAdmissionFence): boolean {
+		const session = state.runtime.session;
+		const metadata = state.runtime.metadata;
+		if (
+			fence.activeSessionIds.has(state.activeSessionId) ||
+			fence.sessionIds.has(session.sessionId) ||
+			(metadata.rlmChildId !== undefined && fence.childIds.has(metadata.rlmChildId)) ||
+			(session.sessionFile !== undefined && fence.sessionPaths.has(canonicalSessionPath(session.sessionFile)))
+		) {
+			return true;
+		}
+		const visited = new Set<string>();
+		let parentActiveSessionId = metadata.parentActiveSessionId;
+		while (parentActiveSessionId && !visited.has(parentActiveSessionId)) {
+			if (fence.activeSessionIds.has(parentActiveSessionId)) return true;
+			visited.add(parentActiveSessionId);
+			parentActiveSessionId = this.sessions.get(parentActiveSessionId)?.runtime.metadata.parentActiveSessionId;
+		}
+		return (
+			metadata.parentSessionFile !== undefined &&
+			fence.sessionPaths.has(canonicalSessionPath(metadata.parentSessionFile))
+		);
+	}
+
+	private selectorBelongsToRlmDeletionFence(selector: string, fence: RlmDeletionAdmissionFence): boolean {
+		if (
+			fence.activeSessionIds.has(selector) ||
+			fence.sessionIds.has(selector) ||
+			fence.sessionNames.has(selector) ||
+			fence.childIds.has(selector) ||
+			[...fence.activeSessionIds].some((id) => matchesSessionIdSuffix(id, selector)) ||
+			[...fence.sessionIds].some((id) => matchesSavedSessionSelector(id, selector))
+		) {
+			return true;
+		}
+		if (
+			(isAbsolute(selector) || selector.endsWith(".jsonl")) &&
+			fence.sessionPaths.has(canonicalSessionPath(selector))
+		) {
+			return true;
+		}
+		return [...this.sessions.values()].some(
+			(state) =>
+				this.stateMatchesWorkAdmissionSelector(state, selector) &&
+				this.stateBelongsToRlmDeletionFence(state, fence),
+		);
+	}
+
+	private assertWorkAdmissionOpen(selectors: Iterable<string>, operation: string): void {
+		for (const fence of this.rlmDeletionAdmissionFences.values()) {
+			for (const selector of selectors) {
+				if (this.selectorBelongsToRlmDeletionFence(selector, fence)) {
+					throw new RlmDeletionAdmissionClosedError(
+						`Cannot admit ${operation}: the target RLM subagent family is being deleted`,
+					);
+				}
+			}
+		}
+	}
+
+	private beginDaemonWorkAdmission(operation: string, selectors: Iterable<string>): () => void {
+		const selectorSet = new Set([...selectors].filter(Boolean));
+		if (selectorSet.size === 0) return () => {};
+		this.assertWorkAdmissionOpen(selectorSet, operation);
+		const admission: DaemonWorkAdmission = {
+			operation,
+			selectors: selectorSet,
+			states: new Set(
+				[...this.sessions.values()].filter((state) =>
+					[...selectorSet].some((selector) => this.stateMatchesWorkAdmissionSelector(state, selector)),
+				),
+			),
+		};
+		this.daemonWorkAdmissions.add(admission);
+		return () => this.daemonWorkAdmissions.delete(admission);
+	}
+
+	private daemonWorkAdmissionBelongsToFence(
+		admission: DaemonWorkAdmission,
+		fence: RlmDeletionAdmissionFence,
+	): boolean {
+		return (
+			[...admission.states].some((state) => this.stateBelongsToRlmDeletionFence(state, fence)) ||
+			[...admission.selectors].some((selector) => this.selectorBelongsToRlmDeletionFence(selector, fence))
+		);
+	}
+
+	private rlmDeletionAdmissionFenceKey(parentState: ActiveSessionState, childId: string): string {
+		const parentSession = parentState.runtime.session;
+		return JSON.stringify([
+			parentSession.sessionId,
+			parentSession.sessionFile ? canonicalSessionPath(parentSession.sessionFile) : parentState.activeSessionId,
+			childId,
+		]);
+	}
+
+	private async buildRlmDeletionAdmissionFence(
+		parentState: ActiveSessionState,
+		childId: string,
+	): Promise<RlmDeletionAdmissionFence> {
+		const parentSession = parentState.runtime.session;
+		const parentFile = parentSession.sessionFile;
+		const parentPath = parentFile ? canonicalSessionPath(parentFile) : undefined;
+		const childIds = new Set([childId]);
+		const sessionPaths = new Set<string>();
+		const sessionNames = new Set<string>();
+		if (parentPath) {
+			const edges = await this.rlmSpawnLedger().edges(true);
+			const childrenByParent = new Map<string, typeof edges>();
+			for (const edge of edges) {
+				const parent = canonicalSessionPath(edge.parent);
+				const children = childrenByParent.get(parent) ?? [];
+				children.push(edge);
+				childrenByParent.set(parent, children);
+			}
+			const familyPaths = new Set([parentPath]);
+			const familyQueue = [parentPath];
+			while (familyQueue.length > 0) {
+				for (const edge of childrenByParent.get(familyQueue.shift()!) ?? []) {
+					const child = canonicalSessionPath(edge.child);
+					if (familyPaths.has(child)) continue;
+					familyPaths.add(child);
+					familyQueue.push(child);
+				}
+			}
+			for (const edge of edges) {
+				const child = canonicalSessionPath(edge.child);
+				if (edge.childId !== childId || !familyPaths.has(child)) continue;
+				childIds.add(edge.childId);
+				sessionPaths.add(child);
+				if (edge.name) sessionNames.add(edge.name);
+			}
+			const descendantQueue = [...sessionPaths];
+			while (descendantQueue.length > 0) {
+				for (const edge of childrenByParent.get(descendantQueue.shift()!) ?? []) {
+					const child = canonicalSessionPath(edge.child);
+					if (sessionPaths.has(child)) continue;
+					childIds.add(edge.childId);
+					sessionPaths.add(child);
+					if (edge.name) sessionNames.add(edge.name);
+					descendantQueue.push(child);
+				}
+			}
+		}
+
+		const activeSessionIds = new Set<string>();
+		const sessionIds = new Set<string>();
+		let changed = true;
+		while (changed) {
+			changed = false;
+			for (const state of this.sessions.values()) {
+				const metadata = state.runtime.metadata;
+				const sessionFile = state.runtime.session.sessionFile;
+				const directChild =
+					metadata.kind === "subagent" &&
+					metadata.rlmChildId === childId &&
+					(metadata.parentActiveSessionId === parentState.activeSessionId ||
+						metadata.parentSessionId === parentSession.sessionId ||
+						(parentPath !== undefined &&
+							metadata.parentSessionFile !== undefined &&
+							canonicalSessionPath(metadata.parentSessionFile) === parentPath));
+				const descendant =
+					(metadata.parentActiveSessionId !== undefined && activeSessionIds.has(metadata.parentActiveSessionId)) ||
+					(sessionFile !== undefined && sessionPaths.has(canonicalSessionPath(sessionFile)));
+				if (!directChild && !descendant) continue;
+				if (!activeSessionIds.has(state.activeSessionId)) {
+					activeSessionIds.add(state.activeSessionId);
+					changed = true;
+				}
+				sessionIds.add(state.runtime.session.sessionId);
+				if (state.runtime.session.sessionName) sessionNames.add(state.runtime.session.sessionName);
+				if (metadata.rlmChildId) childIds.add(metadata.rlmChildId);
+				if (sessionFile) sessionPaths.add(canonicalSessionPath(sessionFile));
+			}
+		}
+		for (const sessionPath of sessionPaths) {
+			const info = await readSessionInfo(sessionPath);
+			if (!info) continue;
+			sessionIds.add(info.id);
+			if (info.name) sessionNames.add(info.name);
+		}
+		return {
+			key: this.rlmDeletionAdmissionFenceKey(parentState, childId),
+			holders: 0,
+			childIds,
+			sessionPaths,
+			sessionIds,
+			sessionNames,
+			activeSessionIds,
+		};
+	}
+
+	private async acquireRlmDeletionAdmissionFence(
+		parentState: ActiveSessionState,
+		childId: string,
+	): Promise<{ fence: RlmDeletionAdmissionFence; release: () => void }> {
+		const key = this.rlmDeletionAdmissionFenceKey(parentState, childId);
+		const existing = this.rlmDeletionAdmissionFences.get(key);
+		if (existing) {
+			existing.holders++;
+			let released = false;
+			return {
+				fence: existing,
+				release: () => {
+					if (released) return;
+					released = true;
+					existing.holders--;
+					if (existing.holders === 0 && this.rlmDeletionAdmissionFences.get(key) === existing) {
+						this.rlmDeletionAdmissionFences.delete(key);
+					}
+				},
+			};
+		}
+		const candidate = await this.buildRlmDeletionAdmissionFence(parentState, childId);
+		const fence = this.rlmDeletionAdmissionFences.get(candidate.key) ?? candidate;
+		if (fence === candidate) {
+			this.rlmDeletionAdmissionFences.set(candidate.key, candidate);
+		} else {
+			for (const value of candidate.childIds) fence.childIds.add(value);
+			for (const value of candidate.sessionPaths) fence.sessionPaths.add(value);
+			for (const value of candidate.sessionIds) fence.sessionIds.add(value);
+			for (const value of candidate.sessionNames) fence.sessionNames.add(value);
+			for (const value of candidate.activeSessionIds) fence.activeSessionIds.add(value);
+		}
+		fence.holders++;
+		let released = false;
+		return {
+			fence,
+			release: () => {
+				if (released) return;
+				released = true;
+				fence.holders--;
+				if (fence.holders === 0 && this.rlmDeletionAdmissionFences.get(fence.key) === fence) {
+					this.rlmDeletionAdmissionFences.delete(fence.key);
+				}
+			},
+		};
+	}
+
+	private async withRlmDeletionAdmissionFence<T>(
+		parentState: ActiveSessionState,
+		childId: string,
+		deleteFamily: (isFamilyBusy: () => boolean) => Promise<T>,
+	): Promise<T> {
+		const { fence, release } = await this.acquireRlmDeletionAdmissionFence(parentState, childId);
+		try {
+			return await deleteFamily(() => this.isRlmDeletionFamilyBusy(fence));
+		} finally {
+			release();
+		}
+	}
+
+	private isRlmDeletionFamilyBusy(fence: RlmDeletionAdmissionFence): boolean {
+		for (const state of this.sessions.values()) {
+			if (!this.stateBelongsToRlmDeletionFence(state, fence)) continue;
+			const session = state.runtime.session;
+			if (
+				this.bindingSessions.has(state.activeSessionId) ||
+				this.closingSessions.has(state.activeSessionId) ||
+				isActiveSessionBusy(state) ||
+				session.isStreaming ||
+				session.isCompacting ||
+				session.isBashRunning ||
+				state.inFlightBash !== undefined ||
+				session.isRetrying ||
+				session.hasAcceptedPromptInFlight ||
+				session.unfinishedActionCount > 0
+			) {
+				return true;
+			}
+			const actions = session.getSessionActionSnapshot();
+			if (actions.queuedCount > 0 || actions.steering.length > 0 || actions.followUps.length > 0) return true;
+			if ([...this.sideQuestionRuns.values()].some((run) => run.activeSessionId === state.activeSessionId))
+				return true;
+		}
+		return [...this.daemonWorkAdmissions].some((admission) =>
+			this.daemonWorkAdmissionBelongsToFence(admission, fence),
+		);
 	}
 
 	private async appendRlmLedgerRenameForState(state: ActiveSessionState, name: string): Promise<void> {
@@ -1012,50 +1435,14 @@ export class AgentDaemon {
 		return join(getSessionArtifactPathForFile(parentSessionFile, parentSessionId), RLM_SUBAGENT_REGISTRY_FILE);
 	}
 
-	private async readLegacyRlmSubagentRegistry(
+	private readLegacyRlmSubagentRegistry(
 		path: string,
 		throwOnReadError = false,
 	): Promise<LegacyRlmSubagentRegistryEntry[]> {
-		let lines: string[];
-		try {
-			lines = (await readFile(path, "utf8")).split(/\r?\n/);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-				this.log(`failed to read RLM subagent registry: ${error instanceof Error ? error.message : String(error)}`);
-				if (throwOnReadError) {
-					throw error;
-				}
-			}
-			return [];
-		}
-		const latest = new Map<string, LegacyRlmSubagentRegistryEntry>();
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) {
-				continue;
-			}
-			try {
-				const entry = JSON.parse(trimmed) as Partial<LegacyRlmSubagentRegistryEntry>;
-				if (
-					entry.type !== "rlm_subagent" ||
-					typeof entry.childId !== "string" ||
-					typeof entry.sessionName !== "string" ||
-					typeof entry.sessionDir !== "string" ||
-					typeof entry.sessionFile !== "string" ||
-					(entry.status !== "running" && entry.status !== "completed" && entry.status !== "deleted") ||
-					(entry.rlmDepth !== undefined && (!Number.isSafeInteger(entry.rlmDepth) || entry.rlmDepth < 0)) ||
-					(entry.rlmMaxDepth !== undefined && (!Number.isSafeInteger(entry.rlmMaxDepth) || entry.rlmMaxDepth < 0))
-				) {
-					continue;
-				}
-				latest.set(entry.childId, entry as LegacyRlmSubagentRegistryEntry);
-			} catch (error) {
-				this.log(
-					`ignored malformed RLM subagent registry entry: ${error instanceof Error ? error.message : String(error)}`,
-				);
-			}
-		}
-		return [...latest.values()];
+		return readLegacyRlmSubagentRegistryFile(path, {
+			throwOnReadError,
+			log: (message) => this.log(message),
+		});
 	}
 
 	/**
@@ -1259,7 +1646,7 @@ export class AgentDaemon {
 				? { sessionDir: source.sessionDir, sessionFile: source.sessionFile }
 				: {}),
 			...rlmSubagentMetadataFields(source),
-			status: source.status,
+			status: source.status === "deleted" ? "completed" : source.status,
 			createdAt: source.createdAt,
 		});
 		const display = await readRlmSubagentDisplayEntry(dirname(edge.child));
@@ -1575,11 +1962,113 @@ export class AgentDaemon {
 		}
 	}
 
+	private sessionPathOperationKey(sessionPath: string): string {
+		return canonicalSessionPath(sessionPath);
+	}
+
+	private async assertAuthoritativeNestedDeletionEdge(
+		ledger: RlmSpawnLedger,
+		targetPath: string,
+		contextState: ActiveSessionState | undefined,
+	): Promise<RlmLedgerEdge> {
+		const edge = await ledger.edgeByChildPath(targetPath);
+		if (!edge) {
+			throw new Error(`No authoritative RLM ledger edge contains child session ${targetPath}`);
+		}
+		const contextFile = contextState?.runtime.session.sessionFile;
+		if (!contextFile) {
+			throw new Error(`Cannot verify RLM ledger parent edge for ${targetPath} without a resident worker context`);
+		}
+		const contextPath = canonicalSessionPath(contextFile);
+		const edges = await ledger.edges(true);
+		const edgesByChild = new Map<string, RlmLedgerEdge[]>();
+		for (const candidate of edges) {
+			const childPath = canonicalSessionPath(candidate.child);
+			const matches = edgesByChild.get(childPath) ?? [];
+			matches.push(candidate);
+			edgesByChild.set(childPath, matches);
+		}
+		const visited = new Set([canonicalSessionPath(edge.child)]);
+		let parentPath = canonicalSessionPath(edge.parent);
+		while (parentPath !== contextPath) {
+			if (visited.has(parentPath)) {
+				throw new Error(`RLM ledger parent edge for ${targetPath} contains a cycle`);
+			}
+			visited.add(parentPath);
+			const parentEdges = edgesByChild.get(parentPath) ?? [];
+			if (parentEdges.length !== 1) {
+				throw new Error(`RLM ledger parent edge for ${targetPath} does not reach worker context ${contextPath}`);
+			}
+			parentPath = canonicalSessionPath(parentEdges[0]!.parent);
+		}
+		return edge;
+	}
+
+	private async waitForSessionPathMutation(sessionPath: string): Promise<boolean> {
+		const mutation = this.mutatingSessionPaths.get(this.sessionPathOperationKey(sessionPath));
+		if (!mutation) return false;
+		await mutation;
+		return true;
+	}
+
+	private async withSessionPathMutation<T>(
+		sessionPath: string,
+		action: (canonicalPath: string) => Promise<T>,
+	): Promise<T> {
+		const canonicalPath = this.sessionPathOperationKey(sessionPath);
+		const existingMutation = this.mutatingSessionPaths.get(canonicalPath);
+		if (existingMutation) {
+			await existingMutation;
+			return this.withSessionPathMutation(canonicalPath, action);
+		}
+		const openReservation = this.reservingSessionOpens.get(canonicalPath);
+		if (openReservation) {
+			await openReservation;
+			return this.withSessionPathMutation(canonicalPath, action);
+		}
+		const opening = this.openingSessions.get(canonicalPath);
+		if (opening) {
+			await opening;
+			return this.withSessionPathMutation(canonicalPath, action);
+		}
+		const passivation = this.passivatingSessions.get(canonicalPath);
+		if (passivation) {
+			await passivation;
+			return this.withSessionPathMutation(canonicalPath, action);
+		}
+
+		let resolveBarrier!: () => void;
+		let rejectBarrier!: (error: unknown) => void;
+		const barrier = new Promise<void>((resolve, reject) => {
+			resolveBarrier = resolve;
+			rejectBarrier = reject;
+		});
+		// The mutation caller observes the source rejection; this attached handler
+		// prevents a rejected barrier with no racing opener from becoming unhandled.
+		void barrier.catch(() => undefined);
+		this.mutatingSessionPaths.set(canonicalPath, barrier);
+		try {
+			const result = await action(canonicalPath);
+			resolveBarrier();
+			return result;
+		} catch (error) {
+			rejectBarrier(error);
+			throw error;
+		} finally {
+			if (this.mutatingSessionPaths.get(canonicalPath) === barrier) {
+				this.mutatingSessionPaths.delete(canonicalPath);
+			}
+		}
+	}
+
 	private async createRuntime(
 		command: Extract<DaemonCommand, { type: "create" }>,
 		runtimeOpenGuard?: RuntimeOpenGuard,
 	): Promise<ActiveSessionState> {
-		const config = mergeAgentSessionRuntimeConfig(this.options.defaultSessionConfig, command.config);
+		const config = this.bindWorkerSessionsDir(
+			command,
+			mergeAgentSessionRuntimeConfig(this.options.defaultSessionConfig, command.config),
+		);
 		if (!config.cwd) {
 			throw new Error("Active session config is missing cwd");
 		}
@@ -1594,9 +2083,12 @@ export class AgentDaemon {
 		const sessionPath = command.sessionPath
 			? await resolveDaemonSessionPath(command.sessionPath, cwd, config.sessionDir)
 			: undefined;
-		const sessionKey = sessionPath ? resolve(sessionPath) : undefined;
+		const sessionKey = sessionPath ? this.sessionPathOperationKey(sessionPath) : undefined;
 		if (sessionKey && this.findPassivationBySessionFile(sessionKey)) {
 			await this.waitForPassivation(sessionKey);
+			return this.createRuntime(command, runtimeOpenGuard);
+		}
+		if (sessionKey && (await this.waitForSessionPathMutation(sessionKey))) {
 			return this.createRuntime(command, runtimeOpenGuard);
 		}
 		const pending = sessionKey ? this.openingSessions.get(sessionKey) : undefined;
@@ -1668,6 +2160,9 @@ export class AgentDaemon {
 
 		let releaseOpenReservation = () => {};
 		if (sessionKey) {
+			if (await this.waitForSessionPathMutation(sessionKey)) {
+				return this.createRuntime(command, runtimeOpenGuard);
+			}
 			const reservation = this.reservingSessionOpens.get(sessionKey);
 			if (reservation) {
 				await reservation;
@@ -1807,7 +2302,12 @@ export class AgentDaemon {
 			releaseOpenReservation();
 			return createState();
 		}
-		const openedSessionKey = resolve(sessionFile);
+		const openedSessionKey = this.sessionPathOperationKey(sessionFile);
+		if (await this.waitForSessionPathMutation(openedSessionKey)) {
+			sessionLease?.release();
+			releaseOpenReservation();
+			return this.createRuntime({ ...command, sessionPath: sessionFile }, runtimeOpenGuard);
+		}
 		if (this.openingSessions.has(openedSessionKey)) {
 			sessionLease?.release();
 			releaseOpenReservation();
@@ -1837,18 +2337,17 @@ export class AgentDaemon {
 		if (!state || !runnableJob || !this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 			return "skipped";
 		}
-		const session = state.runtime.session;
-		const isAgentMessagePromptInProgress =
-			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
-			this.agentMessagePreparingTargets.has(state.activeSessionId);
-		if (isHeartbeatCronJob(runnableJob) && isAgentMessagePromptInProgress) {
-			return "skipped";
+		try {
+			this.assertWorkAdmissionOpen([state.activeSessionId], "cron job");
+		} catch (error) {
+			if (error instanceof RlmDeletionAdmissionClosedError) return "skipped";
+			throw error;
 		}
+		const session = state.runtime.session;
 		if (shouldDeferHeartbeatCronJob(runnableJob, session)) {
 			return "skipped";
 		}
 		const shouldQueueCronPrompt =
-			isAgentMessagePromptInProgress ||
 			session.isStreaming ||
 			session.isCompacting ||
 			session.isRetrying ||
@@ -1857,6 +2356,12 @@ export class AgentDaemon {
 		if (!isHeartbeatCronJob(runnableJob) && shouldQueueCronPrompt) {
 			if (!this.isCronJobRunnableForState(runnableJob, state, requirePersistedJob)) {
 				return "skipped";
+			}
+			try {
+				this.assertWorkAdmissionOpen([state.activeSessionId], "cron job");
+			} catch (error) {
+				if (error instanceof RlmDeletionAdmissionClosedError) return "skipped";
+				throw error;
 			}
 			await session.followUp(runnableJob.prompt, undefined, {
 				resumeIfIdle: true,
@@ -1867,149 +2372,44 @@ export class AgentDaemon {
 			const current = requirePersistedJob ? this.getRunnableCronJob(job.id) : runnableJob;
 			return current && this.isCronJobRunnableForState(current, state, requirePersistedJob) ? current : undefined;
 		};
-		if (isHeartbeatCronJob(runnableJob)) {
-			const streamingBehavior = resolveHeartbeatStreamingBehavior(runnableJob.deliveryMode);
-			const didPrompt = await this.promptHeartbeatWithAgentMessagePreparingGuard(
-				state,
-				runnableJob,
-				{
-					streamingBehavior,
-					followUpQueueKey: `heartbeat:${runnableJob.id}`,
-					source: "rpc",
-				},
-				getRunnableJob,
-			);
-			return didPrompt ? undefined : "skipped";
+		const current = getRunnableJob();
+		if (!current) {
+			return "skipped";
 		}
-		const canPrompt = () => getRunnableJob() !== undefined;
-		const didPrompt = await this.promptWithAgentMessagePreparingGuard(
-			state,
-			runnableJob.prompt,
-			{
+		// Re-check after the session admission fence wait: the job may have been cancelled, completed, or updated meanwhile.
+		const unrunnableAtAdmission = new Error("Cron job became unrunnable before admission");
+		const admissionCommitted = () => {
+			this.assertWorkAdmissionOpen([state.activeSessionId], "cron job");
+			const refreshed = getRunnableJob();
+			if (!refreshed || refreshed.prompt !== current.prompt || refreshed.deliveryMode !== current.deliveryMode) {
+				throw unrunnableAtAdmission;
+			}
+		};
+		try {
+			if (isHeartbeatCronJob(current)) {
+				await session.promptHeartbeat(current, {
+					streamingBehavior: resolveHeartbeatStreamingBehavior(current.deliveryMode),
+					followUpQueueKey: `heartbeat:${current.id}`,
+					source: "rpc",
+					admissionCommitted,
+				});
+				return;
+			}
+			await session.promptUntilAccepted(current.prompt, {
 				streamingBehavior: "followUp",
 				source: "rpc",
-			},
-			canPrompt,
-			false,
-		);
-		return didPrompt ? undefined : "skipped";
+				admissionCommitted,
+			});
+		} catch (error) {
+			if (error === unrunnableAtAdmission || error instanceof RlmDeletionAdmissionClosedError) {
+				return "skipped";
+			}
+			throw error;
+		}
 	}
 
 	private getRunnableCronJob(jobId: string): AgentCronJob | undefined {
 		return this.cronStore.getClaimedJob(jobId) ?? this.cronStore.getDueJob(jobId);
-	}
-
-	// Wraps session.prompt so the target counts as "preparing" until the turn
-	// starts streaming (or the prompt settles); concurrent agent messages queue
-	// instead of racing agent.prompt during the preflight awaits. Refcounted so
-	// overlapping prompts each hold their own registration.
-	private async promptWithAgentMessagePreparingGuard(
-		state: ActiveSessionState,
-		message: string,
-		options?: PromptOptions,
-		canPrompt?: () => boolean,
-		waitForCompletion = true,
-	): Promise<boolean> {
-		return this.withAgentMessagePreparingGuard(
-			state,
-			(session, clearPreparing) => {
-				const prompt =
-					options?.agentMessageId !== undefined && options.expandPromptTemplates === false
-						? session.acceptAgentMessagePrompt.bind(session)
-						: waitForCompletion
-							? (session.promptAndWait ?? session.prompt).bind(session)
-							: (session.promptUntilAccepted ?? session.prompt).bind(session);
-				return prompt(message, {
-					...options,
-					preflightResult: (didSucceed, queued) => {
-						if (didSucceed && session.isStreaming) {
-							clearPreparing();
-						}
-						options?.preflightResult?.(didSucceed, queued);
-					},
-				});
-			},
-			canPrompt,
-			options?.signal,
-		);
-	}
-
-	private async promptHeartbeatWithAgentMessagePreparingGuard(
-		state: ActiveSessionState,
-		job: AgentCronJob,
-		options?: PromptOptions,
-		getPromptJob?: () => AgentCronJob | undefined,
-	): Promise<boolean> {
-		let promptJob = job;
-		return this.withAgentMessagePreparingGuard(
-			state,
-			(session, clearPreparing) =>
-				session.promptHeartbeat(promptJob, {
-					...options,
-					preflightResult: (didSucceed) => {
-						if (didSucceed && session.isStreaming) {
-							clearPreparing();
-						}
-						options?.preflightResult?.(didSucceed);
-					},
-				}),
-			() => {
-				if (!getPromptJob) {
-					return true;
-				}
-				const current = getPromptJob();
-				if (!current) {
-					return false;
-				}
-				promptJob = current;
-				return true;
-			},
-		);
-	}
-
-	private async withAgentMessagePreparingGuard(
-		state: ActiveSessionState,
-		run: (session: AgentSession, clearPreparing: () => void) => Promise<void>,
-		canRun?: () => boolean,
-		signal?: AbortSignal,
-	): Promise<boolean> {
-		const activeSessionId = state.activeSessionId;
-		this.agentMessagePreparingTargets.set(
-			activeSessionId,
-			(this.agentMessagePreparingTargets.get(activeSessionId) ?? 0) + 1,
-		);
-		let cleared = false;
-		const clearPreparing = () => {
-			if (cleared) {
-				return;
-			}
-			cleared = true;
-			const next = (this.agentMessagePreparingTargets.get(activeSessionId) ?? 1) - 1;
-			if (next <= 0) {
-				this.agentMessagePreparingTargets.delete(activeSessionId);
-			} else {
-				this.agentMessagePreparingTargets.set(activeSessionId, next);
-			}
-		};
-		try {
-			const targetLock = this.agentMessageTargetLocks.get(activeSessionId);
-			if (targetLock)
-				await waitForPromptAdmission(
-					targetLock.catch(() => undefined),
-					signal,
-				);
-			if (this.sessions.get(activeSessionId) !== state || this.closingSessions.has(activeSessionId)) {
-				throw new Error("Target session is closing before prompt delivery");
-			}
-			if (canRun && !canRun()) {
-				return false;
-			}
-			const session = state.runtime.session;
-			await run(session, clearPreparing);
-			return true;
-		} finally {
-			clearPreparing();
-		}
 	}
 
 	private createCronJobForState(state: ActiveSessionState, schedule: string, prompt: string): AgentCronJob {
@@ -2448,6 +2848,10 @@ export class AgentDaemon {
 	}
 
 	private async getOrHydrateBoundSessionState(id: string): Promise<ActiveSessionState> {
+		// A non-path selector can spend time resolving passive topology while a
+		// canonical-path mutation finishes. Retain the entry snapshot so that
+		// lookup still joins (and observes failure from) the mutation it raced.
+		const mutationSnapshot = new Map(this.mutatingSessionPaths);
 		let lookupError: unknown;
 		try {
 			return this.getBoundSessionState(id);
@@ -2462,6 +2866,12 @@ export class AgentDaemon {
 		}
 		const passiveSubagent = await this.findPassiveRlmSubagent(id);
 		if (passiveSubagent) {
+			const sessionKey = this.sessionPathOperationKey(passiveSubagent.entry.sessionFile);
+			const racedMutation = mutationSnapshot.get(sessionKey) ?? this.mutatingSessionPaths.get(sessionKey);
+			if (racedMutation) {
+				await racedMutation;
+				return this.getOrHydrateBoundSessionState(id);
+			}
 			return this.hydratePassiveRlmSubagent(passiveSubagent);
 		}
 		const hydratingChild = [...this.sessions.values()].find(
@@ -2494,6 +2904,8 @@ export class AgentDaemon {
 	private createSubagentRuntimeHost(parentState: ActiveSessionState): SubagentRuntimeHost {
 		return {
 			createRlmSubagentRuntime: async (options) => this.createRlmSubagentRuntime(parentState, options),
+			withRlmSubagentDeletion: async (childId, deleteFamily) =>
+				this.withRlmDeletionAdmissionFence(parentState, childId, deleteFamily),
 			completeRlmSubagentRuntime: (childId, session) => {
 				const state = [...this.sessions.values()].find(
 					(candidate) =>
@@ -2522,110 +2934,116 @@ export class AgentDaemon {
 				});
 			},
 			releaseRlmSubagentRuntime: async (runtime, options, status) => {
-				// Persist the deletion boundary first, but never let a registry failure
-				// strand the cancelled child as a stale resident session.
-				let deletionError: unknown;
-				if (status === "cancelled") {
-					try {
-						await this.recordRlmSubagentDeletion(parentState, options.id, "revoked");
-					} catch (error) {
-						deletionError = error;
-					}
-				}
-				const state = [...this.sessions.values()].find(
-					(candidate) =>
-						candidate.runtime.metadata.kind === "subagent" &&
-						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
-						candidate.runtime.metadata.rlmChildId === options.id &&
-						candidate.runtime.session === runtime.session,
-				);
-				try {
-					if (state) {
-						await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
-					} else {
-						await runtime.session.disposeAsync();
-					}
-				} finally {
-					// Sweep even when teardown throws (see deleteRlmSubagentRuntime);
-					// never throws, so it cannot mask a teardown error.
-					if (status === "cancelled" && deletionError === undefined) {
-						const childSessionFile = runtime.session?.sessionFile;
-						if (childSessionFile) {
-							await this.deleteRlmSubagentArtifacts(options.id, childSessionFile);
+				const releaseRuntime = async () => {
+					// Persist the deletion boundary first, but never let a registry failure
+					// strand the cancelled child as a stale resident session.
+					let deletionError: unknown;
+					if (status === "cancelled") {
+						try {
+							await this.recordRlmSubagentDeletion(parentState, options.id, "revoked");
+						} catch (error) {
+							deletionError = error;
 						}
 					}
-				}
-				if (deletionError !== undefined) throw deletionError;
-			},
-			deleteRlmSubagentRuntime: async (childId, session) => {
-				const state = [...this.sessions.values()].find(
-					(candidate) =>
-						candidate.runtime.metadata.kind === "subagent" &&
-						candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
-						candidate.runtime.metadata.rlmChildId === childId,
-				);
-				const parentFile = parentState.runtime.session.sessionFile;
-				const parentPath = parentFile ? canonicalSessionPath(parentFile) : undefined;
-				// Tombstoned edges included: a retried delete must still resolve the
-				// child's path so its scheduled jobs get cancelled.
-				const persistedEdge = parentPath
-					? (await this.rlmSpawnLedger().edges(true)).find(
-							(edge) => edge.childId === childId && canonicalSessionPath(edge.parent) === parentPath,
-						)
-					: undefined;
-				// The writer-recorded path (not the ledger's realpath-canonical one)
-				// keys the cron store and residency maps.
-				const persisted =
-					persistedEdge && parentFile
-						? await this.passiveRlmSubagentEntryForEdge(persistedEdge, {
-								sessionId: parentState.runtime.session.sessionId,
-								sessionFile: parentFile,
-							})
-						: undefined;
-				// Pre-ledger children have no edge at all (tombstoned or live): the
-				// legacy registry (including its tombstones) is the last path source.
-				const legacyFallback =
-					!persisted && !state && parentFile
-						? (
-								await this.readLegacyRlmSubagentRegistry(
-									this.legacyRlmSubagentRegistryPath(parentFile, parentState.runtime.session.sessionId),
-								)
-							).find((entry) => entry.childId === childId)
-						: undefined;
-				const childSessionFile =
-					persisted?.sessionFile ?? state?.runtime.session.sessionFile ?? legacyFallback?.sessionFile;
-				// Persist the deletion boundary before tearing down the runtime.
-				await this.recordRlmSubagentDeletion(parentState, childId);
-				const staleSession = state && session && state.runtime.session !== session ? session : undefined;
-				try {
+					const state = [...this.sessions.values()].find(
+						(candidate) =>
+							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+							candidate.runtime.metadata.rlmChildId === options.id &&
+							candidate.runtime.session === runtime.session,
+					);
 					try {
 						if (state) {
-							await this.closeSession(state, "killed", false);
+							await this.closeSession(state, status === "cancelled" ? "killed" : "completed");
 						} else {
-							await session?.disposeAsync();
+							await runtime.session.disposeAsync();
 						}
 					} finally {
-						await staleSession?.disposeAsync();
-					}
-				} finally {
-					// Runs even when teardown throws: the jobs-cancel rewrite and the
-					// kernel dispose's final snapshot flush may have already happened,
-					// resurrecting the artifact dir swept in recordRlmSubagentDeletion.
-					// A killed close can join a passivation close that already skipped
-					// killed cleanup. Neither step may throw here: a jobs-store error
-					// would mask the teardown error and skip the sweep.
-					if (childSessionFile) {
-						try {
-							this.cancelScheduledJobsForSessionFile(childSessionFile);
-						} catch (error) {
-							this.log(
-								`failed to cancel scheduled jobs for deleted RLM subagent ${childId}: ${error instanceof Error ? error.message : String(error)}`,
-							);
+						// Sweep even when teardown throws (see deleteRlmSubagentRuntime);
+						// never throws, so it cannot mask a teardown error.
+						if (status === "cancelled" && deletionError === undefined) {
+							const childSessionFile = runtime.session?.sessionFile;
+							if (childSessionFile) {
+								await this.deleteRlmSubagentArtifacts(options.id, childSessionFile);
+							}
 						}
-						await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
 					}
-				}
+					if (deletionError !== undefined) throw deletionError;
+				};
+				return status === "cancelled"
+					? this.withRlmDeletionAdmissionFence(parentState, options.id, async () => releaseRuntime())
+					: releaseRuntime();
 			},
+			deleteRlmSubagentRuntime: async (childId, session) =>
+				this.withRlmDeletionAdmissionFence(parentState, childId, async () => {
+					const state = [...this.sessions.values()].find(
+						(candidate) =>
+							candidate.runtime.metadata.kind === "subagent" &&
+							candidate.runtime.metadata.parentActiveSessionId === parentState.activeSessionId &&
+							candidate.runtime.metadata.rlmChildId === childId,
+					);
+					const parentFile = parentState.runtime.session.sessionFile;
+					const parentPath = parentFile ? canonicalSessionPath(parentFile) : undefined;
+					// Tombstoned edges included: a retried delete must still resolve the
+					// child's path so its scheduled jobs get cancelled.
+					const persistedEdge = parentPath
+						? (await this.rlmSpawnLedger().edges(true)).find(
+								(edge) => edge.childId === childId && canonicalSessionPath(edge.parent) === parentPath,
+							)
+						: undefined;
+					// The writer-recorded path (not the ledger's realpath-canonical one)
+					// keys the cron store and residency maps.
+					const persisted =
+						persistedEdge && parentFile
+							? await this.passiveRlmSubagentEntryForEdge(persistedEdge, {
+									sessionId: parentState.runtime.session.sessionId,
+									sessionFile: parentFile,
+								})
+							: undefined;
+					// Pre-ledger children have no edge at all (tombstoned or live): the
+					// legacy registry (including its tombstones) is the last path source.
+					const legacyFallback =
+						!persisted && !state && parentFile
+							? (
+									await this.readLegacyRlmSubagentRegistry(
+										this.legacyRlmSubagentRegistryPath(parentFile, parentState.runtime.session.sessionId),
+									)
+								).find((entry) => entry.childId === childId)
+							: undefined;
+					const childSessionFile =
+						persisted?.sessionFile ?? state?.runtime.session.sessionFile ?? legacyFallback?.sessionFile;
+					// Persist the deletion boundary before tearing down the runtime.
+					await this.recordRlmSubagentDeletion(parentState, childId);
+					const staleSession = state && session && state.runtime.session !== session ? session : undefined;
+					try {
+						try {
+							if (state) {
+								await this.closeSession(state, "killed", false);
+							} else {
+								await session?.disposeAsync();
+							}
+						} finally {
+							await staleSession?.disposeAsync();
+						}
+					} finally {
+						// Runs even when teardown throws: the jobs-cancel rewrite and the
+						// kernel dispose's final snapshot flush may have already happened,
+						// resurrecting the artifact dir swept in recordRlmSubagentDeletion.
+						// A killed close can join a passivation close that already skipped
+						// killed cleanup. Neither step may throw here: a jobs-store error
+						// would mask the teardown error and skip the sweep.
+						if (childSessionFile) {
+							try {
+								this.cancelScheduledJobsForSessionFile(childSessionFile);
+							} catch (error) {
+								this.log(
+									`failed to cancel scheduled jobs for deleted RLM subagent ${childId}: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							}
+							await this.deleteRlmSubagentArtifacts(childId, childSessionFile);
+						}
+					}
+				}),
 			disposeRlmSubagentRuntimes: async () => {
 				const cascadeError = await this.closeChildSessions(parentState, "replaced");
 				if (cascadeError) {
@@ -2795,13 +3213,9 @@ export class AgentDaemon {
 					job.status !== "completed",
 			);
 		const hasPendingAdmission =
-			this.agentMessageAcceptingTargets.has(state.activeSessionId) ||
-			this.agentMessagePreparingTargets.has(state.activeSessionId) ||
-			this.agentMessageTargetLocks.has(state.activeSessionId) ||
 			[...this.promptAdmissions.values()].some(
 				(admission) => admission.activeSessionId === state.activeSessionId && admission.status !== "cancelled",
-			) ||
-			state.runtime.session.hasPendingAdmissionWaiters;
+			) || state.runtime.session.hasPendingAdmissionWaiters;
 		return {
 			isSessionActive: summary.isSessionActive || summary.hasRunningRlmChildren === true || hasPendingAdmission,
 			attachedClients: state.clients.size + state.pendingAttaches,
@@ -2812,11 +3226,13 @@ export class AgentDaemon {
 			hasNonPassiveDescendants: getChildActiveSessionStates(this.sessions, state).length > 0,
 			isHydrating:
 				this.bindingSessions.has(state.activeSessionId) ||
-				(sessionFile ? this.openingSessions.has(resolve(sessionFile)) : false) ||
+				(sessionFile ? this.openingSessions.has(this.sessionPathOperationKey(sessionFile)) : false) ||
 				passiveDescendants.some(
 					(passive) =>
 						passive.rootParentState === state &&
-						passive.chain.some((entry) => this.openingSessions.has(resolve(entry.sessionFile))),
+						passive.chain.some((entry) =>
+							this.openingSessions.has(this.sessionPathOperationKey(entry.sessionFile)),
+						),
 				),
 		};
 	}
@@ -2832,7 +3248,7 @@ export class AgentDaemon {
 		if (!sessionFile || metadata.kind !== "subagent" || !metadata.rlmChildId || !metadata.parentActiveSessionId) {
 			return false;
 		}
-		const sessionKey = resolve(sessionFile);
+		const sessionKey = this.sessionPathOperationKey(sessionFile);
 		const parentActiveSessionId = metadata.parentActiveSessionId;
 		const childId = metadata.rlmChildId;
 		const existing = this.passivatingSessions.get(sessionKey);
@@ -2868,12 +3284,9 @@ export class AgentDaemon {
 			try {
 				await this.closeSession(state, "shutdown", true, false);
 			} catch (error) {
-				// A pre-removal close failure must not strand a resident child outside its
-				// parent's ownership map or disconnect its event forwarder.
 				if (
 					this.sessions.get(state.activeSessionId) === state &&
-					this.sessions.get(parentActiveSessionId) === parentState &&
-					parentState.runtime.session.registerRlmChildSession(childId, state.runtime.session, unsubscribeChild)
+					this.sessions.get(parentActiveSessionId) === parentState
 				) {
 					throw error;
 				}
@@ -2921,7 +3334,7 @@ export class AgentDaemon {
 	}
 
 	private findPassivationBySessionFile(sessionFile: string): Promise<void> | undefined {
-		return this.passivatingSessions.get(resolve(sessionFile));
+		return this.passivatingSessions.get(this.sessionPathOperationKey(sessionFile));
 	}
 
 	private async waitForPassivation(sessionFile: string): Promise<void> {
@@ -3002,7 +3415,10 @@ export class AgentDaemon {
 		if (this.updateRestart !== undefined) {
 			throw new BoundSessionUnavailableError("Daemon is preparing an update restart");
 		}
-		const sessionKey = resolve(entry.sessionFile);
+		const sessionKey = this.sessionPathOperationKey(entry.sessionFile);
+		if (await this.waitForSessionPathMutation(sessionKey)) {
+			return this.rehydrateCompletedRlmSubagent(parentState, entry, restoreActiveSessionId, clientEnv);
+		}
 		const reservation = this.reservingSessionOpens.get(sessionKey);
 		if (reservation) {
 			await reservation;
@@ -3493,6 +3909,7 @@ export class AgentDaemon {
 				supervisorGeneration?: unknown;
 				supervisorPid?: unknown;
 				supervisorProcessStartId?: unknown;
+				supervisorAuthorityProcessStartId?: unknown;
 				supervisorSocketPath?: unknown;
 				activeSessionId?: unknown;
 				admissionId?: unknown;
@@ -3526,6 +3943,17 @@ export class AgentDaemon {
 					!Number.isInteger(parsed.supervisorPid) ||
 					(parsed.supervisorPid as number) <= 0 ||
 					(parsed.supervisorProcessStartId !== undefined && typeof parsed.supervisorProcessStartId !== "string") ||
+					(parsed.supervisorAuthorityProcessStartId !== undefined &&
+						(typeof parsed.supervisorAuthorityProcessStartId !== "string" ||
+							!isExactProcessStartId(parsed.supervisorAuthorityProcessStartId))) ||
+					(parsed.supervisorProcessStartId === undefined &&
+						parsed.supervisorAuthorityProcessStartId === undefined) ||
+					!hasConsistentDaemonProcessIdentityProjection(
+						typeof parsed.supervisorProcessStartId === "string" ? parsed.supervisorProcessStartId : undefined,
+						typeof parsed.supervisorAuthorityProcessStartId === "string"
+							? parsed.supervisorAuthorityProcessStartId
+							: undefined,
+					) ||
 					typeof parsed.supervisorSocketPath !== "string"
 				) {
 					clearParsedAdmission();
@@ -3539,13 +3967,19 @@ export class AgentDaemon {
 					...(typeof parsed.supervisorProcessStartId === "string"
 						? { supervisorProcessStartId: parsed.supervisorProcessStartId }
 						: {}),
+					...(typeof parsed.supervisorAuthorityProcessStartId === "string"
+						? { supervisorAuthorityProcessStartId: parsed.supervisorAuthorityProcessStartId }
+						: {}),
 					supervisorSocketPath: parsed.supervisorSocketPath,
 				};
 				let ownerFingerprint: string;
 				try {
 					ownerFingerprint = await this.assertSupervisorClaimCurrent(claim);
 				} catch {
-					this.write(client, failure(commandId, "worker_auth", "supervisor_generation_stale"));
+					const authenticationError = claim.supervisorAuthorityProcessStartId
+						? "supervisor_generation_stale"
+						: "worker_auth_version_incompatible";
+					this.write(client, failure(commandId, "worker_auth", authenticationError));
 					client.socket.end();
 					return;
 				}
@@ -3669,7 +4103,12 @@ export class AgentDaemon {
 			return;
 		}
 		if (mutation) this.mutationDrain.begin();
+		let releaseWorkAdmission = () => {};
 		try {
+			releaseWorkAdmission = this.beginDaemonWorkAdmission(
+				command.type,
+				this.daemonCommandWorkAdmissionSelectors(command),
+			);
 			const response = await this.handleCommand(client, command, () => {
 				promptHandlerOwnsAdmission = true;
 			});
@@ -3685,6 +4124,7 @@ export class AgentDaemon {
 			);
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
 		} finally {
+			releaseWorkAdmission();
 			if (!promptHandlerOwnsAdmission) clearParsedAdmission();
 			if (mutation) this.mutationDrain.end();
 		}
@@ -3724,13 +4164,6 @@ export class AgentDaemon {
 					this.write(client, success(command.id, "detach"));
 					return;
 				}
-				case "worker_sync_agent_peers":
-					this.remoteAgentPeers.clear();
-					for (const peer of command.peers) {
-						this.remoteAgentPeers.set(peer.activeSessionId, peer);
-					}
-					this.writeWorkerSuccess(client, command);
-					return;
 				case "worker_archive_and_shutdown": {
 					for (const state of [...this.sessions.values()]) {
 						await this.closeSession(state, "killed");
@@ -3745,14 +4178,21 @@ export class AgentDaemon {
 					return;
 				}
 				case "worker_deliver_message": {
-					const receipt = await this.sendAgentSessionMessage({
-						targetSelector: command.targetActiveSessionId,
-						message: command.message,
-						sender: command.sender,
-						senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
-						origin: "agent",
-					});
-					this.writeWorkerSuccess(client, command, receipt);
+					const releaseWorkAdmission = this.beginDaemonWorkAdmission("worker_deliver_message", [
+						command.targetActiveSessionId,
+					]);
+					try {
+						const receipt = await this.sendAgentSessionMessage({
+							targetSelector: command.targetActiveSessionId,
+							message: command.message,
+							sender: command.sender,
+							senderKey: command.sender.activeSessionId ?? `client:${command.sender.clientId}`,
+							origin: "agent",
+						});
+						this.writeWorkerSuccess(client, command, receipt);
+					} finally {
+						releaseWorkAdmission();
+					}
 					return;
 				}
 				case "worker_prepare_update": {
@@ -3800,6 +4240,12 @@ export class AgentDaemon {
 					this.writeWorkerSuccess(client, command);
 					return;
 				}
+				default: {
+					// Legacy commands from older supervisors (e.g. worker_sync_agent_peers) must fail fast, not time out.
+					const unknown = command as { id?: string; type: string };
+					this.write(client, failure(unknown.id, unknown.type, `Unknown worker command: ${unknown.type}`));
+					return;
+				}
 			}
 		} catch (error) {
 			this.write(client, failure(command.id, command.type, error, serializeDaemonError(error)));
@@ -3839,7 +4285,9 @@ export class AgentDaemon {
 					});
 				}
 				const defaultConfig = this.options.defaultSessionConfig;
-				const listSessionDir = command.sessionDir ?? defaultConfig.sessionDir;
+				const listSessionDir = this.options.worker
+					? this.workerScopedSessionsDir(command.sessionDir)
+					: (command.sessionDir ?? defaultConfig.sessionDir);
 				if (command.cwd) {
 					const savedSessions = await SessionManager.list(resolve(command.cwd), listSessionDir);
 					return success(command.id, "list", {
@@ -3876,6 +4324,7 @@ export class AgentDaemon {
 					cwd = resolve(command.cwd);
 					sessionDir = command.sessionDir;
 				}
+				sessionDir = this.workerScopedSessionsDir(sessionDir);
 				const callbacks = command.id
 					? {
 							onProgress: (loaded: number, total: number) => {
@@ -4054,78 +4503,105 @@ export class AgentDaemon {
 				if (!name) {
 					throw new Error("Session name cannot be empty");
 				}
-				await this.setStateSessionName(state, name);
+				await this.setStateSessionNameForCommand(state, name);
 				return success(command.id, "rename", summaryForActiveSession(state));
 			}
 
 			case "rename_saved_session": {
-				if (command.activeSessionId) {
-					this.getSessionState(command.activeSessionId);
-				}
-				const state = this.findActiveSessionByFile(command.sessionPath);
-				const name = command.name.trim();
-				if (!name) {
-					throw new Error("Session name cannot be empty");
-				}
-				if (state) {
-					await this.setStateSessionName(state, name);
-				} else {
-					const info = await readSessionInfo(command.sessionPath);
-					if (!info) throw new Error(`Session not found: ${command.sessionPath}`);
-					const depth = info.rlmDepth ?? 0;
-					await this.withSessionNameReservation(
-						{
-							name,
-							depth,
-							...(depth > 0 && info.parentSessionPath ? { parentSessionPath: info.parentSessionPath } : {}),
-						},
-						async () => {
-							await this.assertFamilySessionNameAvailable(
-								{
-									name,
-									depth,
-									...(depth > 0 && info.parentSessionPath
-										? { parentSessionPath: info.parentSessionPath }
-										: {}),
-									ignoreSessionId: info.id,
-								},
-								undefined,
-								true,
-							);
-							SessionManager.open(command.sessionPath).appendSessionInfo(name);
-							try {
-								await this.rlmSpawnLedger().appendRenameByChildPath(command.sessionPath, name);
-							} catch (error) {
+				this.workerScopedSessionsDir(command.sessionDir);
+				return this.withSessionPathMutation(command.sessionPath, async (canonicalPath) => {
+					if (command.activeSessionId) {
+						this.getSessionState(command.activeSessionId);
+					}
+					const state = this.findActiveSessionByFile(canonicalPath);
+					const name = command.name.trim();
+					if (!name) {
+						throw new Error("Session name cannot be empty");
+					}
+					if (state) {
+						await this.setStateSessionNameForCommand(state, name);
+					} else {
+						const info = await readSessionInfo(canonicalPath);
+						if (!info) throw new Error(`Session not found: ${canonicalPath}`);
+						const depth = info.rlmDepth ?? 0;
+						await this.withSessionNameReservation(
+							{
+								name,
+								depth,
+								...(depth > 0 && info.parentSessionPath ? { parentSessionPath: info.parentSessionPath } : {}),
+							},
+							async () => {
+								await this.assertFamilySessionNameAvailable(
+									{
+										name,
+										depth,
+										...(depth > 0 && info.parentSessionPath
+											? { parentSessionPath: info.parentSessionPath }
+											: {}),
+										ignoreSessionId: info.id,
+									},
+									undefined,
+									true,
+								);
+								SessionManager.open(canonicalPath).appendSessionInfo(name);
 								try {
-									SessionManager.open(command.sessionPath).appendSessionInfo(info.name ?? "");
-								} catch (rollbackError) {
-									throw new AggregateError(
-										[error, rollbackError],
-										`Failed to persist and roll back saved-session rename for ${command.sessionPath}`,
-									);
+									await this.rlmSpawnLedger().appendRenameByChildPath(canonicalPath, name);
+								} catch (error) {
+									try {
+										SessionManager.open(canonicalPath).appendSessionInfo(info.name ?? "");
+									} catch (rollbackError) {
+										throw new AggregateError(
+											[error, rollbackError],
+											`Failed to persist and roll back saved-session rename for ${canonicalPath}`,
+										);
+									}
+									throw error;
 								}
-								throw error;
-							}
-						},
-					);
-				}
-				return success(command.id, "rename_saved_session");
+							},
+						);
+					}
+					return success(command.id, "rename_saved_session");
+				});
 			}
 
 			case "delete_saved_session": {
-				if (command.activeSessionId) {
-					this.getSessionState(command.activeSessionId);
-				}
-				if (this.findActiveSessionByFile(command.sessionPath)) {
-					throw new Error("Cannot delete the currently active session");
-				}
-				const result = await this.deleteSavedSessionFile(command.sessionPath, {
-					afterFileRemoved: () => {
-						this.cancelScheduledJobsForSessionFile(command.sessionPath);
-					},
+				const sessionsDir = this.workerScopedSessionsDir(command.sessionDir);
+				return this.withSessionPathMutation(command.sessionPath, async (canonicalPath) => {
+					const contextState = command.activeSessionId ? this.getSessionState(command.activeSessionId) : undefined;
+					if (this.findActiveSessionByFile(canonicalPath)) {
+						throw new Error("Cannot delete the currently active session");
+					}
+					const ledger = this.rlmSpawnLedger();
+					const isWorkerNested =
+						this.options.worker !== undefined &&
+						canonicalRlmSessionsDir(dirname(canonicalPath)) !==
+							canonicalRlmSessionsDir(sessionsDir ?? this.rlmLedgerSessionsDir());
+					const authoritativeEdge = isWorkerNested
+						? await this.assertAuthoritativeNestedDeletionEdge(ledger, canonicalPath, contextState)
+						: undefined;
+					const result = await this.deleteSavedSessionFile(canonicalPath, {
+						afterFileRemoved: () => {
+							this.cancelScheduledJobsForSessionFile(canonicalPath);
+							if (command.sessionPath !== canonicalPath) {
+								this.cancelScheduledJobsForSessionFile(command.sessionPath);
+							}
+						},
+					});
+					if (result.ok) {
+						await ledger.appendDeleteByChildPath(canonicalPath, "user");
+						if (authoritativeEdge) {
+							const tombstone = await ledger.edgeByChildPath(canonicalPath);
+							if (
+								!tombstone?.deleted ||
+								tombstone.childId !== authoritativeEdge.childId ||
+								canonicalSessionPath(tombstone.parent) !== canonicalSessionPath(authoritativeEdge.parent)
+							) {
+								throw new Error(`RLM ledger did not tombstone child session ${canonicalPath}`);
+							}
+						}
+					}
+					return success(command.id, "delete_saved_session", result);
 				});
-				await this.rlmSpawnLedger().appendDeleteByChildPath(command.sessionPath, "user");
-				return success(command.id, "delete_saved_session", result);
 			}
 
 			case "cancel_prompt_admission": {
@@ -4168,6 +4644,7 @@ export class AgentDaemon {
 					}
 				};
 				const commitAdmission = () => {
+					this.assertWorkAdmissionOpen([state.activeSessionId], command.type);
 					if (admission?.status === "waiting") admission.status = "owned";
 				};
 				let state: ActiveSessionState;
@@ -4187,16 +4664,12 @@ export class AgentDaemon {
 					expandPromptTemplates: command.expandPromptTemplates,
 					skipInputHandlers: command.expandPromptTemplates === false ? true : undefined,
 					source: command.source,
-					...(admission?.controller
-						? {
-								signal: admission.controller.signal,
-								admissionCommitted: commitAdmission,
-							}
-						: {}),
+					admissionCommitted: commitAdmission,
+					...(admission?.controller ? { signal: admission.controller.signal } : {}),
 				};
 				if (command.type === "prompt_and_wait") {
 					try {
-						await this.promptWithAgentMessagePreparingGuard(state, command.message, {
+						await state.runtime.session.promptAndWait(command.message, {
 							...options,
 							preflightResult: (didSucceed) => {
 								if (didSucceed) this.recordWorkerRecoveryState(state, "prompt_accepted", true);
@@ -4215,25 +4688,23 @@ export class AgentDaemon {
 					responseSent = true;
 					this.write(client, success(command.id, "prompt"));
 				};
-				void this.promptWithAgentMessagePreparingGuard(
-					state,
-					command.message,
-					{
-						...options,
-						agentMessageId: command.agentMessageId,
-						customMessage: command.customMessage,
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								this.recordWorkerRecoveryState(state, "prompt_accepted", true);
-								sendSuccessResponse();
-							} else {
-								preflightRejected = true;
-							}
-						},
+				const prompt =
+					command.agentMessageId !== undefined && command.expandPromptTemplates === false
+						? state.runtime.session.acceptAgentMessagePrompt.bind(state.runtime.session)
+						: state.runtime.session.promptUntilAccepted.bind(state.runtime.session);
+				void prompt(command.message, {
+					...options,
+					agentMessageId: command.agentMessageId,
+					customMessage: command.customMessage,
+					preflightResult: (didSucceed) => {
+						if (didSucceed) {
+							this.recordWorkerRecoveryState(state, "prompt_accepted", true);
+							sendSuccessResponse();
+						} else {
+							preflightRejected = true;
+						}
 					},
-					undefined,
-					false,
-				)
+				})
 					.then(() => {
 						if (preflightRejected) {
 							const error = new Error("Prompt was not accepted by the session.");
@@ -4362,10 +4833,8 @@ export class AgentDaemon {
 
 			case "agent_messages_clear": {
 				const state = this.getSessionState(command.activeSessionId);
-				const cleared = await this.withAgentMessageTargetLock(state.activeSessionId, async () => {
-					this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
-					return state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt);
-				});
+				this.agentMessageRateLimiter.clearMatching((key) => key.endsWith(`->${state.activeSessionId}`));
+				const cleared = state.runtime.session.clearQueuedAgentMessages();
 				return success(command.id, "agent_messages_clear", cleared);
 			}
 
@@ -4430,28 +4899,23 @@ export class AgentDaemon {
 				}
 				// Respond before completion (bash can outlive the client request
 				// timeout); output and completion stream via bash_* session events.
-				void state.runtime.session
-					.runUserBash(command.command, {
-						excludeFromContext: command.excludeFromContext,
-						transient: command.transient,
-						runId: command.runId,
-					})
-					.catch((error) => {
-						this.broadcastToSession(
-							state,
-							failure(undefined, "execute_bash", error, serializeDaemonError(error)),
-						);
-					});
+				const bash = state.runtime.session.runUserBash(command.command, {
+					excludeFromContext: command.excludeFromContext,
+					transient: command.transient,
+					runId: command.runId,
+				});
+				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
+				void bash.catch((error) => {
+					this.broadcastToSession(state, failure(undefined, "execute_bash", error, serializeDaemonError(error)));
+				});
 				return success(command.id, "execute_bash");
 			}
 
 			case "execute_bash_and_wait": {
 				const state = this.getSessionState(command.activeSessionId);
-				return success(
-					command.id,
-					"execute_bash_and_wait",
-					await state.runtime.session.executeBash(command.command),
-				);
+				const bash = state.runtime.session.executeBash(command.command);
+				state.inFlightBash = Promise.allSettled([state.inFlightBash, bash]).then(() => undefined);
+				return success(command.id, "execute_bash_and_wait", await bash);
 			}
 
 			case "abort_bash": {
@@ -4468,20 +4932,7 @@ export class AgentDaemon {
 
 			case "delete_rlm_subagent": {
 				const state = this.getSessionState(command.activeSessionId);
-				const isResidentChildRunning = () => {
-					const childState = [...this.sessions.values()].find(
-						(candidate) =>
-							candidate.runtime.metadata.kind === "subagent" &&
-							candidate.runtime.metadata.rlmChildId === command.childId,
-					);
-					return (
-						childState !== undefined &&
-						(childState.runtime.session.isStreaming || childState.runtime.session.unfinishedActionCount > 0)
-					);
-				};
-				const result = isResidentChildRunning()
-					? "running"
-					: await state.runtime.session.deleteInactiveRlmSubagent(command.childId, isResidentChildRunning);
+				const result = await state.runtime.session.deleteInactiveRlmSubagent(command.childId);
 				return success(command.id, "delete_rlm_subagent", {
 					deleted: result === "deleted",
 					...(result === "running" ? { reason: "running" } : {}),
@@ -4980,7 +5431,7 @@ export class AgentDaemon {
 				if (!name) {
 					throw new Error("Session name cannot be empty");
 				}
-				await this.setStateSessionName(state, name);
+				await this.setStateSessionNameForCommand(state, name);
 				return success(command.id, "set_session_name");
 			}
 
@@ -5449,7 +5900,32 @@ export class AgentDaemon {
 		};
 	}
 
-	private async createAgentMessageListResult(current: ActiveSessionState): Promise<AgentSessionMessageListResult> {
+	private async listSupervisorAgentPeers(): Promise<AgentSessionMessageAgentSummary[]> {
+		const supervisorSocketPath = this.supervisorSocketPathFromEnv();
+		if (!this.options.worker || !supervisorSocketPath) return [];
+		const client = new DaemonClient(supervisorSocketPath);
+		try {
+			await client.connect(1000);
+			await client.waitForHello(1000);
+			const response = await client.request(
+				{ type: "list_agent_peers", workerToken: this.options.worker.authenticationToken },
+				5000,
+			);
+			if (!response.success) throw deserializeDaemonError(response);
+			// SAFETY: The authenticated supervisor constructs the peer response.
+			return (response.data as { peers: AgentSessionMessageAgentSummary[] }).peers;
+		} catch {
+			return [];
+		} finally {
+			client.close();
+		}
+	}
+
+	private async createAgentMessageListResult(
+		current: ActiveSessionState,
+		peers?: AgentSessionMessageAgentSummary[],
+	): Promise<AgentSessionMessageListResult> {
+		peers ??= await this.listSupervisorAgentPeers();
 		const localAgents = this.listTargetableSessionStates(current).map((state) =>
 			this.createAgentMessageAgentSummary(state),
 		);
@@ -5482,32 +5958,33 @@ export class AgentDaemon {
 			});
 		}
 		const localIds = new Set(localAgents.map((agent) => agent.activeSessionId));
+		const remoteAgents = peers.filter(
+			(peer) => !localIds.has(peer.activeSessionId) && !this.closingSessions.has(peer.activeSessionId),
+		);
 		return {
 			current: this.createAgentSessionMessageEndpoint(current),
-			agents: [
-				...localAgents,
-				...[...this.remoteAgentPeers.values()].filter(
-					(peer) =>
-						peer.status !== "inactive" &&
-						!localIds.has(peer.activeSessionId) &&
-						!this.closingSessions.has(peer.activeSessionId),
-				),
-			],
+			agents: [...localAgents, ...remoteAgents],
 		};
 	}
 
 	private async createAgentFamilyCatalog(currentState?: ActiveSessionState): Promise<AgentFamilyCatalogEntry[]> {
 		const current =
 			currentState ?? [...this.sessions.values()].find((state) => !this.bindingSessions.has(state.activeSessionId));
-		const listed = current ? await this.createAgentMessageListResult(current) : { agents: [] };
-		const remotePeers = new Set(this.remoteAgentPeers.values());
+		const remotePeers = current ? await this.listSupervisorAgentPeers() : [];
+		const listed = current ? await this.createAgentMessageListResult(current, remotePeers) : { agents: [] };
+		const remotePeerSet = new Set(remotePeers);
 		const localAgents = current
-			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeers.has(agent))]
-			: listed.agents.filter((agent) => !remotePeers.has(agent));
+			? [this.createAgentMessageAgentSummary(current), ...listed.agents.filter((agent) => !remotePeerSet.has(agent))]
+			: listed.agents;
 		const activePaths = new Set(
 			localAgents.flatMap((agent) => (agent.sessionPath ? [canonicalSessionPath(agent.sessionPath)] : [])),
 		);
-		const savedRoots = (await SessionManager.listAll(undefined, this.options.defaultSessionConfig.sessionDir))
+		const savedRoots = (
+			await SessionManager.listAll(
+				undefined,
+				this.options.worker ? this.rlmLedgerSessionsDir() : this.options.defaultSessionConfig.sessionDir,
+			)
+		)
 			.filter(
 				(info) =>
 					(info.rlmDepth ?? (info.parentSessionPath ? -1 : 0)) === 0 &&
@@ -5544,7 +6021,7 @@ export class AgentDaemon {
 				...(agent.sessionPath ? { sessionPath: canonicalSessionPath(agent.sessionPath) } : {}),
 			});
 		};
-		for (const peer of this.remoteAgentPeers.values()) addAgent(peer);
+		for (const peer of remotePeers) addAgent(peer);
 		for (const agent of localAgents) addAgent(agent);
 		for (const state of this.sessions.values()) {
 			const entry = byId.get(state.runtime.session.sessionId);
@@ -5654,6 +6131,21 @@ export class AgentDaemon {
 		}
 	}
 
+	private setStateSessionNameForCommand(state: ActiveSessionState, name: string): Promise<void> {
+		return this.options.worker ? this.applyStateSessionName(state, name) : this.setStateSessionName(state, name);
+	}
+
+	private async applyStateSessionName(state: ActiveSessionState, name: string): Promise<void> {
+		const previousName = state.runtime.session.sessionName;
+		state.runtime.session.setSessionName(name);
+		try {
+			await this.appendRlmLedgerRenameForState(state, name);
+		} catch (error) {
+			state.runtime.session.setSessionName(previousName ?? "");
+			throw error;
+		}
+	}
+
 	private async setStateSessionName(state: ActiveSessionState, name: string): Promise<void> {
 		const normalizedName = name.trim();
 		if (!normalizedName) {
@@ -5676,14 +6168,7 @@ export class AgentDaemon {
 			},
 			async () => {
 				await this.assertStateSessionNameAvailable(state, normalizedName);
-				const previousName = state.runtime.session.sessionName;
-				state.runtime.session.setSessionName(normalizedName);
-				try {
-					await this.appendRlmLedgerRenameForState(state, normalizedName);
-				} catch (error) {
-					state.runtime.session.setSessionName(previousName ?? "");
-					throw error;
-				}
+				await this.applyStateSessionName(state, normalizedName);
 			},
 		);
 	}
@@ -5713,57 +6198,13 @@ export class AgentDaemon {
 	}
 
 	private async clearQueuedAgentSessionMessagesForState(state: ActiveSessionState) {
-		return this.withAgentMessageTargetLock(state.activeSessionId, async () =>
-			state.runtime.session.clearQueuedUserMessagesMatching(isAgentSessionMessagePrompt),
-		);
+		return state.runtime.session.clearQueuedAgentMessages();
 	}
 
 	private async clearQueuedAgentSessionMessagesForAllStates(): Promise<void> {
 		await Promise.all(
 			[...this.sessions.values()].map((state) => this.clearQueuedAgentSessionMessagesForState(state)),
 		);
-	}
-
-	private reserveAgentMessageQueueSlot(targetState: ActiveSessionState): () => void {
-		const activeSessionId = targetState.activeSessionId;
-		const reserved = this.agentMessagePendingReservations.get(activeSessionId) ?? 0;
-		assertAgentMessageQueueCapacity(
-			targetState.runtime.session.unfinishedActionCount + reserved,
-			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-		);
-		this.agentMessagePendingReservations.set(activeSessionId, reserved + 1);
-		let released = false;
-		return () => {
-			if (released) {
-				return;
-			}
-			released = true;
-			const next = (this.agentMessagePendingReservations.get(activeSessionId) ?? 1) - 1;
-			if (next <= 0) {
-				this.agentMessagePendingReservations.delete(activeSessionId);
-			} else {
-				this.agentMessagePendingReservations.set(activeSessionId, next);
-			}
-		};
-	}
-
-	private async withAgentMessageTargetLock<T>(activeSessionId: string, run: () => Promise<T>): Promise<T> {
-		const previous = this.agentMessageTargetLocks.get(activeSessionId) ?? Promise.resolve();
-		let releaseCurrent: () => void = () => {};
-		const current = new Promise<void>((resolve) => {
-			releaseCurrent = resolve;
-		});
-		const next = previous.catch(() => undefined).then(() => current);
-		this.agentMessageTargetLocks.set(activeSessionId, next);
-		await previous.catch(() => undefined);
-		try {
-			return await run();
-		} finally {
-			releaseCurrent();
-			if (this.agentMessageTargetLocks.get(activeSessionId) === next) {
-				this.agentMessageTargetLocks.delete(activeSessionId);
-			}
-		}
 	}
 
 	private agentFamilyEntry(state: ActiveSessionState): AgentFamilyCatalogEntry {
@@ -5938,13 +6379,11 @@ export class AgentDaemon {
 		if (options.origin === "agent" && options.fromState) {
 			this.assertAgentFamilyReachable(options.fromState, targetState);
 		}
-		const releaseQueueSlot = this.reserveAgentMessageQueueSlot(targetState);
 		const senderKey =
 			options.senderKey ?? options.fromState?.activeSessionId ?? `client:${options.clientId ?? "unknown"}`;
 		const rateLimitKey = `${senderKey}->${targetState.activeSessionId}`;
 		const rateLimit = this.agentMessageRateLimiter.tryConsume(rateLimitKey);
 		if (!rateLimit.ok) {
-			releaseQueueSlot();
 			throw new Error(`Agent messaging rate limit exceeded; retry after ${rateLimit.retryAfterMs}ms`);
 		}
 		const payload: AgentSessionMessagePayload = {
@@ -5958,28 +6397,11 @@ export class AgentDaemon {
 			target: this.createAgentSessionMessageEndpoint(targetState),
 		};
 		try {
-			const { status } = await this.withAgentMessageTargetLock(targetState.activeSessionId, async () => {
-				if (this.agentMessagesPaused) {
-					throw new Error("Agent messaging is paused");
-				}
-				if (
-					!this.sessions.has(targetState.activeSessionId) ||
-					this.closingSessions.has(targetState.activeSessionId)
-				) {
-					throw new Error("Target session is closing before agent message delivery");
-				}
-				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
-					throw new Error("Target session changed before agent message delivery");
-				}
-				return this.acceptAgentSessionMessage(targetState, payload, releaseQueueSlot);
-			});
+			const { status } = await this.acceptAgentSessionMessage(targetState, payload);
 			return createAgentSessionMessageReceipt(payload, status);
 		} catch (error) {
 			this.agentMessageRateLimiter.refund(rateLimitKey);
 			throw error;
-		} finally {
-			// Error-path backstop; success paths release inside acceptAgentSessionMessage.
-			releaseQueueSlot();
 		}
 	}
 
@@ -5993,110 +6415,83 @@ export class AgentDaemon {
 			throw new Error(`Unknown active session: ${targetSelector}`);
 		}
 		const deadline = Date.now() + 30_000;
+		let client: DaemonClient | undefined;
 		let lastError: unknown;
 		while (Date.now() < deadline && !this.shuttingDown) {
-			const client = new DaemonClient(supervisorSocketPath);
-			let receivedResponse = false;
+			const candidate = new DaemonClient(supervisorSocketPath);
 			try {
-				await client.connect(1000);
-				await client.waitForHello(1000);
-				const response = await client.request(
-					{
-						type: "send_message",
-						targetActiveSessionId: targetSelector,
-						message,
-						fromActiveSessionId: fromState.activeSessionId,
-						agentOrigin: true,
-					},
-					30_000,
-				);
-				receivedResponse = true;
-				if (!response.success) {
-					throw deserializeDaemonError(response);
-				}
-				if (!response.data || typeof response.data !== "object") {
-					throw new Error("Supervisor returned an invalid agent-message receipt");
-				}
-				return response.data as AgentSessionMessageReceipt;
+				await candidate.connect(1000);
+				await candidate.waitForHello(1000);
+				client = candidate;
+				break;
 			} catch (error) {
 				lastError = error;
-				if (receivedResponse) {
-					throw error;
-				}
-			} finally {
-				client.close();
+				candidate.close();
 			}
 			await new Promise((resolveDelay) => setTimeout(resolveDelay, 250));
 		}
-		throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+		if (!client) {
+			throw lastError instanceof Error ? lastError : new Error(`Unknown active session: ${targetSelector}`);
+		}
+		try {
+			const response = await client.request(
+				{
+					type: "send_message",
+					targetActiveSessionId: targetSelector,
+					message,
+					fromActiveSessionId: fromState.activeSessionId,
+					agentOrigin: true,
+				},
+				30_000,
+			);
+			if (!response.success) {
+				throw deserializeDaemonError(response);
+			}
+			if (!response.data || typeof response.data !== "object") {
+				throw new Error("Supervisor returned an invalid agent-message receipt");
+			}
+			return response.data as AgentSessionMessageReceipt;
+		} finally {
+			client.close();
+		}
 	}
 
 	private async acceptAgentSessionMessage(
 		targetState: ActiveSessionState,
 		payload: AgentSessionMessagePayload,
-		releaseReservation: () => void,
 	): Promise<{ status: AgentSessionMessageDeliveryStatus }> {
-		const session = targetState.runtime.session;
-		const reserved = this.agentMessagePendingReservations.get(targetState.activeSessionId) ?? 0;
-		const otherReservations = Math.max(0, reserved - 1);
-		assertAgentMessageQueueCapacity(
-			session.unfinishedActionCount + otherReservations,
-			DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-		);
-		const shouldQueue =
-			this.agentMessageAcceptingTargets.has(targetState.activeSessionId) ||
-			this.agentMessagePreparingTargets.has(targetState.activeSessionId) ||
-			session.isStreaming ||
-			session.isCompacting ||
-			session.isRetrying ||
-			session.isBashRunning ||
-			session.unfinishedActionCount > 0;
-		const streamingBehavior = "steer";
 		const message = createAgentSessionMessage(payload);
-		const prompt = message.content;
-
-		if (shouldQueue) {
-			const didQueue = await session.queueAgentMessagePrompt(prompt, streamingBehavior, message);
-			if (!didQueue) {
-				throw new Error("Agent message was not queued");
-			}
-			// The queued message now counts in unfinishedActionCount.
-			releaseReservation();
-			// Do not await delivery: a queued message delivers only when the target's
-			// turn progresses, and the sender is blocked inside its own turn — awaiting
-			// here deadlocks mutual sends between busy sessions.
-			return { status: "queued" };
-		}
-
-		this.agentMessageAcceptingTargets.add(targetState.activeSessionId);
 		let preflightFailed = false;
 		let preflightQueued = false;
-		try {
-			const promptOptions: PromptOptions = {
-				expandPromptTemplates: false,
-				streamingBehavior,
-				queueIfBusy: true,
-				preflightResult: (didSucceed, didQueue) => {
-					preflightFailed = !didSucceed;
-					preflightQueued = didSucceed && didQueue === true;
-				},
-			};
-			if (typeof session.acceptAgentMessagePrompt === "function") {
-				await session.acceptAgentMessagePrompt(prompt, {
-					...promptOptions,
-					customMessage: message,
-				});
-			} else {
-				await session.prompt(prompt, promptOptions);
-			}
-			if (preflightFailed) {
-				throw new Error("Agent message was not accepted");
-			}
-			releaseReservation();
-			return { status: preflightQueued ? "queued" : "delivered" };
-		} finally {
-			this.agentMessageAcceptingTargets.delete(targetState.activeSessionId);
+		await targetState.runtime.session.acceptAgentMessagePrompt(message.content, {
+			expandPromptTemplates: false,
+			streamingBehavior: "steer",
+			queueIfBusy: true,
+			customMessage: message,
+			admissionCommitted: () => {
+				this.assertWorkAdmissionOpen([targetState.activeSessionId], "agent message");
+				if (this.agentMessagesPaused) {
+					throw new Error("Agent messaging is paused");
+				}
+				if (
+					!this.sessions.has(targetState.activeSessionId) ||
+					this.closingSessions.has(targetState.activeSessionId)
+				) {
+					throw new Error("Target session is closing before agent message delivery");
+				}
+				if (targetState.runtime.session.sessionId !== payload.target.sessionId) {
+					throw new Error("Target session changed before agent message delivery");
+				}
+			},
+			preflightResult: (didSucceed, didQueue) => {
+				preflightFailed = !didSucceed;
+				preflightQueued = didSucceed && didQueue === true;
+			},
+		});
+		if (preflightFailed) {
+			throw new Error("Agent message was not accepted");
 		}
+		return { status: preflightQueued ? "queued" : "delivered" };
 	}
 
 	private detachClientFromSession(client: DaemonSocketClient, state: ActiveSessionState): void {
@@ -6185,13 +6580,12 @@ export class AgentDaemon {
 			wasRetrying ||
 			hadAcceptedPromptInFlight ||
 			queue.actions.actions.length > 0;
+		const sessionDir = this.options.worker
+			? this.rlmLedgerSessionsDir()
+			: (state.runtime.runtimeConfig?.sessionDir ?? this.options.defaultSessionConfig.sessionDir);
 		const sessionFile =
 			session.sessionFile ??
-			(hasQueuedMessages || shouldResume
-				? session.sessionManager.materializeSessionFile(
-						state.runtime.runtimeConfig?.sessionDir ?? this.options.defaultSessionConfig.sessionDir,
-					)
-				: undefined);
+			(hasQueuedMessages || shouldResume ? session.sessionManager.materializeSessionFile(sessionDir) : undefined);
 		if (!sessionFile || (this.isEmptyDraftContent(state) && !hasQueuedMessages && !shouldResume)) {
 			return undefined;
 		}
@@ -6203,6 +6597,7 @@ export class AgentDaemon {
 			config: {
 				...state.runtime.runtimeConfig,
 				cwd: session.sessionManager.getCwd(),
+				...(this.options.worker ? { sessionDir } : {}),
 			},
 			runtimeMetadata: state.runtime.metadata,
 			...(state.clientEnv ? { clientEnv: { ...state.clientEnv } } : {}),
@@ -6437,10 +6832,10 @@ export class AgentDaemon {
 	}
 
 	private findActiveSessionByFile(sessionPath: string): ActiveSessionState | undefined {
-		const resolvedSessionPath = resolve(sessionPath);
+		const target = canonicalSessionPath(sessionPath);
 		for (const state of this.sessions.values()) {
 			const sessionFile = state.runtime.session.sessionFile;
-			if (sessionFile && resolve(sessionFile) === resolvedSessionPath) {
+			if (sessionFile && canonicalSessionPath(sessionFile) === target) {
 				return state;
 			}
 		}
@@ -6559,14 +6954,12 @@ export class AgentDaemon {
 	}
 
 	private async abortBashForClose(state: ActiveSessionState): Promise<void> {
-		if (!state.runtime.session.isBashRunning) {
+		const session = state.runtime.session;
+		if (!session.isBashRunning) {
 			return;
 		}
-		state.runtime.session.abortBash();
-		const deadline = Date.now() + UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS;
-		while (state.runtime.session.isBashRunning && Date.now() < deadline) {
-			await delay(50);
-		}
+		session.abortBash();
+		await Promise.race([state.inFlightBash ?? Promise.resolve(), delay(UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS)]);
 	}
 
 	private async closeSessionOnce(

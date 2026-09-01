@@ -1,7 +1,6 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import lockfile from "proper-lockfile";
-import { APP_NAME } from "../../src/config.js";
 import { isDaemonCatalogProcess, runDaemonCatalogProcess } from "../../src/modes/daemon/daemon-catalog-process.js";
 import { DaemonSupervisor } from "../../src/modes/daemon/daemon-supervisor.js";
 import { acquireDaemonSupervisorOwnership } from "../../src/modes/daemon/daemon-supervisor-ownership.js";
@@ -52,7 +51,6 @@ async function runOwnershipHolder(): Promise<never> {
 
 async function runSupervisor(): Promise<never> {
 	process.argv[1] = fileURLToPath(new URL("../../src/cli.ts", import.meta.url));
-	process.title = APP_NAME;
 	const socketPath = requiredEnvironment("ENG_4600_SOCKET_PATH");
 	const agentDir = requiredEnvironment("ENG_4600_AGENT_DIR");
 	const descriptorDir = requiredEnvironment("ENG_4600_DESCRIPTOR_DIR");

@@ -233,7 +233,7 @@ export interface CreateRlmSubagentRuntimeOptions {
 	rlmDepth: number;
 	rlmMaxDepth: number;
 	rlmParentNodeId: string;
-	/** Source of the IPython cell that spawned this subagent, for display. */
+	/** Source of the Python cell that spawned this subagent, for display. */
 	spawnCode?: string;
 	/** Publish the session to the parent before a host makes the runtime addressable. */
 	onSessionPublished?: (session: AgentSession) => void;
@@ -241,6 +241,8 @@ export interface CreateRlmSubagentRuntimeOptions {
 
 export interface SubagentRuntimeHost {
 	createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime>;
+	/** Fence one child family from new host work through the supplied deletion lifecycle. */
+	withRlmSubagentDeletion?<T>(childId: string, deleteFamily: (isFamilyBusy: () => boolean) => Promise<T>): Promise<T>;
 	/** Persist host-owned completion before the child becomes passivation-eligible. */
 	completeRlmSubagentRuntime?(childId: string, session: AgentSession): boolean;
 	/** Release a host-owned child after its detached initial task settles. */

@@ -4,13 +4,20 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { ENV_AGENT_DIR, SELF_UPDATE_INTERACTIVE_CHILD_ENV } from "../config.js";
-import { ORPHAN_PROCESS_JOURNAL_ENV } from "../core/orphan-process-journal.js";
+import { ORPHAN_PROCESS_JOURNAL_ENV, ORPHAN_PROCESS_JOURNAL_GENERATION_ENV } from "../core/orphan-process-journal.js";
 import {
 	prepareProcessLifecycleLaunch,
 	recordProcessLifecycle,
 	setProcessLifecycleContext,
 } from "../core/process-lifecycle.js";
-import { getProcessStartId, SESSION_LEASE_OWNER_ID_ENV, SESSION_LEASES_ENABLED_ENV } from "../core/session-lease.js";
+import {
+	classifyProcessIdentityAuthority,
+	getProcessStartId,
+	isExactProcessStartId,
+	projectLegacyProcessStartId,
+	SESSION_LEASE_OWNER_ID_ENV,
+	SESSION_LEASES_ENABLED_ENV,
+} from "../core/session-lease.js";
 import { defaultDaemonSocketDir, defaultDaemonSocketPath, normalizeSocketPath } from "../modes/daemon/daemon-socket.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -49,9 +56,34 @@ export interface DaemonUpdateRestartFailure {
 
 export interface DaemonUpdateRestartProcessIdentity {
 	pid: number;
+	/** Byte-compatible pre-move projection only; never new-reader signal authority. */
 	processStartId?: string;
+	/** Exact identity authority for new readers. */
+	authorityProcessStartId?: string;
 	supervisorGeneration?: string;
 	supervisorOwnerToken?: string;
+}
+
+function projectUpdateRestartLegacyProcessStartId(exactId: string): string | undefined {
+	const projection = projectLegacyProcessStartId(exactId);
+	return projection === exactId ? projection : undefined;
+}
+
+export function createDaemonUpdateRestartProcessIdentity(
+	pid: number,
+	processStartId?: string,
+	extra: Pick<DaemonUpdateRestartProcessIdentity, "supervisorGeneration" | "supervisorOwnerToken"> = {},
+): DaemonUpdateRestartProcessIdentity {
+	const authorityProcessStartId = processStartId && isExactProcessStartId(processStartId) ? processStartId : undefined;
+	const legacyProcessStartId = authorityProcessStartId
+		? projectUpdateRestartLegacyProcessStartId(authorityProcessStartId)
+		: processStartId;
+	return {
+		pid,
+		...(legacyProcessStartId ? { processStartId: legacyProcessStartId } : {}),
+		...(authorityProcessStartId ? { authorityProcessStartId } : {}),
+		...extra,
+	};
 }
 
 export interface DaemonUpdateRestartStatus {
@@ -99,8 +131,13 @@ export interface AcquireDaemonUpdateRestartCoordinatorOptions {
 	registryDir?: string;
 }
 
+/**
+ * Keep the absolute lexical AF_UNIX spelling used by the live endpoint. Keys
+ * and persisted coordinator authority canonicalize separately through socketKey.
+ */
 export function resolveDaemonUpdateRestartSocketPath(socketPath?: string): string {
-	return normalizeSocketPath(socketPath ?? defaultDaemonSocketPath());
+	const requestedSocketPath = socketPath ?? defaultDaemonSocketPath();
+	return process.platform === "win32" ? normalizeSocketPath(requestedSocketPath) : resolve(requestedSocketPath);
 }
 
 const TERMINAL_PHASES: ReadonlySet<DaemonUpdateRestartPhase> = new Set(["complete", "skipped", "failed"]);
@@ -157,6 +194,7 @@ function statusLivenessId(status: DaemonUpdateRestartStatus): string {
 }
 
 function socketKey(socketPath: string): string {
+	// Registry identity is physical even though connect/bind must keep lexical spelling.
 	return createHash("sha256").update(normalizeSocketPath(socketPath)).digest("hex");
 }
 
@@ -176,10 +214,21 @@ function isProcessIdentity(value: unknown): value is DaemonUpdateRestartProcessI
 		return false;
 	}
 	const identity = value as Partial<DaemonUpdateRestartProcessIdentity>;
+	if (typeof identity.authorityProcessStartId === "string") {
+		if (!isExactProcessStartId(identity.authorityProcessStartId)) return false;
+		if (
+			identity.processStartId !== undefined &&
+			identity.processStartId !== projectLegacyProcessStartId(identity.authorityProcessStartId)
+		)
+			return false;
+	}
 	return (
 		Number.isInteger(identity.pid) &&
 		(identity.pid ?? 0) > 0 &&
 		(identity.processStartId === undefined || typeof identity.processStartId === "string") &&
+		(identity.authorityProcessStartId === undefined ||
+			(typeof identity.authorityProcessStartId === "string" &&
+				isExactProcessStartId(identity.authorityProcessStartId))) &&
 		(identity.supervisorGeneration === undefined || typeof identity.supervisorGeneration === "string") &&
 		(identity.supervisorOwnerToken === undefined || typeof identity.supervisorOwnerToken === "string")
 	);
@@ -263,7 +312,7 @@ export class DaemonUpdateRestartStatusWriter {
 			requestId,
 			socketPath,
 			phase: "starting",
-			coordinator: { pid: process.pid, ...(processStartId ? { processStartId } : {}) },
+			coordinator: createDaemonUpdateRestartProcessIdentity(process.pid, processStartId),
 			counts: { total: 0, restored: 0, resumed: 0, failed: 0 },
 			startedAt: now,
 			updatedAt: now,
@@ -359,16 +408,21 @@ function isProcessAlive(pid: number): boolean {
 	return true;
 }
 
-function matchesProcessStartId(identity: DaemonUpdateRestartProcessIdentity): boolean {
-	if (!identity.processStartId) {
-		return true;
-	}
-	const observed = getProcessStartId(identity.pid);
-	return observed === undefined || observed === identity.processStartId;
+function updateRestartLivenessProcessStartId(identity: DaemonUpdateRestartProcessIdentity): string | undefined {
+	return (
+		identity.authorityProcessStartId ??
+		(identity.processStartId && isExactProcessStartId(identity.processStartId) ? identity.processStartId : undefined)
+	);
+}
+
+function retainsProcessIdentity(identity: DaemonUpdateRestartProcessIdentity): boolean {
+	const processStartId = updateRestartLivenessProcessStartId(identity);
+	if (!processStartId) return true;
+	return classifyProcessIdentityAuthority(identity.pid, processStartId) !== "exact-dead";
 }
 
 function isProcessIdentityAlive(identity: DaemonUpdateRestartProcessIdentity): boolean {
-	return isProcessAlive(identity.pid) && matchesProcessStartId(identity);
+	return isProcessAlive(identity.pid) && retainsProcessIdentity(identity);
 }
 
 function createProcessIdentityLivenessCheck(identity: DaemonUpdateRestartProcessIdentity): () => boolean {
@@ -377,7 +431,7 @@ function createProcessIdentityLivenessCheck(identity: DaemonUpdateRestartProcess
 		if (!isProcessAlive(identity.pid)) {
 			return false;
 		}
-		if (!identity.processStartId) {
+		if (!updateRestartLivenessProcessStartId(identity)) {
 			return true;
 		}
 		const now = Date.now();
@@ -385,15 +439,22 @@ function createProcessIdentityLivenessCheck(identity: DaemonUpdateRestartProcess
 			return true;
 		}
 		lastStartIdCheckAt = now;
-		return matchesProcessStartId(identity);
+		return retainsProcessIdentity(identity);
 	};
+}
+
+export class DaemonUpdateRestartCoordinatorCorruptError extends Error {
+	constructor(readonly path: string) {
+		super(`Daemon update restart coordinator authority is present but invalid: ${path}`);
+		this.name = "DaemonUpdateRestartCoordinatorCorruptError";
+	}
 }
 
 function readCoordinatorRecord(path: string): DaemonUpdateRestartCoordinatorRecord | undefined {
 	try {
 		const value = JSON.parse(readFileSync(path, "utf8")) as unknown;
 		if (!value || typeof value !== "object") {
-			return undefined;
+			throw new DaemonUpdateRestartCoordinatorCorruptError(path);
 		}
 		const record = value as Partial<DaemonUpdateRestartCoordinatorRecord>;
 		if (
@@ -405,13 +466,15 @@ function readCoordinatorRecord(path: string): DaemonUpdateRestartCoordinatorReco
 			typeof record.createdAt !== "string" ||
 			!isProcessIdentity(record)
 		) {
-			return undefined;
+			throw new DaemonUpdateRestartCoordinatorCorruptError(path);
 		}
 		return record as DaemonUpdateRestartCoordinatorRecord;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			return undefined;
 		}
+		if (error instanceof DaemonUpdateRestartCoordinatorCorruptError) throw error;
+		if (error instanceof SyntaxError) throw new DaemonUpdateRestartCoordinatorCorruptError(path);
 		throw error;
 	}
 }
@@ -458,12 +521,11 @@ export async function acquireDaemonUpdateRestartCoordinator(
 	const token = randomUUID();
 	const processStartId = getProcessStartId(process.pid);
 	const record: DaemonUpdateRestartCoordinatorRecord = {
+		...createDaemonUpdateRestartProcessIdentity(process.pid, processStartId),
 		version: 1,
 		token,
 		requestId: options.requestId,
-		pid: process.pid,
-		...(processStartId ? { processStartId } : {}),
-		socketPath: options.socketPath,
+		socketPath: normalizeSocketPath(options.socketPath),
 		statusPath: options.statusPath,
 		createdAt: new Date().toISOString(),
 	};
@@ -533,6 +595,7 @@ function coordinatorEnvironment(agentDir: string): NodeJS.ProcessEnv {
 	delete environment[DAEMON_WORKER_RECOVERY_JOURNAL_ENV];
 	delete environment[DAEMON_WORKER_SUPERVISOR_SOCKET_ENV];
 	delete environment[ORPHAN_PROCESS_JOURNAL_ENV];
+	delete environment[ORPHAN_PROCESS_JOURNAL_GENERATION_ENV];
 	delete environment[SESSION_LEASES_ENABLED_ENV];
 	delete environment[SESSION_LEASE_OWNER_ID_ENV];
 	return environment;

@@ -1,18 +1,25 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import {
+	createProcessIdentityOwnerToken,
+	getProcessStartId,
+	matchesExactProcessIdentity,
+	observeProcessIdentity,
+} from "../src/core/session-lease.js";
 import { SessionManager } from "../src/core/session-manager.js";
 import { DaemonAgentConnection } from "../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import type { SessionSummary } from "../src/modes/daemon/daemon-session-list.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
+const tsxLoaderPath = resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs");
 const children = new Set<ChildProcess>();
-const workerPids = new Set<number>();
+const childProcessStartIds = new Map<number, string>();
+const workerProcessStartIds = new Map<number, string>();
 const tempDirs: string[] = [];
 
 function delay(ms: number): Promise<void> {
@@ -90,32 +97,43 @@ function requireSessionList(responseData: unknown): SessionSummary[] {
 
 afterEach(async () => {
 	for (const child of children) {
-		if (child.exitCode === null && child.signalCode === null) {
+		const processStartId = child.pid ? childProcessStartIds.get(child.pid) : undefined;
+		if (
+			child.exitCode === null &&
+			child.signalCode === null &&
+			child.pid &&
+			processStartId &&
+			matchesExactProcessIdentity(child.pid, processStartId)
+		) {
 			child.kill("SIGTERM");
 		}
 		await waitForExit(child).catch(() => undefined);
 	}
 	children.clear();
-	for (const pid of workerPids) {
+	childProcessStartIds.clear();
+	for (const [pid, processStartId] of workerProcessStartIds) {
+		if (!matchesExactProcessIdentity(pid, processStartId)) continue;
 		try {
 			process.kill(-pid, "SIGTERM");
 		} catch {
-			try {
-				process.kill(pid, "SIGTERM");
-			} catch {
-				// Already gone.
+			if (matchesExactProcessIdentity(pid, processStartId)) {
+				try {
+					process.kill(pid, "SIGTERM");
+				} catch {
+					// Already gone.
+				}
 			}
 		}
 		await waitForProcessGone(pid).catch(() => undefined);
 	}
-	workerPids.clear();
+	workerProcessStartIds.clear();
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
 
 describe.skipIf(process.platform === "win32")("live daemon socket lease compromise", () => {
-	it("keeps the same resident session listable and attachable after its socket lease is stolen", async () => {
+	it("keeps read-only access alive after out-of-band socket guard removal", async () => {
 		const root = mkdtempSync(join(tmpdir(), "prime-live-lock-compromise-"));
 		tempDirs.push(root);
 		const agentDir = join(root, "agent");
@@ -132,10 +150,12 @@ describe.skipIf(process.platform === "win32")("live daemon socket lease compromi
 			throw new Error("Fixture session did not persist");
 		}
 
+		const supervisorIdentity = createProcessIdentityOwnerToken();
 		const supervisor = spawn(
 			process.execPath,
-			[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline"],
+			["--import", tsxLoaderPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline"],
 			{
+				argv0: supervisorIdentity.argument,
 				cwd: projectDir,
 				env: {
 					...process.env,
@@ -150,11 +170,28 @@ describe.skipIf(process.platform === "win32")("live daemon socket lease compromi
 		children.add(supervisor);
 
 		const firstClient = await connectEventually(socketPath, supervisor);
-		const created = await firstClient.request({
-			type: "create",
-			sessionPath: sessionFile,
-			config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+		const ownerRegistry = join(root, "supervisor-owners");
+		const ownerPath = readdirSync(ownerRegistry, { recursive: true })
+			.map(String)
+			.find((value) => value.endsWith("owner.json"));
+		expect(ownerPath).toBeDefined();
+		const ownerRecord = JSON.parse(readFileSync(join(ownerRegistry, ownerPath!), "utf8")) as {
+			pid?: number;
+		};
+		expect(ownerRecord.pid).toBe(supervisor.pid);
+		expect(observeProcessIdentity(supervisor.pid!)).toEqual({
+			status: "present-exact",
+			id: supervisorIdentity.processStartId,
 		});
+		childProcessStartIds.set(supervisor.pid!, supervisorIdentity.processStartId);
+		const created = await firstClient.request(
+			{
+				type: "create",
+				sessionPath: sessionFile,
+				config: { cwd: projectDir, agentDir, sessionDir, noTools: true, noExtensions: true },
+			},
+			40_000,
+		);
 		if (!created.success) {
 			throw new Error(created.error);
 		}
@@ -162,11 +199,13 @@ describe.skipIf(process.platform === "win32")("live daemon socket lease compromi
 		if (!createdSummary.workerPid || !createdSummary.activeSessionId) {
 			throw new Error("Resident session did not expose its process identity");
 		}
-		workerPids.add(createdSummary.workerPid);
+		const workerProcessStartId = getProcessStartId(createdSummary.workerPid);
+		expect(workerProcessStartId).toBeDefined();
+		workerProcessStartIds.set(createdSummary.workerPid, workerProcessStartId!);
 
-		// Simulate a contender judging the supervisor's long-lived socket lock stale.
+		// Simulate out-of-band removal. The durable guard has no stale-time
+		// callback, so this must not crash an otherwise idle control plane.
 		rmSync(`${socketPath}.lock`, { recursive: true, force: true });
-		await delay(2_000);
 
 		// Probe 1: the original control connection and resident worker remain alive.
 		expect(supervisor.exitCode).toBeNull();
@@ -193,11 +232,24 @@ describe.skipIf(process.platform === "win32")("live daemon socket lease compromi
 			expect.objectContaining({ role: "user", content: "live lock-compromise fixture" }),
 		);
 		await connection.dispose();
-		await replacementClient.request({ type: "shutdown" });
 		replacementClient.close();
+		// Graceful shutdown performs persistence and therefore must not run after
+		// lease compromise. End the fixture out of band instead.
+		expect(matchesExactProcessIdentity(supervisor.pid!, supervisorIdentity.processStartId)).toBe(true);
+		supervisor.kill("SIGKILL");
 		await waitForExit(supervisor);
 		children.delete(supervisor);
+		childProcessStartIds.delete(supervisor.pid!);
+		if (matchesExactProcessIdentity(createdSummary.workerPid, workerProcessStartId!)) {
+			try {
+				process.kill(-createdSummary.workerPid, "SIGKILL");
+			} catch {
+				if (matchesExactProcessIdentity(createdSummary.workerPid, workerProcessStartId!)) {
+					process.kill(createdSummary.workerPid, "SIGKILL");
+				}
+			}
+		}
 		await waitForProcessGone(createdSummary.workerPid);
-		workerPids.delete(createdSummary.workerPid);
-	}, 30_000);
+		workerProcessStartIds.delete(createdSummary.workerPid);
+	}, 45_000);
 });

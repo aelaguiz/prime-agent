@@ -1,21 +1,29 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { ENV_AGENT_DIR } from "../src/config.js";
+import {
+	createProcessIdentityOwnerToken,
+	isExactProcessStartId,
+	matchesExactProcessIdentity,
+} from "../src/core/session-lease.js";
 import { DaemonClient } from "../src/modes/daemon/daemon-client.js";
 import { type RunningMcpServe, startMcpServe } from "../src/modes/mcp-serve/mcp-serve-mode.js";
 
 const cliPath = resolve(__dirname, "../src/cli.ts");
-const tsxPath = resolve(__dirname, "../../../node_modules/tsx/dist/cli.mjs");
+const tsxPreflightPath = resolve(__dirname, "../../../node_modules/tsx/dist/preflight.cjs");
+const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../node_modules/tsx/dist/loader.mjs")).href;
 
 const tempDirs: string[] = [];
 const children = new Set<ChildProcess>();
+const childProcessStartIds = new WeakMap<ChildProcess, string>();
 const daemonSockets = new Set<string>();
 const servers = new Set<RunningMcpServe>();
 
@@ -37,7 +45,14 @@ afterEach(async () => {
 	}
 	daemonSockets.clear();
 	for (const child of children) {
-		if (child.exitCode === null && child.signalCode === null) {
+		const processStartId = childProcessStartIds.get(child);
+		if (
+			child.pid &&
+			processStartId &&
+			child.exitCode === null &&
+			child.signalCode === null &&
+			matchesExactProcessIdentity(child.pid, processStartId)
+		) {
 			child.kill("SIGTERM");
 			await waitForExit(child);
 		}
@@ -77,18 +92,34 @@ function daemonEnvironment(agentDir: string): NodeJS.ProcessEnv {
 	}
 	environment[ENV_AGENT_DIR] = agentDir;
 	environment.PI_OFFLINE = "1";
+	// A dummy credential lets prompt admission reach the async provider turn; the
+	// test interrupts that turn and never depends on an external model response.
+	environment.ANTHROPIC_API_KEY = "mcp-e2e-placeholder";
 	environment.TSX_TSCONFIG_PATH = resolve(__dirname, "../../../tsconfig.json");
 	return environment;
 }
 
 function spawnDaemon(agentDir: string, socketPath: string, cwd: string): ChildProcess {
 	daemonSockets.add(socketPath);
+	const ownerIdentity = createProcessIdentityOwnerToken();
 	const child = spawn(
 		process.execPath,
-		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", socketPath, "--offline"],
-		{ cwd, env: daemonEnvironment(agentDir), stdio: ["ignore", "pipe", "pipe"] },
+		[
+			"--require",
+			tsxPreflightPath,
+			"--import",
+			tsxLoaderUrl,
+			cliPath,
+			"--mode",
+			"daemon",
+			"--daemon-socket",
+			socketPath,
+			"--offline",
+		],
+		{ cwd, env: daemonEnvironment(agentDir), stdio: ["ignore", "pipe", "pipe"], argv0: ownerIdentity.argument },
 	);
 	children.add(child);
+	childProcessStartIds.set(child, ownerIdentity.processStartId);
 	return child;
 }
 
@@ -102,6 +133,18 @@ async function waitForDaemon(socketPath: string, child: ChildProcess): Promise<v
 		try {
 			await client.connect(250);
 			await client.waitForHello(1000);
+			const pid = child.pid;
+			const authorityProcessStartId = client.hello?.supervisorAuthorityProcessStartId;
+			if (
+				!pid ||
+				client.hello?.supervisorPid !== pid ||
+				!authorityProcessStartId ||
+				!isExactProcessStartId(authorityProcessStartId) ||
+				!matchesExactProcessIdentity(pid, authorityProcessStartId)
+			) {
+				throw new Error("Daemon hello did not bind the spawned owner process exactly");
+			}
+			childProcessStartIds.set(child, authorityProcessStartId);
 			client.close();
 			return;
 		} catch {
@@ -131,6 +174,23 @@ async function callTool(client: Client, name: string, args: Record<string, unkno
 function sessions(call: ToolCall): Array<Record<string, unknown>> {
 	const value = call.structured.sessions;
 	return Array.isArray(value) ? (value as Array<Record<string, unknown>>) : [];
+}
+
+function daemonData<T>(response: Awaited<ReturnType<DaemonClient["request"]>>): T {
+	if (!response.success) {
+		throw new Error(response.error);
+	}
+	return response.data as T;
+}
+
+async function waitForSessionCount(client: Client, expected: number, timeoutMs = 15_000): Promise<ToolCall> {
+	const deadline = Date.now() + timeoutMs;
+	let status = await callTool(client, "status", {});
+	while (sessions(status).length !== expected && Date.now() < deadline) {
+		await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+		status = await callTool(client, "status", {});
+	}
+	return status;
 }
 
 describe("mcp-serve end to end", () => {
@@ -177,12 +237,12 @@ describe("mcp-serve end to end", () => {
 				prompt: "first task",
 				name: "e2e-demo",
 			});
-			expect(started.isError).toBe(false);
+			expect(started.isError, started.text).toBe(false);
 			const startedSession = started.structured.session as Record<string, unknown>;
 			const selector = String(startedSession.session);
 			expect(selector).not.toHaveLength(0);
 			expect(startedSession.name).toBe("e2e-demo");
-			expect(startedSession.state).not.toBe("inactive");
+			expect(startedSession.state, JSON.stringify(startedSession)).not.toBe("inactive");
 
 			const listed = await callTool(client, "status", {});
 			expect(sessions(listed)).toHaveLength(1);
@@ -257,6 +317,56 @@ describe("mcp-serve end to end", () => {
 
 			expect((await callTool(client, "kill_session", { session: resumedSelector })).isError).toBe(false);
 			expect(sessions(await callTool(client, "status", {}))).toHaveLength(0);
+
+			// Empty unnamed sessions are eligible for passivation after the last attached
+			// client leaves. A label makes this zero-message session meaningful enough to
+			// retain on disk without making it supervisor-exempt like a session name would.
+			const raw = new DaemonClient(socketPath);
+			await raw.connect(1000);
+			let emptySessionFile: string;
+			try {
+				const created = daemonData<Record<string, unknown>>(
+					await raw.request({ type: "create", config: { cwd: projectDir } }, 30_000),
+				);
+				const emptySelector = String(created.activeSessionId);
+				emptySessionFile = String(created.sessionFile);
+				expect(emptySelector).not.toHaveLength(0);
+				expect(emptySessionFile).toContain(agentDir);
+
+				const connectionState = daemonData<Record<string, unknown>>(
+					await raw.request({ type: "get_connection_state", activeSessionId: emptySelector }),
+				);
+				const leafId = String(connectionState.leafId);
+				expect(leafId).not.toHaveLength(0);
+				daemonData(
+					await raw.request({
+						type: "set_session_entry_label",
+						activeSessionId: emptySelector,
+						entryId: leafId,
+						label: "retain empty MCP session",
+					}),
+				);
+				daemonData(await raw.request({ type: "attach", activeSessionId: emptySelector }));
+				daemonData(await raw.request({ type: "detach", activeSessionId: emptySelector }));
+			} finally {
+				raw.close();
+			}
+
+			const afterEmptyDetach = await waitForSessionCount(client, 0);
+			expect(sessions(afterEmptyDetach)).toHaveLength(0);
+			expect(existsSync(emptySessionFile)).toBe(true);
+
+			const emptyResumed = await callTool(client, "resume_session", { session: emptySessionFile });
+			expect(emptyResumed.isError).toBe(false);
+			expect(emptyResumed.structured.was_already_active).toBe(false);
+			const emptyResumedSelector = String(emptyResumed.structured.session);
+			expect(emptyResumed.structured.summary).toMatchObject({ messageCount: 0 });
+			expect(sessions(await waitForSessionCount(client, 1))[0]).toMatchObject({
+				session: emptyResumedSelector,
+				messageCount: 0,
+			});
+			expect((await callTool(client, "kill_session", { session: emptyResumedSelector })).isError).toBe(false);
+			expect(sessions(await waitForSessionCount(client, 0))).toHaveLength(0);
 
 			const unknown = await callTool(client, "session_detail", { session: "no-such-session" });
 			expect(unknown.isError).toBe(true);

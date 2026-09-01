@@ -1,17 +1,21 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { once } from "node:events";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	ensureInteractiveDaemonRunning,
 	probeDaemonVersion,
 	probeRunningDaemonSessions,
+	processIdentityFromDaemonHello,
 	shouldStartDaemonEarly,
 	shutdownDaemonAndWait,
 } from "../src/cli/daemon-launch.js";
 import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
+import { PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX } from "../src/core/session-lease.js";
 import {
 	daemonLaunchLeaseDirectory,
 	isDaemonLaunchLeaseContentionError,
@@ -36,6 +40,7 @@ interface FakeDaemonOptions {
 	serverCapabilities?: string[];
 	sendHello?: boolean;
 	onCommand?: (command: { type: string }) => void;
+	helloIdentity?: Record<string, unknown>;
 }
 
 interface FakeDaemon {
@@ -56,6 +61,8 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 		if (options.sendHello !== false) {
 			send(socket, {
 				type: "daemon_hello",
+				supervisorPid: 2_000_000_000,
+				supervisorProcessStartId: "proc:1",
 				socketPath,
 				protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
 				appVersion: options.appVersion ?? VERSION,
@@ -70,6 +77,7 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 					: {}),
 				clientId: "fake-client",
 				serverCapabilities: options.serverCapabilities ?? [],
+				...options.helloIdentity,
 			});
 		}
 		let buffer = "";
@@ -144,6 +152,8 @@ const send = (socket, message) => socket.write(JSON.stringify(message) + "\\n");
 const server = createServer((socket) => {
 	send(socket, {
 		type: "daemon_hello",
+		supervisorPid: process.pid,
+		supervisorProcessStartId: "proc:1",
 		socketPath,
 		protocol: { name: "prime-agent.daemon", version: ${DAEMON_PROTOCOL_VERSION} },
 		schemaId: ${JSON.stringify(DAEMON_SCHEMA_ID)},
@@ -252,7 +262,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		await Promise.all(cleanups.splice(0).map((fn) => fn()));
 	});
 
-	it("rejects a busy pre-session-action daemon before attach", async () => {
+	it("reuses a busy pre-session-action daemon across wire-version drift", async () => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
 			protocolVersion: 3,
@@ -262,7 +272,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		});
 		cleanups.push(daemon.close);
 
-		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("incompatible");
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).resolves.toBeUndefined();
 		expect(commands).not.toContain("list");
 		expect(commands).not.toContain("shutdown");
 	});
@@ -301,6 +311,78 @@ describe("ensureInteractiveDaemonRunning", () => {
 			const successor = tryAcquireDaemonLaunchLease(socketPath);
 			expect(successor).toBeDefined();
 			successor?.release();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.runIf(process.platform !== "win32")("uses one launch key for physical socket aliases", () => {
+		const root = mkdtempSync(join(tmpdir(), "pa-launch-alias-"));
+		const physicalParent = join(root, "physical");
+		const aliasParent = join(root, "alias");
+		mkdirSync(physicalParent);
+		symlinkSync(physicalParent, aliasParent, "dir");
+		const physicalSocketPath = join(physicalParent, "d.sock");
+		const aliasSocketPath = join(aliasParent, "d.sock");
+		try {
+			expect(daemonLaunchLeaseDirectory(aliasSocketPath)).toBe(daemonLaunchLeaseDirectory(physicalSocketPath));
+			const leader = tryAcquireDaemonLaunchLease(aliasSocketPath);
+			expect(leader).toBeDefined();
+			expect(tryAcquireDaemonLaunchLease(physicalSocketPath)).toBeUndefined();
+			leader?.release();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reclaims an exact-dead non-empty launch guard before electing a leader", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-crashed-guard-"));
+		const socketPath = join(dir, "d.sock");
+		try {
+			const leaseDirectory = daemonLaunchLeaseDirectory(socketPath);
+			const fixture = join(dir, "crashed-launch-guard.mts");
+			const entered = join(dir, "entered");
+			const helperUrl = pathToFileURL(resolve(import.meta.dirname, "../src/core/authority-mutation-guard.ts")).href;
+			const identityUrl = pathToFileURL(resolve(import.meta.dirname, "../src/core/session-lease.ts")).href;
+			writeFileSync(
+				fixture,
+				`import { writeFileSync } from "node:fs";
+import { acquireAuthorityMutationGuard } from ${JSON.stringify(helperUrl)};
+import { classifyProcessIdentityAuthority, observeProcessIdentity } from ${JSON.stringify(identityUrl)};
+const [directory, entered] = process.argv.slice(2);
+const observed = observeProcessIdentity(process.pid);
+if (observed.status !== "present-exact" && observed.status !== "present-coarse") throw new Error("identity");
+acquireAuthorityMutationGuard({
+  authorityPath: directory,
+  lockfilePath: directory + ".guard",
+  attempts: 1,
+  retryMs: 1,
+  identity: observed.status === "present-exact" ? { processStartId: observed.id } : { processIdentityHint: observed.hint },
+  classifyOwner: (owner) => classifyProcessIdentityAuthority(owner.pid, owner.processStartId) === "exact-dead" ? "exact-dead" : "retained",
+  failureMessage: "blocked",
+});
+writeFileSync(entered, "entered");
+process.exit(0);
+`,
+			);
+			const tsxPath = resolve(import.meta.dirname, "../../../node_modules/tsx/dist/cli.mjs");
+			const child = spawn(process.execPath, [tsxPath, fixture, leaseDirectory, entered], { stdio: "ignore" });
+			await once(child, "exit");
+			expect(existsSync(entered)).toBe(true);
+			const abandoned = JSON.parse(readFileSync(`${leaseDirectory}.guard`, "utf8")) as {
+				token: string;
+			};
+
+			const leader = tryAcquireDaemonLaunchLease(socketPath);
+			expect(leader).toBeDefined();
+			expect(existsSync(`${leaseDirectory}.guard`)).toBe(false);
+			const successor = JSON.parse(readFileSync(join(leaseDirectory, "lease.json"), "utf8")) as {
+				ownerPid: number;
+				token: string;
+			};
+			expect(successor).toMatchObject({ ownerPid: process.pid });
+			expect(successor.token).not.toBe(abandoned.token);
+			leader?.release();
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -393,7 +475,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 		expect(commands).not.toContain("shutdown");
 	});
 
-	it("shuts down an idle version-mismatched daemon before starting its successor", async () => {
+	it("keeps an idle version-mismatched daemon instead of starting a successor", async () => {
 		const commands: string[] = [];
 		const stale = await startFakeDaemon({
 			appVersion: "0.0.0-stale",
@@ -407,14 +489,9 @@ describe("ensureInteractiveDaemonRunning", () => {
 		process.argv[1] = entrypoint;
 
 		try {
-			await expect(ensureInteractiveDaemonRunning(stale.socketPath)).rejects.toThrow(
-				/Prime Agent daemon exited during startup \(code 7\)/,
-			);
-			expect(commands.filter((command) => command === "list" || command === "shutdown")).toEqual([
-				"list",
-				"shutdown",
-			]);
-			await expect(probeDaemonVersion(stale.socketPath)).resolves.toEqual({ status: "absent" });
+			await expect(ensureInteractiveDaemonRunning(stale.socketPath)).resolves.toBeUndefined();
+			expect(commands.filter((command) => command === "list" || command === "shutdown")).toEqual([]);
+			await expect(probeDaemonVersion(stale.socketPath)).resolves.toMatchObject({ status: "current" });
 		} finally {
 			process.argv[1] = originalEntrypoint;
 			await stale.close();
@@ -433,6 +510,33 @@ describe("ensureInteractiveDaemonRunning", () => {
 		Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
 
 		await expect(probe).resolves.toMatchObject({ status: "current" });
+	});
+
+	it("launches the supervisor with an exact owner argv0 capability", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pa-launch-owner-argv0-"));
+		const entrypoint = join(dir, "capture-argv0.mjs");
+		const proofPath = join(dir, "argv0.txt");
+		const socketPath = join(dir, "d.sock");
+		const originalAgentDir = process.env[ENV_AGENT_DIR];
+		process.env[ENV_AGENT_DIR] = join(dir, "agent");
+		writeFileSync(
+			entrypoint,
+			`import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(proofPath)}, process.argv0); process.exit(29);`,
+		);
+		const originalEntrypoint = process.argv[1]!;
+		process.argv[1] = entrypoint;
+
+		try {
+			await expect(ensureInteractiveDaemonRunning(socketPath)).rejects.toThrow(/exited during startup \(code 29\)/);
+			const argv0 = readFileSync(proofPath, "utf8");
+			expect(argv0.startsWith(PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX)).toBe(true);
+			expect(argv0.slice(PROCESS_IDENTITY_OWNER_TOKEN_ARGUMENT_PREFIX.length)).toMatch(/^[0-9a-f]{64}$/);
+		} finally {
+			process.argv[1] = originalEntrypoint;
+			if (originalAgentDir === undefined) delete process.env[ENV_AGENT_DIR];
+			else process.env[ENV_AGENT_DIR] = originalAgentDir;
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("fails fast with the daemon log tail when the spawned daemon exits during startup", async () => {
@@ -566,6 +670,44 @@ describe("ensureInteractiveDaemonRunning", () => {
 	});
 });
 
+describe("daemon hello shutdown identity", () => {
+	const base = { supervisorPid: 42 } as const;
+	it.each([
+		[
+			"qualified Linux authority-only",
+			{ ...base, supervisorAuthorityProcessStartId: "proc:00000000-0000-4000-8000-000000000000:11" },
+			{ pid: 42, processStartId: "proc:00000000-0000-4000-8000-000000000000:11" },
+		],
+		[
+			"token authority-only",
+			{ ...base, supervisorAuthorityProcessStartId: `token:${"8".repeat(64)}` },
+			{ pid: 42, processStartId: `token:${"8".repeat(64)}` },
+		],
+		[
+			"Windows exact dual",
+			{ ...base, supervisorProcessStartId: "win:11", supervisorAuthorityProcessStartId: "win:11" },
+			{ pid: 42, processStartId: "win:11" },
+		],
+		[
+			"historical exact old field",
+			{ ...base, supervisorProcessStartId: "win:11" },
+			{ pid: 42, processStartId: "win:11" },
+		],
+		["legacy-only", { ...base, supervisorProcessStartId: "proc:11" }, { pid: 42 }],
+	])("maps %s with authority separation", (_name, hello, expected) => {
+		expect(processIdentityFromDaemonHello(hello as never)).toEqual(expected);
+	});
+	it.each([
+		["malformed", { ...base, supervisorAuthorityProcessStartId: "token:bad" }],
+		[
+			"conflicting",
+			{ ...base, supervisorProcessStartId: "proc:11", supervisorAuthorityProcessStartId: `token:${"9".repeat(64)}` },
+		],
+	])("rejects %s authority", (_name, hello) => {
+		expect(() => processIdentityFromDaemonHello(hello as never)).toThrow(/invalid supervisor process identity/);
+	});
+});
+
 describe("shutdownDaemonAndWait", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 	afterEach(async () => {
@@ -580,6 +722,58 @@ describe("shutdownDaemonAndWait", () => {
 		const daemon = await startFakeDaemon({ sessions: [{ id: "a", activeSessionId: "a", isStreaming: false }] });
 		cleanups.push(daemon.close);
 		expect(await shutdownDaemonAndWait(daemon.socketPath)).toBe(true);
+	});
+
+	it("does not send shutdown when a reachable endpoint provides no hello", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			sendHello: false,
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 50)).toBe(false);
+		expect(commands).not.toContain("shutdown");
+	});
+
+	it("does not send shutdown for a hello with no valid supervisor PID", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			helloIdentity: { supervisorPid: undefined },
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 50)).toBe(false);
+		expect(commands).not.toContain("shutdown");
+	});
+
+	it("does not send shutdown for a recycled exact supervisor identity", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			helloIdentity: {
+				supervisorPid: process.pid,
+				supervisorProcessStartId: undefined,
+				supervisorAuthorityProcessStartId: `token:${"f".repeat(64)}`,
+			},
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 50)).toBe(false);
+		expect(commands).not.toContain("shutdown");
+	});
+
+	it("does not send shutdown for a conflicting dual supervisor identity", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({
+			helloIdentity: {
+				supervisorPid: process.pid,
+				supervisorProcessStartId: "proc:11",
+				supervisorAuthorityProcessStartId: `token:${"1".repeat(64)}`,
+			},
+			onCommand: (command) => commands.push(command.type),
+		});
+		cleanups.push(daemon.close);
+		expect(await shutdownDaemonAndWait(daemon.socketPath, 50)).toBe(false);
+		expect(commands).not.toContain("shutdown");
 	});
 
 	it("accepts an exited daemon that leaves a stale socket behind", async () => {

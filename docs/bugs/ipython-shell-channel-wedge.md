@@ -10,11 +10,12 @@ related: []
 <!-- bugs:block:tldr -->
 ## TL;DR
 
-- **Symptom:** A harmless IPython call can remain in `tool_execution_start` forever while Prime reports the session as working.
-- **Impact:** Long-lived home-server sessions stop making progress and require a kernel or worker restart.
-- **Most likely cause:** `KernelManager` consumes one shell reply during startup and never drains later `execute_reply` traffic. The observed worker had lost its shell TCP connection while IOPub/control and the idle kernel remained alive; the pending cell never reached IPython history. The unbounded Dealer send and IOPub-only completion wait then never settled.
-- **Next action:** Drain shell replies for the kernel lifetime, make disconnected shell sends bounded and connection-aware, and fail an active execution loudly if its shell transport disconnects.
-- **Status:** Closed.
+> **Historical record:** The CPython cutover removed the Jupyter/IPython/ZeroMQ shell-channel runtime described below. Current Python REPL execution uses the CPython JSON-lines stdio protocol, so this failure mode and its fork-server-era diagnostics no longer apply.
+
+- **Symptom (legacy runtime):** A harmless IPython call could remain in `tool_execution_start` forever while Prime reported the session as working.
+- **Impact:** Long-lived home-server sessions stopped making progress and required a kernel or worker restart.
+- **Cause:** The removed `KernelManager` consumed one shell reply during startup and did not continuously drain later `execute_reply` traffic.
+- **Resolution:** Closed by the CPython runtime cutover; no current action remains. The implementation notes below document the 2026-08-08 fix for the retired runtime.
 <!-- /bugs:block:tldr -->
 
 <!-- bugs:block:analysis -->

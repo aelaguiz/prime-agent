@@ -38,7 +38,7 @@ async function createBundle(buildId) {
 		platform: "node",
 		// Native or interop-sensitive packages stay external; they resolve from
 		// node_modules at runtime (and are loaded via createRequire/lazily anyway).
-		external: ["zeromq", "koffi", "undici", "@silvia-odwyer/photon-node", "@mariozechner/clipboard"],
+		external: ["koffi", "undici", "@silvia-odwyer/photon-node", "@mariozechner/clipboard"],
 		define: { __PI_BUNDLED__: "true", __PI_BUILD_ID__: JSON.stringify(buildId) },
 		banner: {
 			js: `// prime-agent-bundle-build-id: ${buildId}\nimport { createRequire as __piBundleCreateRequire } from 'node:module'; const require = __piBundleCreateRequire(import.meta.url);`,

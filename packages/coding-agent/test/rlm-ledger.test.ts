@@ -41,10 +41,12 @@ import { AgentDaemon } from "../src/modes/daemon/daemon-mode.js";
 import type { DaemonCommand } from "../src/modes/daemon/daemon-protocol.js";
 import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 import {
+	discoverRlmLedgerSessionsDirForChild,
 	RLM_LEDGER_MAX_BYTES,
 	RLM_LEDGER_MAX_RECORDS,
 	type RlmLedgerDeleteReason,
 	RlmSpawnLedger,
+	readLegacyRlmSubagentRegistry,
 	rlmLedgerPath,
 } from "../src/modes/daemon/rlm-ledger.js";
 
@@ -99,6 +101,186 @@ describe("rlm spawn ledger", () => {
 			expect(JSON.parse(lines[4])).toMatchObject({ v: 1, op: "delete", reason: "revoked" });
 			expect(statSync(ledger.ledgerPath).mode & 0o777).toBe(0o600);
 			expect(statSync(dirname(ledger.ledgerPath)).mode & 0o777).toBe(0o700);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("discovers exactly one authoritative sessions directory for a missing child", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-discovery-"));
+		try {
+			const sessionsA = join(root, "sessions-a");
+			const sessionsB = join(root, "sessions-b");
+			mkdirSync(sessionsA, { recursive: true });
+			mkdirSync(sessionsB, { recursive: true });
+			const child = join(root, "session-artifacts", "parent", "sub-child", "child.jsonl");
+			await new RlmSpawnLedger(root, sessionsA).appendSpawn({
+				childId: "sub-target",
+				parent: join(sessionsA, "parent.jsonl"),
+				child,
+				depth: 1,
+				name: "target",
+			});
+			await new RlmSpawnLedger(root, sessionsB).appendSpawn({
+				childId: "sub-other",
+				parent: join(sessionsB, "parent.jsonl"),
+				child: join(root, "other-child.jsonl"),
+				depth: 1,
+				name: "other",
+			});
+
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).resolves.toBe(realpathSync(sessionsA));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("recovers a crashed first writer before a second instance appends and remains discoverable", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-first-writer-race-"));
+		let releaseCrashedSeed!: () => void;
+		const crashedSeedGate = new Promise<void>((resolve) => {
+			releaseCrashedSeed = resolve;
+		});
+		let markEmptyFilePublished!: () => void;
+		const emptyFilePublished = new Promise<void>((resolve) => {
+			markEmptyFilePublished = resolve;
+		});
+		try {
+			const sessionsDir = join(root, "sessions");
+			mkdirSync(sessionsDir, { recursive: true });
+			writeFileSync(join(sessionsDir, "parent.jsonl"), "{}\n");
+			const firstChild = join(root, "session-artifacts", "first.jsonl");
+			const secondChild = join(root, "session-artifacts", "second.jsonl");
+			const crashedWriter = new RlmSpawnLedger(root, sessionsDir, {
+				readRegistryForSessionFile: async () => {
+					mkdirSync(dirname(rlmLedgerPath(root, sessionsDir)), { recursive: true });
+					writeFileSync(rlmLedgerPath(root, sessionsDir), "");
+					markEmptyFilePublished();
+					await crashedSeedGate;
+					throw new Error("simulated first-writer crash");
+				},
+			});
+			const recoveringWriter = new RlmSpawnLedger(root, sessionsDir);
+			const firstAppend = crashedWriter.appendSpawn({
+				childId: "sub-first",
+				parent: join(sessionsDir, "parent.jsonl"),
+				child: firstChild,
+				depth: 1,
+				name: "first",
+			});
+			await emptyFilePublished;
+			await recoveringWriter.appendSpawn({
+				childId: "sub-second",
+				parent: join(sessionsDir, "parent.jsonl"),
+				child: secondChild,
+				depth: 1,
+				name: "second",
+			});
+			releaseCrashedSeed();
+			await firstAppend;
+
+			const records = readFileSync(crashedWriter.ledgerPath, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as { op: string });
+			expect(records[0]?.op).toBe("meta");
+			expect(records.filter((record) => record.op === "meta")).toHaveLength(1);
+			expect(records.filter((record) => record.op === "spawn")).toHaveLength(2);
+			await expect(discoverRlmLedgerSessionsDirForChild(root, firstChild)).resolves.toBe(realpathSync(sessionsDir));
+			await expect(discoverRlmLedgerSessionsDirForChild(root, secondChild)).resolves.toBe(realpathSync(sessionsDir));
+		} finally {
+			releaseCrashedSeed();
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("accepts identical duplicate metadata but rejects missing or conflicting ownership", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-duplicate-meta-"));
+		try {
+			const sessionsDir = join(root, "sessions");
+			mkdirSync(sessionsDir, { recursive: true });
+			const child = join(root, "missing-child.jsonl");
+			const ledger = new RlmSpawnLedger(root, sessionsDir);
+			await ledger.appendSpawn({
+				childId: "sub-target",
+				parent: join(sessionsDir, "parent.jsonl"),
+				child,
+				depth: 1,
+				name: "target",
+			});
+			const records = readFileSync(ledger.ledgerPath, "utf8").trim().split("\n");
+			writeFileSync(ledger.ledgerPath, `${records.join("\n")}\n${records[0]}\n`);
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).resolves.toBe(realpathSync(sessionsDir));
+
+			const conflicting = JSON.stringify({
+				...JSON.parse(records[0]!),
+				sessionsDir: join(root, "wrong-sessions"),
+			});
+			writeFileSync(ledger.ledgerPath, `${records.join("\n")}\n${conflicting}\n`);
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).rejects.toThrow(
+				"conflicting sessions-directory metadata",
+			);
+			await expect(ledger.edges()).rejects.toThrow("conflicting sessions-directory metadata");
+
+			writeFileSync(ledger.ledgerPath, `${records.slice(1).join("\n")}\n`);
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).rejects.toThrow(
+				"has no sessions-directory metadata",
+			);
+			await expect(ledger.edges()).rejects.toThrow("has no sessions-directory metadata");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when missing-child ledger discovery is absent or ambiguous", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-discovery-closed-"));
+		try {
+			const child = join(root, "missing-child.jsonl");
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).rejects.toThrow("No authoritative RLM ledger");
+
+			for (const suffix of ["a", "b"]) {
+				const sessionsDir = join(root, `sessions-${suffix}`);
+				mkdirSync(sessionsDir, { recursive: true });
+				await new RlmSpawnLedger(root, sessionsDir).appendSpawn({
+					childId: `sub-${suffix}`,
+					parent: join(sessionsDir, "parent.jsonl"),
+					child,
+					depth: 1,
+					name: `child-${suffix}`,
+				});
+			}
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).rejects.toThrow(
+				"Multiple authoritative RLM ledgers",
+			);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects discovery when ledger metadata does not own its hashed path", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-discovery-meta-"));
+		try {
+			const sessionsDir = join(root, "sessions");
+			const otherDir = join(root, "other-sessions");
+			mkdirSync(sessionsDir, { recursive: true });
+			mkdirSync(otherDir, { recursive: true });
+			const child = join(root, "missing-child.jsonl");
+			const ledger = new RlmSpawnLedger(root, sessionsDir);
+			await ledger.appendSpawn({
+				childId: "sub-target",
+				parent: join(sessionsDir, "parent.jsonl"),
+				child,
+				depth: 1,
+				name: "target",
+			});
+			const records = readFileSync(ledger.ledgerPath, "utf8").trimEnd().split("\n");
+			records[0] = JSON.stringify({ ...JSON.parse(records[0]!), sessionsDir: otherDir });
+			writeFileSync(ledger.ledgerPath, `${records.join("\n")}\n`);
+
+			await expect(discoverRlmLedgerSessionsDirForChild(root, child)).rejects.toThrow(
+				"does not match its sessions-directory metadata",
+			);
+			await expect(ledger.edges()).rejects.toThrow("does not match its sessions-directory metadata");
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
@@ -782,6 +964,40 @@ describe("rlm spawn ledger daemon wiring", () => {
 		}
 	});
 
+	it("keeps a registry entry whose optional rlmMaxDepth is damaged, dropping only the field", async () => {
+		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-damaged-maxdepth-"));
+		try {
+			const registryPath = join(tempDir, "rlm-subagents.jsonl");
+			const entry = (childId: string, overrides: Record<string, unknown>) => ({
+				type: "rlm_subagent",
+				childId,
+				sessionName: `${childId}-worker`,
+				sessionDir: join(tempDir, childId),
+				sessionFile: join(tempDir, childId, "session.jsonl"),
+				status: "completed",
+				rlmDepth: 1,
+				rlmMaxDepth: 4,
+				createdAt: 1,
+				updatedAt: "2026-01-01T00:00:00.000Z",
+				...overrides,
+			});
+			writeFileSync(
+				registryPath,
+				`${[
+					JSON.stringify(entry("sub-11111111", {})),
+					JSON.stringify(entry("sub-22222222", { rlmMaxDepth: "corrupt" })),
+				].join("\n")}\n`,
+			);
+
+			const entries = await readLegacyRlmSubagentRegistry(registryPath);
+			expect(entries.map((item) => item.childId).sort()).toEqual(["sub-11111111", "sub-22222222"]);
+			expect(entries.find((item) => item.childId === "sub-11111111")?.rlmMaxDepth).toBe(4);
+			expect(entries.find((item) => item.childId === "sub-22222222")?.rlmMaxDepth).toBeUndefined();
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("leaves no ledger file behind an interrupted seed and re-seeds completely", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "prime-rlm-ledger-seed-crash-"));
 		try {
@@ -1069,7 +1285,10 @@ describe("rlm spawn ledger supervisor wiring", () => {
 				defaultSessionConfig: { agentDir: tempDir, cwd: tempDir, sessionDir: sessionsDir },
 				descriptorDir: join(tempDir, "workers"),
 			}) as unknown as SupervisorLedgerInternals;
-			const rename = vi.fn(async () => {});
+			const rename = vi.fn(async (_sessionPath: string, name: string) => {
+				child.manager.appendSessionInfo(name);
+				child.manager.flushNow();
+			});
 			Object.assign(supervisor.catalog, { rename });
 			const ledger = supervisor.rlmSpawnLedger();
 			await ledger.appendSpawn({
@@ -1084,7 +1303,21 @@ describe("rlm spawn ledger supervisor wiring", () => {
 				{},
 				{ type: "rename_saved_session", sessionPath: child.file, name: "new-name" },
 			);
-			expect(rename).toHaveBeenCalledWith(child.file, "new-name");
+			expect(rename).toHaveBeenCalledWith(canonicalSessionPath(child.file), "new-name");
+			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ name: "new-name" })]);
+
+			rename.mockClear();
+			vi.spyOn(ledger, "appendRenameByChildPath").mockRejectedValueOnce(new Error("ledger unavailable"));
+			await expect(
+				supervisor.handleCommand(
+					{},
+					{ type: "rename_saved_session", sessionPath: child.file, name: "failed-name" },
+				),
+			).rejects.toThrow("ledger unavailable");
+			expect(rename.mock.calls).toEqual([
+				[canonicalSessionPath(child.file), "failed-name"],
+				[canonicalSessionPath(child.file), "new-name"],
+			]);
 			await expect(ledger.edges()).resolves.toEqual([expect.objectContaining({ name: "new-name" })]);
 		} finally {
 			rmSync(tempDir, { recursive: true, force: true });

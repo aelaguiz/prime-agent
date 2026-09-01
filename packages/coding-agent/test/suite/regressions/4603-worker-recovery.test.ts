@@ -1,27 +1,24 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import {
-	chmodSync,
-	existsSync,
-	linkSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { APP_NAME, ENV_AGENT_DIR } from "../../../src/config.js";
-import { getProcessStartId } from "../../../src/core/session-lease.js";
+import {
+	createProcessIdentityOwnerToken,
+	getProcessStartId,
+	isExactProcessStartId,
+	matchesExactProcessIdentity,
+} from "../../../src/core/session-lease.js";
 import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
 import type { DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
 import {
 	acquireDaemonShutdownAdmission,
-	acquireDaemonSupervisorOwnership,
+	daemonSupervisorOwnerAuthorityProcessStartId,
+	daemonSupervisorOwnerLegacyProcessStartId,
 } from "../../../src/modes/daemon/daemon-supervisor-ownership.js";
 import {
 	DAEMON_WORKER_ACTIVE_SESSION_ID_ENV,
@@ -41,10 +38,17 @@ import {
 import { createHarness, type Harness } from "../harness.js";
 
 interface OwnerRecord {
+	version: 1;
+	role: "supervisor";
+	appVersion: string;
+	phase: "starting" | "owner" | "stopping";
+	createdAt: string;
+	updatedAt: string;
 	token: string;
 	generation: string;
 	pid: number;
 	processStartId?: string;
+	authorityProcessStartId?: string;
 	socketPath: string;
 	descriptorDir: string;
 	agentDir: string;
@@ -54,7 +58,8 @@ type FixtureMessage =
 	| { type: "booted" }
 	| { type: "ready" }
 	| { type: "failed"; error: string }
-	| { type: "runtime_released" };
+	| { type: "runtime_released" }
+	| { type: "owner_released" };
 
 interface ProcessHandle {
 	child: ChildProcess;
@@ -76,11 +81,6 @@ interface FixtureProcessIdentity {
 	role: "client" | "supervisor" | "worker";
 }
 
-interface FixtureProcessSnapshot {
-	ppid: number;
-	state: string;
-}
-
 interface TestPaths {
 	agentDir: string;
 	descriptorDir: string;
@@ -93,7 +93,8 @@ interface TestPaths {
 const fixturePath = resolve(__dirname, "../../fixtures/eng-4600-supervisor-fixture.ts");
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const cliPath = resolve(__dirname, "../../../src/cli.ts");
-const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+const tsxPreflightPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/preflight.cjs");
+const tsxLoaderUrl = pathToFileURL(resolve(__dirname, "../../../../../node_modules/tsx/dist/loader.mjs")).href;
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const handles = new Set<ProcessHandle>();
@@ -129,6 +130,10 @@ async function createPaths(): Promise<TestPaths> {
 	linkSync(process.execPath, executablePath);
 	const socketTmpDir = `/tmp/eng-4603-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	mkdirSync(socketTmpDir, { recursive: true, mode: 0o700 });
+	mkdirSync(join(socketTmpDir, `prime-agent-${typeof process.getuid === "function" ? process.getuid() : "user"}`), {
+		recursive: true,
+		mode: 0o700,
+	});
 	socketTempDirs.add(socketTmpDir);
 	fixtureDescriptorDirs.add(join(harness.tempDir, "workers"));
 	fixtureRegistryDirs.add(join(harness.tempDir, "registry"));
@@ -146,8 +151,9 @@ async function createPaths(): Promise<TestPaths> {
 }
 
 function spawnSupervisor(paths: TestPaths): ProcessHandle {
+	const identity = createProcessIdentityOwnerToken();
 	return trackProcess(
-		spawn(paths.executablePath, [tsxPath, fixturePath], {
+		spawn(paths.executablePath, ["--require", tsxPreflightPath, "--import", tsxLoaderUrl, fixturePath], {
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -163,8 +169,37 @@ function spawnSupervisor(paths: TestPaths): ProcessHandle {
 				TSX_TSCONFIG_PATH: tsconfigPath,
 			},
 			stdio: ["ignore", "pipe", "pipe", "ipc"],
+			argv0: identity.argument,
 		}),
 		"supervisor",
+		process.platform === "darwin" ? identity.processStartId : undefined,
+	);
+}
+
+function spawnOwnershipHolder(paths: TestPaths, generation: string): ProcessHandle {
+	const identity = createProcessIdentityOwnerToken();
+	return trackProcess(
+		spawn(paths.executablePath, ["--require", tsxPreflightPath, "--import", tsxLoaderUrl, fixturePath], {
+			cwd: paths.agentDir,
+			env: {
+				...process.env,
+				[supervisorRegistryDirEnv]: paths.registryDir,
+				[ENV_AGENT_DIR]: paths.agentDir,
+				ENG_4600_AGENT_DIR: paths.agentDir,
+				ENG_4600_DESCRIPTOR_DIR: paths.descriptorDir,
+				ENG_4600_FIXTURE_MODE: "owner",
+				ENG_4600_GENERATION: generation,
+				ENG_4600_REGISTRY_DIR: paths.registryDir,
+				ENG_4600_SOCKET_PATH: paths.socketPath,
+				PI_OFFLINE: "1",
+				TMPDIR: paths.socketTmpDir,
+				TSX_TSCONFIG_PATH: tsconfigPath,
+			},
+			stdio: ["ignore", "pipe", "pipe", "ipc"],
+			argv0: identity.argument,
+		}),
+		"supervisor",
+		process.platform === "darwin" ? identity.processStartId : undefined,
 	);
 }
 
@@ -174,10 +209,22 @@ function spawnStandaloneWorker(
 	token: string,
 	extraEnv: NodeJS.ProcessEnv = {},
 ): ProcessHandle {
+	const identity = createProcessIdentityOwnerToken();
 	return trackProcess(
 		spawn(
 			paths.executablePath,
-			[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", workerSocketPath, "--offline"],
+			[
+				"--require",
+				tsxPreflightPath,
+				"--import",
+				tsxLoaderUrl,
+				cliPath,
+				"--mode",
+				"daemon",
+				"--daemon-socket",
+				workerSocketPath,
+				"--offline",
+			],
 			{
 				cwd: paths.agentDir,
 				env: {
@@ -193,14 +240,24 @@ function spawnStandaloneWorker(
 					TSX_TSCONFIG_PATH: tsconfigPath,
 				},
 				stdio: ["ignore", "pipe", "pipe"],
+				argv0: identity.argument,
 			},
 		),
 		"worker",
+		process.platform === "darwin" ? identity.processStartId : undefined,
 	);
 }
 
-function trackProcess(child: ChildProcess, role: FixtureProcessIdentity["role"]): ProcessHandle {
-	const identity = registerFixtureProcess(child.pid, getProcessStartId(child.pid ?? -1), role);
+function trackProcess(
+	child: ChildProcess,
+	role: FixtureProcessIdentity["role"],
+	expectedProcessStartId?: string,
+): ProcessHandle {
+	const identity = registerFixtureProcess(
+		child.pid,
+		expectedProcessStartId ?? getProcessStartId(child.pid ?? -1),
+		role,
+	);
 	const handle: ProcessHandle = { child, identity, role, stdout: "", stderr: "", messages: [], waiters: [] };
 	handles.add(handle);
 	child.stdout?.on("data", (chunk: Buffer) => {
@@ -281,64 +338,24 @@ function registerFixtureRecord(value: unknown, role: "supervisor" | "worker", pa
 	if (!value || typeof value !== "object") {
 		throw new Error(`Invalid fixture process record: ${path}`);
 	}
-	const record = value as { pid?: unknown; processStartId?: unknown };
-	if (
-		typeof record.pid !== "number" ||
-		!Number.isSafeInteger(record.pid) ||
-		record.pid <= 0 ||
-		typeof record.processStartId !== "string" ||
-		record.processStartId.length === 0
-	) {
+	const record = value as {
+		pid?: unknown;
+		processStartId?: unknown;
+		authorityProcessStartId?: unknown;
+	};
+	if (typeof record.pid !== "number" || !Number.isSafeInteger(record.pid) || record.pid <= 0) {
 		throw new Error(`Invalid fixture process identity: ${path}`);
 	}
-	return registerFixtureProcess(record.pid, record.processStartId, role)!;
-}
-
-function readFixtureProcessSnapshot(): Map<number, FixtureProcessSnapshot> {
-	const listing = spawnSync("ps", ["-axo", "pid=,ppid=,state="], { encoding: "utf8" });
-	if (listing.error) throw listing.error;
-	if (listing.status !== 0) {
-		throw new Error(`Could not enumerate fixture descendants: ${listing.stderr.trim()}`);
+	const authorityProcessStartId =
+		typeof record.authorityProcessStartId === "string" && isExactProcessStartId(record.authorityProcessStartId)
+			? record.authorityProcessStartId
+			: typeof record.processStartId === "string" && isExactProcessStartId(record.processStartId)
+				? record.processStartId
+				: undefined;
+	if (!authorityProcessStartId) {
+		throw new Error(`Fixture process identity is retained and non-signalling: ${path}`);
 	}
-	const processes = new Map<number, FixtureProcessSnapshot>();
-	for (const line of listing.stdout.split("\n")) {
-		const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
-		if (!match) continue;
-		processes.set(Number(match[1]), { ppid: Number(match[2]), state: match[3]! });
-	}
-	return processes;
-}
-
-function fixtureDescendantPids(rootPid: number, processes: Map<number, FixtureProcessSnapshot>): number[] {
-	const childrenByParent = new Map<number, number[]>();
-	for (const [pid, process] of processes) {
-		const children = childrenByParent.get(process.ppid) ?? [];
-		children.push(pid);
-		childrenByParent.set(process.ppid, children);
-	}
-	const descendants: number[] = [];
-	const pending = [rootPid];
-	while (pending.length > 0) {
-		const parentPid = pending.shift()!;
-		for (const childPid of childrenByParent.get(parentPid) ?? []) {
-			descendants.push(childPid);
-			pending.push(childPid);
-		}
-	}
-	return descendants;
-}
-
-function isFixtureDescendant(pid: number, rootPid: number, processes: Map<number, FixtureProcessSnapshot>): boolean {
-	const visited = new Set<number>();
-	let current = pid;
-	while (!visited.has(current)) {
-		visited.add(current);
-		const process = processes.get(current);
-		if (!process) return false;
-		if (process.ppid === rootPid) return true;
-		current = process.ppid;
-	}
-	return false;
+	return registerFixtureProcess(record.pid, authorityProcessStartId, role)!;
 }
 
 function signalFixtureProcess(identity: FixtureProcessIdentity, signal: NodeJS.Signals): boolean {
@@ -356,76 +373,25 @@ function signalFixtureProcess(identity: FixtureProcessIdentity, signal: NodeJS.S
 	}
 }
 
-async function terminateFixtureProcessTree(root: FixtureProcessIdentity): Promise<void> {
-	if (fixtureProcessState(root) === "exited") return;
-	if (process.platform === "win32") {
-		if (signalFixtureProcess(root, "SIGKILL")) await waitForFixtureProcessExit(root);
-		return;
-	}
-	if (!signalFixtureProcess(root, "SIGSTOP")) return;
-	if (!(await waitForFixtureProcessStopped(root))) {
-		throw new Error(`Fixture root ${root.pid}/${root.processStartId} exited before descendant discovery`);
-	}
-	const tree = new Map<string, FixtureProcessIdentity>([[`${root.pid}:${root.processStartId}`, root]]);
-	let unchangedScans = 0;
-	while (unchangedScans < 2) {
-		const processesBefore = readFixtureProcessSnapshot();
-		let discovered = 0;
-		for (const pid of fixtureDescendantPids(root.pid, processesBefore)) {
-			const processStartId = getProcessStartId(pid);
-			if (!processStartId) {
-				if (fixturePidIsAlive(pid)) throw new Error(`Live fixture descendant ${pid} has no exact start identity`);
-				continue;
-			}
-			if (
-				[...tree.values()].some((identity) => identity.pid === pid && identity.processStartId === processStartId)
-			) {
-				continue;
-			}
-			const processesAfter = readFixtureProcessSnapshot();
-			const currentStartId = getProcessStartId(pid);
-			if (currentStartId !== processStartId) {
-				if (currentStartId === undefined && fixturePidIsAlive(pid)) {
-					throw new Error(`Could not revalidate fixture descendant ${pid}`);
-				}
-				continue;
-			}
-			if (!isFixtureDescendant(pid, root.pid, processesAfter)) {
-				throw new Error(`Fixture descendant ${pid}/${processStartId} changed ancestry during cleanup`);
-			}
-			const identity = registerFixtureProcess(pid, processStartId, "worker")!;
-			tree.set(`${identity.pid}:${identity.processStartId}`, identity);
-			if (signalFixtureProcess(identity, "SIGSTOP")) {
-				await waitForFixtureProcessStopped(identity);
-			}
-			discovered++;
-		}
-		unchangedScans = discovered === 0 ? unchangedScans + 1 : 0;
-		await delay(25);
-	}
-	for (const identity of [...tree.values()].reverse()) {
-		signalFixtureProcess(identity, "SIGKILL");
-	}
-	for (const identity of tree.values()) {
-		await waitForFixtureProcessExit(identity);
-	}
-}
-
-async function waitForFixtureProcessStopped(identity: FixtureProcessIdentity, timeoutMs = 5000): Promise<boolean> {
+async function waitForFixtureProcessStopped(identity: FixtureProcessIdentity, timeoutMs = 5000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		const state = fixtureProcessState(identity);
-		if (state === "exited") return false;
-		if (state === "unverified") {
-			throw new Error(`Could not verify fixture process ${identity.pid}/${identity.processStartId}`);
+		if (fixtureProcessState(identity) !== "matching") {
+			throw new Error(`Fixture process ${identity.pid}/${identity.processStartId} exited before stopping`);
 		}
-		const processStatus = readFixtureProcessSnapshot().get(identity.pid)?.state;
-		if (processStatus && ["T", "Z"].includes(processStatus[0]!) && fixtureProcessState(identity) === "matching") {
-			return true;
-		}
+		const status = spawnSync("ps", ["-o", "state=", "-p", String(identity.pid)], { encoding: "utf8" });
+		if (/^\s*T/.test(status.stdout) && fixtureProcessState(identity) === "matching") return;
 		await delay(25);
 	}
 	throw new Error(`Timed out waiting for fixture process ${identity.pid}/${identity.processStartId} to stop`);
+}
+
+async function terminateFixtureProcessTree(root: FixtureProcessIdentity): Promise<void> {
+	if (fixtureProcessState(root) === "exited") return;
+	// Every destructive send is authorized by the root's recorded exact identity.
+	// Other exact worker roots are registered separately from durable descriptors;
+	// never promote an unqualified descendant discovered only through ps.
+	if (signalFixtureProcess(root, "SIGKILL")) await waitForFixtureProcessExit(root);
 }
 
 function readFixtureDirectory(path: string): string[] {
@@ -535,19 +501,34 @@ function waitForMessage(
 	});
 }
 
-function waitForType<T extends FixtureMessage["type"]>(
+async function waitForType<T extends FixtureMessage["type"]>(
 	handle: ProcessHandle,
 	type: T,
 	timeoutMs?: number,
 ): Promise<Extract<FixtureMessage, { type: T }>> {
-	return waitForMessage(handle, (message) => message.type === type || message.type === "failed", timeoutMs)
-		.then((message) => {
-			if (message.type === "failed") throw new Error(message.error);
-			return message as Extract<FixtureMessage, { type: T }>;
-		})
-		.catch((error: unknown) => {
-			throw new Error(`Timed out waiting for fixture message ${type}: ${String(error)}`);
-		});
+	try {
+		const message = await waitForMessage(
+			handle,
+			(candidate) => candidate.type === type || candidate.type === "failed",
+			timeoutMs,
+		);
+		if (message.type === "failed") throw new Error(message.error);
+		if (handle.role !== "client" && handle.identity) {
+			const deadline = Date.now() + 5_000;
+			while (
+				!matchesExactProcessIdentity(handle.identity.pid, handle.identity.processStartId) &&
+				Date.now() < deadline
+			) {
+				await delay(10);
+			}
+			if (!matchesExactProcessIdentity(handle.identity.pid, handle.identity.processStartId)) {
+				throw new Error(`Fixture ${handle.role} hello did not match its spawned process authority`);
+			}
+		}
+		return message as Extract<FixtureMessage, { type: T }>;
+	} catch (error) {
+		throw new Error(`Timed out waiting for fixture message ${type}: ${String(error)}`);
+	}
 }
 
 function waitForExit(handle: ProcessHandle, timeoutMs = 30_000): Promise<void> {
@@ -676,8 +657,9 @@ async function runCli(
 	timeoutMs = 60_000,
 	extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+	const identity = createProcessIdentityOwnerToken();
 	const handle = trackProcess(
-		spawn(process.execPath, [tsxPath, cliPath, ...args], {
+		spawn(process.execPath, ["--require", tsxPreflightPath, "--import", tsxLoaderUrl, cliPath, ...args], {
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -689,8 +671,10 @@ async function runCli(
 				TSX_TSCONFIG_PATH: tsconfigPath,
 			},
 			stdio: ["ignore", "pipe", "pipe"],
+			argv0: identity.argument,
 		}),
 		"client",
+		process.platform === "darwin" ? identity.processStartId : undefined,
 	);
 	await waitForExit(handle, timeoutMs);
 	return { code: handle.child.exitCode ?? 0, stdout: handle.stdout, stderr: handle.stderr };
@@ -826,8 +810,14 @@ describe("ENG-4603 worker recovery convergence", () => {
 			await delay(25);
 		}
 		if (!replacement) throw new Error("Fresh client context did not replace the failed worker");
-		expect(getProcessStartId(replacement.pid)).toBe(replacement.processStartId);
-		expect(exactProcessIsAlive(replacement.pid, replacement.processStartId)).toBe(true);
+		const replacementProcessStartId =
+			replacement.authorityProcessStartId ??
+			(replacement.processStartId && isExactProcessStartId(replacement.processStartId)
+				? replacement.processStartId
+				: undefined);
+		if (!replacementProcessStartId) throw new Error("Replacement descriptor retained no exact authority");
+		expect(getProcessStartId(replacement.pid)).toBe(replacementProcessStartId);
+		expect(exactProcessIsAlive(replacement.pid, replacementProcessStartId)).toBe(true);
 		expect(readdirSync(paths.descriptorDir).filter((name) => name.endsWith(".json"))).toHaveLength(1);
 
 		const connection = await DaemonAgentConnection.attach(
@@ -849,7 +839,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 		successorClient.close();
 		predecessorClient.close();
 		await waitForExit(successor);
-		await waitForExactProcessExit(replacement.pid, replacement.processStartId);
+		await waitForExactProcessExit(replacement.pid, replacementProcessStartId);
 		await terminateTrackedFixtureProcess(predecessor);
 	}, 150_000);
 
@@ -858,25 +848,16 @@ describe("ENG-4603 worker recovery convergence", () => {
 		const workerPaths = await createPaths();
 		const workerSocketPath = join(workerPaths.agentDir, "worker-command.sock");
 		const token = "eng-4603-token";
-		const psCountPath = join(workerPaths.agentDir, "ps-count");
 		const workerEnvironment: NodeJS.ProcessEnv = {};
-		if (process.platform === "darwin") {
-			const psWrapperPath = join(workerPaths.agentDir, "ps");
-			writeFileSync(psWrapperPath, '#!/bin/sh\nprintf x >> "$ENG_4603_PS_COUNT_PATH"\nexec /bin/ps "$@"\n', {
-				mode: 0o700,
-			});
-			chmodSync(psWrapperPath, 0o700);
-			workerEnvironment.ENG_4603_PS_COUNT_PATH = psCountPath;
-			workerEnvironment.PATH = `${workerPaths.agentDir}:${process.env.PATH ?? ""}`;
-		}
-		const oldOwner = await acquireDaemonSupervisorOwnership({
-			agentDir: workerPaths.agentDir,
-			appVersion: "test",
-			descriptorDir: workerPaths.descriptorDir,
-			generation: "old-generation",
-			registryDir: workerPaths.registryDir,
-			socketPath: workerPaths.socketPath,
-		});
+
+		const oldOwnerProcess = spawnOwnershipHolder(workerPaths, "old-generation");
+		await waitForType(oldOwnerProcess, "booted");
+		oldOwnerProcess.child.send({ type: "go" });
+		await waitForType(oldOwnerProcess, "ready");
+		const oldOwnerRecord = listOwnerRecords(workerPaths.registryDir).find(
+			(record) => record.generation === "old-generation",
+		);
+		if (!oldOwnerRecord) throw new Error("Old supervisor owner was not published");
 		const worker = spawnStandaloneWorker(workerPaths, workerSocketPath, token, workerEnvironment);
 		await waitForPath(workerSocketPath);
 		const socket = createConnection(workerSocketPath);
@@ -895,10 +876,13 @@ describe("ENG-4603 worker recovery convergence", () => {
 						id: authId,
 						type: "worker_auth",
 						token,
-						supervisorGeneration: oldOwner.record.generation,
-						supervisorPid: oldOwner.record.pid,
-						supervisorProcessStartId: oldOwner.record.processStartId,
-						supervisorSocketPath: oldOwner.record.socketPath,
+						supervisorGeneration: oldOwnerRecord.generation,
+						supervisorPid: oldOwnerRecord.pid,
+						...(daemonSupervisorOwnerLegacyProcessStartId(oldOwnerRecord)
+							? { supervisorProcessStartId: daemonSupervisorOwnerLegacyProcessStartId(oldOwnerRecord) }
+							: {}),
+						supervisorAuthorityProcessStartId: daemonSupervisorOwnerAuthorityProcessStartId(oldOwnerRecord),
+						supervisorSocketPath: oldOwnerRecord.socketPath,
 					}),
 				),
 			),
@@ -908,34 +892,22 @@ describe("ENG-4603 worker recovery convergence", () => {
 				await frames.waitFor((frame) => frame.header.kind === "outbound" && frame.header.requestId === authId),
 			).success,
 		).toBe(true);
-		if (process.platform === "darwin") {
-			const countAfterAuthentication = readFileSync(psCountPath, "utf8").length;
-			await delay(750);
-			expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterAuthentication);
-			const ownerPath = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`, "owner.json");
-			const ownerRecord = JSON.parse(readFileSync(ownerPath, "utf8")) as { updatedAt: string };
-			ownerRecord.updatedAt = new Date(Date.now() + 1000).toISOString();
-			const updatedOwnerPath = `${ownerPath}.updated`;
-			writeFileSync(updatedOwnerPath, `${JSON.stringify(ownerRecord, null, 2)}\n`);
-			renameSync(updatedOwnerPath, ownerPath);
-			await delay(500);
-			const countAfterOwnerChange = readFileSync(psCountPath, "utf8").length;
-			expect(countAfterOwnerChange).toBeGreaterThan(countAfterAuthentication);
-			await delay(750);
-			expect(readFileSync(psCountPath, "utf8").length).toBe(countAfterOwnerChange);
-		}
 		const commandId = "stale-list";
 		const commandFrame = encodePrivateFrame<DaemonWorkerFrameHeader>(
 			{ kind: "command", requestId: commandId, commandType: "list" },
 			Buffer.from(serializeJsonLine({ id: commandId, type: "list" })),
 		);
 		socket.write(commandFrame.subarray(0, commandFrame.length - 1));
-		const ownerDirectory = join(workerPaths.registryDir, `${oldOwner.record.generation}.owner`);
+		const ownerDirectory = join(workerPaths.registryDir, `${oldOwnerRecord.generation}.owner`);
 		const ownerPath = join(ownerDirectory, "owner.json");
 		const transitionedOwner = JSON.parse(readFileSync(ownerPath, "utf8")) as OwnerRecord & { updatedAt: string };
 		transitionedOwner.token = "successor-token";
 		transitionedOwner.pid = worker.child.pid!;
-		transitionedOwner.processStartId = getProcessStartId(worker.child.pid!);
+		const transitionedAuthority = getProcessStartId(worker.child.pid!);
+		if (!transitionedAuthority) throw new Error("Worker exact identity is unavailable");
+		transitionedOwner.authorityProcessStartId = transitionedAuthority;
+		if (transitionedAuthority.startsWith("win:")) transitionedOwner.processStartId = transitionedAuthority;
+		else delete transitionedOwner.processStartId;
 		transitionedOwner.updatedAt = new Date().toISOString();
 		const transitionedOwnerPath = `${ownerPath}.transitioned`;
 		writeFileSync(transitionedOwnerPath, `${JSON.stringify(transitionedOwner, null, 2)}\n`);
@@ -946,7 +918,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 		);
 		expect(staleResponse).toMatchObject({ success: false, error: "supervisor_generation_stale" });
 		socket.destroy();
-		await oldOwner.release();
+		await terminateTrackedFixtureProcess(oldOwnerProcess);
 		rmSync(ownerDirectory, { recursive: true, force: true });
 		await terminateTrackedFixtureProcess(worker);
 
@@ -962,24 +934,23 @@ describe("ENG-4603 worker recovery convergence", () => {
 		const journalBefore = existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "";
 		const displacedOwnerDir = join(publicPaths.registryDir, `${publishedOwner.generation}.displaced`);
 		renameSync(join(publicPaths.registryDir, `${publishedOwner.generation}.owner`), displacedOwnerDir);
-		const replacementOwner = await acquireDaemonSupervisorOwnership({
-			agentDir: publicPaths.agentDir,
-			appVersion: "test",
-			descriptorDir: publicPaths.descriptorDir,
-			generation: "journal-successor",
-			registryDir: publicPaths.registryDir,
-			socketPath: publicPaths.socketPath,
-		});
+		const replacementOwnerProcess = spawnOwnershipHolder(publicPaths, "journal-successor");
+		await waitForType(replacementOwnerProcess, "booted");
+		replacementOwnerProcess.child.send({ type: "go" });
+		await waitForType(replacementOwnerProcess, "ready");
 		const rejected = await publicClient.request({ type: "create" });
 		expect(rejected).toMatchObject({ success: false, error: expect.stringContaining("no longer owns") });
 		expect(existsSync(journalPath) ? readFileSync(journalPath, "utf8") : "").toBe(journalBefore);
 		publicClient.close();
-		await replacementOwner.release();
+		replacementOwnerProcess.child.send({ type: "release" });
+		await waitForType(replacementOwnerProcess, "owner_released");
+		replacementOwnerProcess.child.send({ type: "shutdown" });
+		await waitForExit(replacementOwnerProcess);
 		rmSync(displacedOwnerDir, { recursive: true, force: true });
 		await terminateTrackedFixtureProcess(staleSupervisor);
 	}, 90_000);
 
-	it("serializes shutdown admission and reclaims an unrenewed live lease", async () => {
+	it("serializes shutdown admission until the exact owner releases", async () => {
 		const paths = await createPaths();
 		const previousRegistryDir = process.env[supervisorRegistryDirEnv];
 		process.env[supervisorRegistryDirEnv] = paths.registryDir;
@@ -987,16 +958,10 @@ describe("ENG-4603 worker recovery convergence", () => {
 			const first = await acquireDaemonShutdownAdmission();
 			const record = JSON.parse(readFileSync(join(paths.registryDir, "shutdown-admission.json"), "utf8")) as {
 				pid: number;
-				processStartId?: string;
+				authorityProcessStartId?: string;
 			};
 			expect(record.pid).toBe(process.pid);
-			expect(record.processStartId).toBe(getProcessStartId(process.pid));
-			const renewal = Reflect.get(first, "renewal") as object | undefined;
-			const refreshTimer = renewal
-				? (Reflect.get(renewal, "refreshTimer") as ReturnType<typeof setInterval> | undefined)
-				: undefined;
-			if (!refreshTimer) throw new Error("Shutdown admission did not start its lease refresh");
-			clearInterval(refreshTimer);
+			expect(record.authorityProcessStartId).toBe(getProcessStartId(process.pid));
 			let acquired = false;
 			const waiting = acquireDaemonShutdownAdmission().then((admission) => {
 				acquired = true;
@@ -1004,6 +969,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 			});
 			await delay(250);
 			expect(acquired).toBe(false);
+			await first.release();
 			const second = await waiting;
 			expect(acquired).toBe(true);
 			let destructivePasses = 0;
@@ -1015,7 +981,6 @@ describe("ENG-4603 worker recovery convergence", () => {
 			await destructivePass(second);
 			expect(destructivePasses).toBe(1);
 			await second.release();
-			await first.release();
 		} finally {
 			if (previousRegistryDir === undefined) {
 				delete process.env[supervisorRegistryDirEnv];
@@ -1025,7 +990,7 @@ describe("ENG-4603 worker recovery convergence", () => {
 		}
 	}, 15_000);
 
-	it("shutdown --force removes hidden supervisors and workers through the public CLI", async () => {
+	it("shutdown --force stops exact services and retains an ambiguous hidden predecessor", async () => {
 		if (process.platform === "win32") return;
 		const paths = await createPaths();
 		const predecessor = spawnSupervisor(paths);
@@ -1050,7 +1015,10 @@ describe("ENG-4603 worker recovery convergence", () => {
 		const systemLsofPath = spawnSync("which", ["lsof"], { encoding: "utf8" }).stdout.trim();
 		if (!systemLsofPath) throw new Error("Could not locate lsof for the shutdown regression");
 		const lsofPath = join(paths.agentDir, "lsof");
-		writeFileSync(lsofPath, '#!/bin/sh\nexec "$ENG_4603_SYSTEM_LSOF" -nP -F pn -U -a -p "$ENG_4603_LSOF_PIDS"\n', {
+		// Keep the genuine path-only output from the macOS system lsof. The
+		// shutdown path must bind it to an exact hello and stable socket inode;
+		// the hidden predecessor cannot pass that proof after the pathname rebind.
+		writeFileSync(lsofPath, '#!/bin/sh\nexec "$ENG_4603_SYSTEM_LSOF" -nP -F pfnT -U -a -p "$ENG_4603_LSOF_PIDS"\n', {
 			mode: 0o700,
 		});
 		const lsofEnvironment = {
@@ -1058,29 +1026,41 @@ describe("ENG-4603 worker recovery convergence", () => {
 			ENG_4603_SYSTEM_LSOF: systemLsofPath,
 			PATH: `${paths.agentDir}:${process.env.PATH ?? ""}`,
 		};
-		const listenersBeforeShutdown = spawnSync(lsofPath, [], {
+		const listenersBeforeShutdown = spawnSync(lsofPath, ["-nP", "-F", "pfnT", "-U", "-a", "-c", APP_NAME], {
 			encoding: "utf8",
 			env: { ...process.env, ...lsofEnvironment },
 		}).stdout;
 		expect(listenersBeforeShutdown).toContain(`p${predecessor.child.pid}`);
 		expect(listenersBeforeShutdown).toContain(`p${successor.child.pid}`);
+		expect(listenersBeforeShutdown).toContain(`p${workerPid}`);
+		if (!predecessor.identity) throw new Error("Predecessor exact identity is unavailable");
+		expect(signalFixtureProcess(predecessor.identity, "SIGSTOP")).toBe(true);
+		await waitForFixtureProcessStopped(predecessor.identity);
 
 		const shutdown = await runCli(paths, ["shutdown", "--force", "--json"], 60_000, lsofEnvironment);
-		expect(shutdown.code).toBe(0);
-		const shutdownResult = JSON.parse(shutdown.stdout) as { stopped: unknown[]; failed: unknown[] };
-		const survivingIdentities = [
-			{ pid: predecessor.child.pid!, processStartId: predecessorStartId },
-			{ pid: successor.child.pid!, processStartId: successorStartId },
-			{ pid: workerPid, processStartId: workerStartId },
-		].filter((identity) => exactProcessIsAlive(identity.pid, identity.processStartId));
-		if (survivingIdentities.length > 0) {
-			expect(shutdownResult.failed).not.toHaveLength(0);
-		}
-		expect(shutdownResult).toMatchObject({ stopped: expect.any(Array), failed: [] });
-		await waitForExactProcessExit(predecessor.child.pid!, predecessorStartId);
+		expect(
+			shutdown.code,
+			`${shutdown.stderr}
+${shutdown.stdout}`,
+		).toBe(1);
+		const shutdownResult = JSON.parse(shutdown.stdout) as {
+			stopped: Array<{ socketPath: string; action: string }>;
+			failed: Array<{ socketPath: string; reason: string }>;
+		};
+		expect(shutdownResult.stopped).toContainEqual(
+			expect.objectContaining({ action: expect.stringContaining(`pid ${successor.child.pid}`) }),
+		);
+		expect(shutdownResult.failed).toEqual(
+			expect.arrayContaining([expect.objectContaining({ reason: expect.stringContaining("retained") })]),
+		);
+		// Releasing the predecessor unlinked its listener inode before the
+		// successor rebound the same pathname. The predecessor is now ambiguous:
+		// its boot token proves process generation, not current listener ownership.
+		expect(exactProcessIsAlive(predecessor.child.pid!, predecessorStartId)).toBe(true);
 		await waitForExactProcessExit(successor.child.pid!, successorStartId);
 		await waitForExactProcessExit(workerPid, workerStartId);
-		await delay(11_000);
+		expect(exactProcessIsAlive(predecessor.child.pid!, predecessorStartId)).toBe(true);
+		await terminateTrackedFixtureProcess(predecessor);
 		expect(exactProcessIsAlive(predecessor.child.pid!, predecessorStartId)).toBe(false);
 		expect(exactProcessIsAlive(successor.child.pid!, successorStartId)).toBe(false);
 		expect(exactProcessIsAlive(workerPid, workerStartId)).toBe(false);

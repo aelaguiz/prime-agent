@@ -53,7 +53,7 @@ export async function renameDaemonSavedSession(
 	const command: Extract<DaemonCommand, { type: "rename_saved_session" }> =
 		"activeSessionId" in context
 			? { type: "rename_saved_session", activeSessionId: context.activeSessionId, sessionPath, name }
-			: { type: "rename_saved_session", sessionPath, name };
+			: { type: "rename_saved_session", cwd: context.cwd, sessionDir: context.sessionDir, sessionPath, name };
 	const response = await client.request(command);
 	if (!response.success) {
 		throw deserializeDaemonError(response);
@@ -68,7 +68,7 @@ export async function deleteDaemonSavedSession(
 	const command: Extract<DaemonCommand, { type: "delete_saved_session" }> =
 		"activeSessionId" in context
 			? { type: "delete_saved_session", activeSessionId: context.activeSessionId, sessionPath }
-			: { type: "delete_saved_session", sessionPath };
+			: { type: "delete_saved_session", cwd: context.cwd, sessionDir: context.sessionDir, sessionPath };
 	const response = await client.request(command);
 	if (!response.success) {
 		throw deserializeDaemonError(response);

@@ -31,7 +31,7 @@ describe("fork thinking defaults", () => {
 		return result.session;
 	}
 
-	it("starts the three preferred models at xhigh without changing other model defaults", async () => {
+	it("starts Sol at max and the preferred Anthropic models at xhigh without changing other defaults", async () => {
 		const codexHarness = await createHarness({
 			api: "openai-codex-responses",
 			provider: "openai-codex",
@@ -62,7 +62,7 @@ describe("fork thinking defaults", () => {
 			thinkingLevelMap: { xhigh: "xhigh", max: "max" },
 		});
 
-		expect((await createSession(codexHarness, "gpt-5.6-sol")).thinkingLevel).toBe("xhigh");
+		expect((await createSession(codexHarness, "gpt-5.6-sol")).thinkingLevel).toBe("max");
 		expect((await createSession(anthropicHarness, "claude-fable-5")).thinkingLevel).toBe("xhigh");
 		expect((await createSession(anthropicHarness, "claude-opus-5")).thinkingLevel).toBe("xhigh");
 		expect((await createSession(codexHarness, "gpt-5.6-sol-pro")).thinkingLevel).toBe("low");
@@ -81,7 +81,7 @@ describe("fork thinking defaults", () => {
 		});
 		const sessionManager = SessionManager.inMemory(harness.tempDir);
 		const firstSession = await createSession(harness, "gpt-5.6-sol", sessionManager);
-		expect(firstSession.thinkingLevel).toBe("xhigh");
+		expect(firstSession.thinkingLevel).toBe("max");
 
 		sessionManager.appendMessage(userMsg("keep this session"));
 		firstSession.setThinkingLevel("low");
@@ -93,6 +93,6 @@ describe("fork thinking defaults", () => {
 		expect(resumedSession.thinkingLevel).toBe("low");
 
 		const freshSession = await createSession(harness, "gpt-5.6-sol");
-		expect(freshSession.thinkingLevel).toBe("xhigh");
+		expect(freshSession.thinkingLevel).toBe("max");
 	});
 });

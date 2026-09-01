@@ -2,20 +2,28 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { probeRunningDaemonSessions } from "../../../src/cli/daemon-launch.js";
 import {
 	DaemonUpdateRestartStatusWriter,
 	launchDaemonUpdateRestartCoordinator,
 	readDaemonUpdateRestartStatus,
 } from "../../../src/cli/daemon-update-restart.js";
 import { ENV_AGENT_DIR } from "../../../src/config.js";
+import {
+	createProcessIdentityOwnerToken,
+	getProcessStartId,
+	matchesExactProcessIdentity,
+} from "../../../src/core/session-lease.js";
 import { DaemonAgentConnection } from "../../../src/modes/agent-connection/daemon-agent-connection.js";
 import { DaemonClient } from "../../../src/modes/daemon/daemon-client.js";
-import type { DaemonResponse } from "../../../src/modes/daemon/daemon-protocol.js";
+import { type DaemonResponse, parseDaemonSupervisorHelloIdentity } from "../../../src/modes/daemon/daemon-protocol.js";
 import type { SessionSummary } from "../../../src/modes/daemon/daemon-session-list.js";
+import { normalizeSocketPath } from "../../../src/modes/daemon/daemon-socket.js";
 import { createHarness, type Harness } from "../harness.js";
 
 interface SupervisorHandle {
 	child: ChildProcess;
+	processStartId?: string;
 	stdout: string;
 	stderr: string;
 }
@@ -23,6 +31,7 @@ interface SupervisorHandle {
 interface SupervisorOwnerRecord {
 	pid: number;
 	processStartId?: string;
+	authorityProcessStartId?: string;
 	socketPath: string;
 }
 
@@ -30,6 +39,7 @@ const cliPath = resolve(__dirname, "../../../src/cli.ts");
 const fauxExtensionPath = resolve(__dirname, "../../fixtures/eng-4600-faux-extension.ts");
 const launcherFixturePath = resolve(__dirname, "../../fixtures/eng-4606-update-launcher.ts");
 const tsxPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/cli.mjs");
+const tsxLoaderPath = resolve(__dirname, "../../../../../node_modules/tsx/dist/loader.mjs");
 const tsconfigPath = resolve(__dirname, "../../../../../tsconfig.json");
 const supervisorRegistryDirEnv = "PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_REGISTRY_DIR";
 const supervisors = new Set<SupervisorHandle>();
@@ -47,10 +57,12 @@ function spawnSupervisor(paths: {
 	registryDir: string;
 	socketPath: string;
 }): SupervisorHandle {
+	const ownerIdentity = createProcessIdentityOwnerToken();
 	const child = spawn(
 		process.execPath,
-		[tsxPath, cliPath, "--mode", "daemon", "--daemon-socket", paths.socketPath, "--offline"],
+		["--import", tsxLoaderPath, cliPath, "--mode", "daemon", "--daemon-socket", paths.socketPath, "--offline"],
 		{
+			argv0: ownerIdentity.argument,
 			cwd: paths.agentDir,
 			env: {
 				...process.env,
@@ -68,7 +80,12 @@ function spawnSupervisor(paths: {
 			stdio: ["ignore", "pipe", "pipe"],
 		},
 	);
-	const handle: SupervisorHandle = { child, stdout: "", stderr: "" };
+	const handle: SupervisorHandle = {
+		child,
+		processStartId: child.pid ? getProcessStartId(child.pid) : undefined,
+		stdout: "",
+		stderr: "",
+	};
 	supervisors.add(handle);
 	child.stdout?.on("data", (chunk: Buffer) => {
 		handle.stdout += chunk.toString("utf8");
@@ -230,7 +247,15 @@ async function stopDaemon(socketPath: string): Promise<void> {
 	const client = new DaemonClient(socketPath);
 	try {
 		await client.connect(500);
-		await client.waitForHello(2000);
+		const hello = await client.waitForHello(2000);
+		const identity = parseDaemonSupervisorHelloIdentity(hello);
+		if (
+			identity.status !== "exact" ||
+			typeof hello.supervisorPid !== "number" ||
+			!matchesExactProcessIdentity(hello.supervisorPid, identity.authorityProcessStartId)
+		) {
+			return;
+		}
 		await client.request({ type: "shutdown", force: true }, 5000).catch(() => undefined);
 	} catch {
 		return;
@@ -257,10 +282,16 @@ afterEach(async () => {
 	}
 	sockets.clear();
 	for (const supervisor of supervisors) {
-		if (supervisor.child.exitCode === null && supervisor.child.signalCode === null) {
+		if (
+			supervisor.child.exitCode === null &&
+			supervisor.child.signalCode === null &&
+			supervisor.child.pid &&
+			supervisor.processStartId &&
+			matchesExactProcessIdentity(supervisor.child.pid, supervisor.processStartId)
+		) {
 			supervisor.child.kill("SIGKILL");
-			await waitForExit(supervisor.child).catch(() => undefined);
 		}
+		await waitForExit(supervisor.child).catch(() => undefined);
 	}
 	supervisors.clear();
 	while (harnesses.length > 0) {
@@ -364,6 +395,25 @@ describe("ENG-4606 update restart coordinator", () => {
 		const predecessor = spawnSupervisor(paths);
 		const client = await connectEventually(paths.socketPath);
 		const predecessorHello = await client.waitForHello(2000);
+		const predecessorIdentity = parseDaemonSupervisorHelloIdentity(predecessorHello);
+		const predecessorProcessStartId = predecessor.child.pid ? getProcessStartId(predecessor.child.pid) : undefined;
+		predecessor.processStartId = predecessorProcessStartId;
+		const ownerDeadline = Date.now() + 5_000;
+		let predecessorOwners = listSupervisorOwnerRecords(paths.registryDir);
+		while (predecessorOwners.length !== 1 && Date.now() < ownerDeadline) {
+			await delay(25);
+			predecessorOwners = listSupervisorOwnerRecords(paths.registryDir);
+		}
+		expect(predecessor.child.pid).toBe(predecessorHello.supervisorPid);
+		expect(predecessorIdentity).toMatchObject({
+			status: "exact",
+			authorityProcessStartId: predecessorProcessStartId,
+		});
+		expect(predecessorOwners).toHaveLength(1);
+		expect(predecessorOwners[0]).toMatchObject({
+			pid: predecessor.child.pid,
+			authorityProcessStartId: predecessorProcessStartId,
+		});
 		const created = requireSessionSummary(
 			await client.request(
 				{
@@ -385,6 +435,7 @@ describe("ENG-4606 update restart coordinator", () => {
 			),
 		);
 		const originalActiveSessionId = created.activeSessionId ?? created.id;
+		expect(await probeRunningDaemonSessions(paths.socketPath)).toMatchObject({ reachable: true });
 		const updateCommand = [process.execPath, tsxPath, launcherFixturePath].map(shellQuote).join(" ");
 		const executeResponse = await client.request(
 			{ type: "execute_bash", activeSessionId: originalActiveSessionId, command: updateCommand },
@@ -396,9 +447,9 @@ describe("ENG-4606 update restart coordinator", () => {
 		expect(Number.isInteger(updaterPid)).toBe(true);
 
 		const { status } = await waitForTerminalStatus(paths.agentDir);
-		if (status.phase === "failed") {
+		if (status.phase !== "complete") {
 			throw new Error(
-				`Coordinator failed: ${status.message}\npredecessor stderr:\n${predecessor.stderr}\npredecessor stdout:\n${predecessor.stdout}`,
+				`Coordinator did not complete: ${JSON.stringify(status)}\npredecessor stderr:\n${predecessor.stderr}\npredecessor stdout:\n${predecessor.stdout}`,
 			);
 		}
 		expect(status).toMatchObject({
@@ -415,7 +466,7 @@ describe("ENG-4606 update restart coordinator", () => {
 
 		const replacementClient = await connectEventually(paths.socketPath);
 		const replacementHello = await replacementClient.waitForHello(2000);
-		expect(replacementHello.supervisorSocketPath).toBe(resolve(paths.socketPath));
+		expect(replacementHello.supervisorSocketPath).toBe(normalizeSocketPath(paths.socketPath));
 		const sessions = requireSessionList(await replacementClient.request({ type: "list" }, 30_000));
 		expect(sessions).toHaveLength(1);
 		const restored = sessions[0];
@@ -439,7 +490,18 @@ describe("ENG-4606 update restart coordinator", () => {
 
 		const owners = listSupervisorOwnerRecords(paths.registryDir);
 		expect(owners).toHaveLength(1);
-		expect(owners[0]).toMatchObject({ pid: status.successor?.pid, socketPath: resolve(paths.socketPath) });
+		expect(owners[0]).toMatchObject({
+			pid: status.successor?.pid,
+			socketPath: normalizeSocketPath(paths.socketPath),
+		});
+		const successorOwner = owners[0];
+		if (!successorOwner) throw new Error("Replacement supervisor owner record was not published");
+		const successorProcessStartId = getProcessStartId(successorOwner.pid);
+		expect(parseDaemonSupervisorHelloIdentity(replacementHello)).toMatchObject({
+			status: "exact",
+			authorityProcessStartId: successorProcessStartId,
+		});
+		expect(successorOwner.authorityProcessStartId).toBe(successorProcessStartId);
 		await stopDaemon(paths.socketPath);
 		sockets.delete(paths.socketPath);
 		if (replacementHello.supervisorPid === undefined) {

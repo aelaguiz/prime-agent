@@ -9,6 +9,8 @@ import type { AgentSessionEvent } from "../core/agent-session.js";
 import type { AgentSessionRuntimeConfig } from "../core/agent-session-config.js";
 import { type AgentCronJob, formatAgentCronJob } from "../core/cron-jobs.js";
 import { prepareProcessLifecycleLaunch, recordProcessLifecycle } from "../core/process-lifecycle.js";
+import { createProcessIdentityOwnerToken } from "../core/session-lease.js";
+import { looksLikeSessionPath } from "../core/session-resolver.js";
 import { DaemonClient, type DaemonClientMessageListener } from "../modes/daemon/daemon-client.js";
 import type { DaemonOutbound, DaemonResponse } from "../modes/daemon/daemon-protocol.js";
 import { matchesSessionIdSuffix } from "../modes/daemon/daemon-session-id.js";
@@ -109,7 +111,7 @@ function parseDaemonClientCommand(args: string[]): ParsedDaemonClientCommand {
 			if (!value) {
 				throw new Error(`${arg} requires a value`);
 			}
-			socketPath = normalizeSocketPath(value);
+			socketPath = process.platform === "win32" ? normalizeSocketPath(value) : resolve(expandTildePath(value));
 			index++;
 			continue;
 		}
@@ -626,10 +628,6 @@ function parseExtensionFlagOption(
 	return { consumed: 0, daemonArg: arg };
 }
 
-function looksLikeSessionPath(value: string): boolean {
-	return value.includes("/") || value.includes("\\") || value.endsWith(".jsonl");
-}
-
 function requireOptionValue(args: string[], index: number, option: string): string {
 	const value = args[index + 1];
 	if (!value) {
@@ -696,6 +694,7 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 		parsed.socketPath,
 		...sessionArgs.daemonArgs.filter((arg) => arg !== "--background" && arg !== "-d"),
 	];
+	const ownerIdentity = createProcessIdentityOwnerToken();
 	const trigger = "daemon_command_start";
 	const preparedLaunch = prepareProcessLifecycleLaunch(process.env, {
 		role: "daemon-supervisor",
@@ -711,6 +710,7 @@ async function runStart(parsed: ParsedDaemonClientCommand): Promise<void> {
 	let child: ReturnType<typeof spawn>;
 	try {
 		child = spawn(process.execPath, daemonArgs, {
+			argv0: ownerIdentity.argument,
 			cwd: sessionArgs.config?.cwd ?? process.cwd(),
 			detached: true,
 			env: preparedLaunch.environment,
