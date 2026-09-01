@@ -1,0 +1,1 @@
+- Added Claude Fable 5.1 to the Anthropic catalog and updated OAuth compatibility headers so requests reach the new model.

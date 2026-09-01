@@ -105,6 +105,14 @@ async function runWithoutReasoning(model: Model<"anthropic-messages">): Promise<
 }
 
 describe("Anthropic thinking disable payload", () => {
+	it("registers Claude Fable 5.1 with its reduced cache-read price", () => {
+		expect(getModel("anthropic", "claude-fable-5-1").cost).toMatchObject({
+			input: 10,
+			output: 50,
+			cacheRead: 0.25,
+		});
+	});
+
 	it("sends thinking.type=disabled for budget-based reasoning models when thinking is off", async () => {
 		const payload = await capturePayload(getModel("anthropic", "claude-sonnet-4-5"));
 
@@ -167,33 +175,45 @@ describe("Anthropic thinking disable payload", () => {
 		expect(payload.output_config).toEqual({ effort: "max" });
 	});
 
-	it("omits the thinking param for Claude Fable 5 when reasoning is off (explicit disabled is a 400)", async () => {
-		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"));
+	it.each(["claude-fable-5", "claude-fable-5-1"] as const)(
+		"omits the thinking param for %s when reasoning is off (explicit disabled is a 400)",
+		async (modelId) => {
+			const payload = await capturePayload(getModel("anthropic", modelId));
 
-		expect(payload.thinking).toBeUndefined();
-		expect(payload.output_config).toBeUndefined();
-	});
+			expect(payload.thinking).toBeUndefined();
+			expect(payload.output_config).toBeUndefined();
+		},
+	);
 
-	it("drops temperature for Claude Fable 5 (sampling params are rejected)", async () => {
-		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { temperature: 0.5 });
+	it.each(["claude-fable-5", "claude-fable-5-1"] as const)(
+		"drops temperature for %s (sampling params are rejected)",
+		async (modelId) => {
+			const payload = await capturePayload(getModel("anthropic", modelId), { temperature: 0.5 });
 
-		expect(payload.temperature).toBeUndefined();
-		expect(payload.thinking).toBeUndefined();
-	});
+			expect(payload.temperature).toBeUndefined();
+			expect(payload.thinking).toBeUndefined();
+		},
+	);
 
-	it("uses adaptive thinking with effort=xhigh for Claude Fable 5", async () => {
-		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { reasoning: "xhigh" });
+	it.each(["claude-fable-5", "claude-fable-5-1"] as const)(
+		"uses adaptive thinking with effort=xhigh for %s",
+		async (modelId) => {
+			const payload = await capturePayload(getModel("anthropic", modelId), { reasoning: "xhigh" });
 
-		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
-		expect(payload.output_config).toEqual({ effort: "xhigh" });
-	});
+			expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+			expect(payload.output_config).toEqual({ effort: "xhigh" });
+		},
+	);
 
-	it("maps max reasoning to effort=max for Claude Fable 5", async () => {
-		const payload = await capturePayload(getModel("anthropic", "claude-fable-5"), { reasoning: "max" });
+	it.each(["claude-fable-5", "claude-fable-5-1"] as const)(
+		"maps max reasoning to effort=max for %s",
+		async (modelId) => {
+			const payload = await capturePayload(getModel("anthropic", modelId), { reasoning: "max" });
 
-		expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
-		expect(payload.output_config).toEqual({ effort: "max" });
-	});
+			expect(payload.thinking).toEqual({ type: "adaptive", display: "summarized" });
+			expect(payload.output_config).toEqual({ effort: "max" });
+		},
+	);
 });
 
 describe.skipIf(!process.env.ANTHROPIC_API_KEY)("Anthropic thinking disable E2E", () => {

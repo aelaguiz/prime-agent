@@ -1,0 +1,1 @@
+- Added xhigh default thinking for Claude Fable 5.1 sessions.

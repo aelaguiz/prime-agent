@@ -465,11 +465,14 @@ describe("default model selection", () => {
 		expect(result.thinkingLevel).toBe("medium");
 	});
 
-	test("findInitialModel uses xhigh for a fork-preferred model", async () => {
+	test.each([
+		["claude-fable-5", "Claude Fable 5"],
+		["claude-fable-5-1", "Claude Fable 5.1"],
+	] as const)("findInitialModel uses xhigh for fork-preferred %s", async (modelId, modelName) => {
 		const preferredModel: Model<"anthropic-messages"> = {
 			...mockModels[0],
-			id: "claude-fable-5",
-			name: "Claude Fable 5",
+			id: modelId,
+			name: modelName,
 		};
 		const registry = {
 			refreshAvailableModels: async () => [preferredModel],

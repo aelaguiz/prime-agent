@@ -1571,7 +1571,24 @@ async function loadModelsDevData(): Promise<Model<any>[]> {
 	}
 }
 
+function parseProviderFilter(args: string[]): Set<string> {
+	const providers = new Set<string>();
+	for (let index = 0; index < args.length; index += 1) {
+		if (args[index] !== "--provider") {
+			throw new Error(`Unknown argument: ${args[index]}`);
+		}
+		const provider = args[index + 1]?.trim();
+		if (!provider) {
+			throw new Error("--provider requires a provider ID");
+		}
+		providers.add(provider);
+		index += 1;
+	}
+	return providers;
+}
+
 async function generateModels() {
+	const providerFilter = parseProviderFilter(process.argv.slice(2));
 	// Fetch models from both sources
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras
 	// OpenRouter: xAI and other providers (excluding Anthropic, Google, OpenAI)
@@ -1596,6 +1613,10 @@ async function generateModels() {
 
 	// Temporary overrides until upstream model metadata is corrected.
 	for (const candidate of allModels) {
+		// Anthropic reduced Fable 5.1 cache reads to $0.25/MTok at launch.
+		if (/fable-5(?:[.-])1/.test(candidate.id) && candidate.cost.input === 10 && candidate.cost.output === 50) {
+			candidate.cost.cacheRead = 0.25;
+		}
 		if (candidate.provider === "amazon-bedrock" && candidate.id.includes("anthropic.claude-opus-4-6-v1")) {
 			candidate.cost.cacheRead = 0.5;
 			candidate.cost.cacheWrite = 6.25;
@@ -2370,7 +2391,7 @@ async function generateModels() {
 	}
 
 	// Group by provider and deduplicate by model ID
-	const providers: Record<string, Record<string, Model<any>>> = {};
+	let providers: Record<string, Record<string, Model<any>>> = {};
 	for (const model of allModels) {
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
@@ -2380,6 +2401,22 @@ async function generateModels() {
 		if (!providers[model.provider][model.id]) {
 			providers[model.provider][model.id] = model;
 		}
+	}
+
+	if (providerFilter.size > 0) {
+		const scopedProviders: Record<string, Record<string, Model<any>>> = {};
+		for (const [providerId, existingModels] of Object.entries(EXISTING_MODELS)) {
+			scopedProviders[providerId] = existingModels as unknown as Record<string, Model<any>>;
+		}
+		for (const providerId of providerFilter) {
+			const generatedModels = providers[providerId];
+			if (!generatedModels) {
+				throw new Error(`Unknown generated provider: ${providerId}`);
+			}
+			scopedProviders[providerId] = generatedModels;
+		}
+		providers = scopedProviders;
+		console.log(`Scoped catalog generation to: ${Array.from(providerFilter).sort().join(", ")}`);
 	}
 
 	// Generate TypeScript file
