@@ -5,8 +5,8 @@ Audit log: none (cold plan review approved in session)
 Active scope: whole approved plan through PR creation
 Scope contract anchor: plan §4.1 (user authorization 2026-08-31)
 Scope status: approved
-Last updated: 2026-08-31
-Current checkpoint: no-commit merge of `9f5edc192cfe3d4737205a2f551d2b6b6e34fe09` into `integrate/upstream-cpython-9f5edc192`; MERGE_HEAD present with 22 assigned conflicts
+Last updated: 2026-09-01
+Current checkpoint: v0.8.1 integration committed as `6425ab4d4`; v0.9.1 (`81ae3cb34`) conflicts resolved; repository check and AIM canaries green; merge commit and PR publication pending
 
 ## Resume Snapshot
 
@@ -390,3 +390,14 @@ Current checkpoint: no-commit merge of `9f5edc192cfe3d4737205a2f551d2b6b6e34fe09
 - Preserved daemon schema revision 24 and protocol version 7.
 - Final proof: the full scrubbed `daemon-supervisor-process.test.ts` passes 10/10 enabled cases with 8 stress cases skipped; the five cleanup/protocol/CLI/supervisor/lazy suites pass 223/223; the other five adjacent daemon/orphan suites pass 292/292; and the exact ownership reclaimer regression passes 1/1 alone. Root `npx tsgo --noEmit`, scoped Biome, and `git diff --check` pass. No matching daemon or fixture test process remains.
 - Composed adjacent note: the six-file parallel run passes 320/321. Its only failure is the ownership-owned concurrency test `lets one of two exact-dead reclaimers publish a successor that the other cannot remove`, where `canonicalGuard` can still exist immediately after `winnerExit`; the same case passes alone 1/1. This file and guard-release timing remain outside the cleanup slice and were reported to its owner and the parent.
+
+
+### 2026-09-01 — Final upstream v0.9.1 update and ship boundary
+
+- Preserved the completed fork-first/upstream-second v0.8.1 merge as `6425ab4d4a618115349a0288467898d00fc99bc4` with parents `ec626e8fa651da782e13ca4441fdc8a7255b1172` and `9f5edc192cfe3d4737205a2f551d2b6b6e34fe09`.
+- Fetched official v0.9.1 at `81ae3cb34d27d38ee37f9e205a1e73694993b344` and merged its 20 additional commits normally on top. Conflict resolution retained the CPython runtime and exact-authority work while adding upstream roster push, direct session transport, saved-catalog loading, update relaunch, snapshot, trace-flush, and startup/recovery fixes.
+- Final daemon wire remains protocol 7 and advances to schema revision 26, ID `protocol-7-schema-26-fac530c4c6dd`.
+- Startup-pragmatism cut: existing focused green receipts were accepted. No more duplicate focused suites or optional fixture work will run. The remaining validation is one repository-required `npm run check`, Git ancestry, and PR CI for native Windows.
+- Deployment limits: process-authority state is local to one host and PID namespace; Linux observational identity is boot-qualified but not a held pidfd; exact-authority lifecycle support is Linux, Windows, and macOS. Native Windows Job behavior remains a CI requirement.
+- Final repository validation: `npm run check` passed on v0.9.1 (Biome, `tsgo`, installer render, browser smoke).
+- Real AIM launch canaries used the current source tree and isolated agent/socket directories. `aim prime run codex` selected `gpt-5.6-sol` and returned `AIM_CANARY_OK`; `aim prime run claude` selected `claude-fable-5-1` and returned `AIM_CANARY_OK`. Both isolated daemons shut down cleanly.

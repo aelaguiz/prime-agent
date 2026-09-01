@@ -1,6 +1,6 @@
 # Prime Agent Upstream `main` / CPython Integration Plan
 
-**Status:** Approved for implementation; execution authorized 2026-08-31
+**Status:** Implemented through upstream v0.9.1; final validation and PR publication pending
 **Repository:** `/Users/aelaguiz/workspace/prime-agent`
 **Fork remote:** `origin` (`git@github.com:aelaguiz/prime-agent.git`)
 **Official remote:** `upstream` (`https://github.com/PrimeIntellect-ai/prime-agent.git`)
@@ -39,7 +39,9 @@ Do not keep a parallel legacy kernel, an IPython compatibility shim, or the fork
 - Non-mutating ort merge simulation: **17 content conflicts + 5 modify/delete conflicts = 22 unmerged paths**; 27 same-path overlaps merge textually but still require semantic review.
 - Patch-equivalence check: all 41 upstream patches are new to the fork.
 
-`9f5edc192cfe3d4737205a2f551d2b6b6e34fe09` is the review pin, not permission to ignore a later official tip. At implementation start, fetch both remotes. If `upstream/main` moved, update this ledger, recompute merge base/divergence/conflicts, and reapprove the changed scope before merging.
+> **Final upstream update (2026-09-01):** upstream moved to v0.9.1 at `81ae3cb34d27d38ee37f9e205a1e73694993b344` while implementation was finishing. The completed v0.8.1 integration was preserved as merge `6425ab4d4a618115349a0288467898d00fc99bc4`, then the 20 additional official commits were merged normally on top. This avoids rebuilding or squashing the reviewed integration.
+
+`9f5edc192cfe3d4737205a2f551d2b6b6e34fe09` is the initial review pin, not permission to ignore a later official tip. At implementation start, fetch both remotes. If `upstream/main` moved, update this ledger, recompute merge base/divergence/conflicts, and reapprove the changed scope before merging.
 
 ## 2. North Star and done state
 
@@ -51,7 +53,7 @@ A successful result is a fork commit whose first parent is the reviewed fork tip
 2. **Complete upstream coverage:** every commit in `e319a66d7351c75abe7f040d02d9a8d6e25028e9..9f5edc192cfe3d4737205a2f551d2b6b6e34fe09` is accounted for in the 41-commit ledger below and its behavior is either proven or explicitly superseded by the same upstream architecture.
 3. **One runtime:** `ReplKernelManager` and `python -m rlm.repl` are the only code-execution runtime. `rlm.bash` owns managed shell subprocesses.
 4. **Fork continuity:** AIM auth/routing/usage, xAI auth, fork defaults and aliases, daemon recovery/routing, RLM topology, crash evidence, MCP serve, Ctrl-X archive, source launching, atomic bundle publication, and fork CI remain supported.
-5. **Composed daemon protocol:** the fork AIM/ACP command set and upstream `list_agent_peers` coexist under a fresh **schema revision 24** and a newly derived schema ID. No schema-23 daemon is mistaken for the other incompatible schema-23 lineage.
+5. **Composed daemon protocol:** the fork AIM/ACP and peer surfaces coexist with upstream roster/direct transport under final **schema revision 26** and schema ID `protocol-7-schema-26-fac530c4c6dd`. Older incompatible schemas are not treated as current.
 6. **Generated truth is owned:** model catalog comes from the merged generator; lockfile comes from resolved manifests; schema ID comes from the schema descriptor. No generated file is resolved by hand.
 7. **Release truth:** root and workspace manifests/lock metadata land at upstream v0.8.1, post-release upstream fragments remain, and published changelog sections are not rewritten.
 8. **Proof:** focused local tests, `npm run check`, clean source-mode smoke tests, full required GitHub CI, and ancestry/static audits pass.

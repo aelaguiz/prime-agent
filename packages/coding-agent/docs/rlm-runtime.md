@@ -238,6 +238,8 @@ The REPL runtime process executes model-generated Python and `bash()` commands w
 
 Provider credentials are resolved by the TypeScript host. The bounded model catalog crosses into Python as metadata; the full auth store does not.
 
+Process-authority records are local lifecycle state. Keep daemon registries, leases, worker descriptors, and orphan journals on the same host and PID namespace that created them; do not share or restore them across containers, hosts, network filesystems, or VM clones. Exact-authority lifecycle support is limited to Linux, Windows, and macOS. Other POSIX platforms fail closed.
+
 ## Failure Modes
 
 | Failure | Behavior |

@@ -13,9 +13,15 @@ const DAEMON_SOCKET_MODE = 0o600;
 const DAEMON_SOCKET_DIR_MODE = 0o700;
 const DAEMON_SOCKET_RELEASE_GRACE_MS = 1000;
 const DAEMON_SOCKET_RELEASE_POLL_MS = 25;
+// Wait through a concurrent daemon's bounded socket release instead of failing a safe startup race.
+const DAEMON_SOCKET_ACQUIRE_ATTEMPTS = 601;
+
+type DaemonSocketCompromiseListener = (error: Error) => void;
 
 export class DaemonSocketPathLease {
 	private released = false;
+	private compromiseError?: Error;
+	private readonly compromiseListeners = new Set<DaemonSocketCompromiseListener>();
 
 	constructor(
 		readonly socketPath: string,
@@ -24,24 +30,64 @@ export class DaemonSocketPathLease {
 
 	assertSocketLease(): void {
 		if (this.released) throw new Error(`Daemon socket lease is not active: ${this.socketPath}`);
-		this.guard.assertCurrent();
+		if (this.compromiseError) throw this.compromiseError;
+		try {
+			this.guard.assertCurrent();
+		} catch (error) {
+			const compromise = error instanceof Error ? error : new Error(String(error));
+			this.recordCompromise(compromise);
+			throw compromise;
+		}
+	}
+
+	get compromise(): Error | undefined {
+		if (!this.compromiseError) {
+			try {
+				this.assertSocketLease();
+			} catch {
+				// assertSocketLease records the exact authority failure.
+			}
+		}
+		return this.compromiseError;
 	}
 
 	get compromisedError(): Error | undefined {
-		try {
-			this.assertSocketLease();
-			return undefined;
-		} catch (error) {
-			return error instanceof Error ? error : new Error(String(error));
+		return this.compromise;
+	}
+
+	onCompromised(listener: DaemonSocketCompromiseListener): () => void {
+		const compromise = this.compromise;
+		if (compromise) {
+			this.notifyCompromiseListener(listener, compromise);
+			return () => {};
 		}
+		this.compromiseListeners.add(listener);
+		return () => this.compromiseListeners.delete(listener);
 	}
 
 	async release(): Promise<void> {
 		if (this.released) return;
+		this.compromiseListeners.clear();
 		try {
 			this.guard.release();
 		} finally {
 			this.released = true;
+		}
+	}
+
+	private recordCompromise(error: Error): void {
+		if (this.compromiseError) return;
+		this.compromiseError = error;
+		const listeners = [...this.compromiseListeners];
+		this.compromiseListeners.clear();
+		for (const listener of listeners) this.notifyCompromiseListener(listener, error);
+	}
+
+	private notifyCompromiseListener(listener: DaemonSocketCompromiseListener, error: Error): void {
+		try {
+			listener(error);
+		} catch {
+			// A lease callback must not interrupt authority verification.
 		}
 	}
 }
@@ -67,8 +113,8 @@ export async function acquireDaemonSocketPathLease(socketPath: string): Promise<
 	const guard = acquireAuthorityMutationGuard({
 		authorityPath: physicalSocketPath,
 		lockfilePath: `${physicalSocketPath}.lock`,
-		attempts: 2,
-		retryMs: 0,
+		attempts: DAEMON_SOCKET_ACQUIRE_ATTEMPTS,
+		retryMs: DAEMON_SOCKET_RELEASE_POLL_MS,
 		identity:
 			observation.status === "present-exact"
 				? { processStartId: observation.id }

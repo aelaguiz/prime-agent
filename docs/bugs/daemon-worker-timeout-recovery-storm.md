@@ -113,7 +113,7 @@ Proof passed:
 
 - `test/daemon-worker-client-compatibility.test.ts`: stalled transport send rejects at the response deadline with the caller already owning the rejection.
 - `test/daemon-launch.test.ts`: no-hello classification, one-socket launch lease, Windows access-denied contention validation, blocked-release reclamation, compatible-build reuse, real incompatibility replacement, and startup failure diagnostics.
-- `test/daemon-launch-lease-process.test.ts`: eight simultaneous frontend processes elect exactly one launch leader through the shared filesystem lease.
+- `test/daemon-launch-lease-process.test.ts`: eight simultaneous frontend processes on one host and PID namespace elect exactly one launch leader through the local filesystem lease.
 - `test/daemon-client.test.ts`: raw reconnect continues past a reachable replacement that delays hello.
 - `test/daemon-supervisor-monitor.test.ts`: startup connection gate and recovering-descriptor diagnostics.
 - `test/bundle-publication.test.ts`: a real generated generation A remains live and completes its late import after generation B publication; fault injection before the B entrypoint leaves A runnable with the same identity; fresh execution sees B; the production entrypoint remains executable and runnable.
