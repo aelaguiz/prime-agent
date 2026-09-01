@@ -1,7 +1,7 @@
 ---
 title: "Daemon fleet lags and session starts time out under parallel load"
 date: 2026-09-01
-status: verifying
+status: resolved
 owners: [coding-agent]
 reviewers: []
 related: [docs/bugs/daemon-worker-timeout-recovery-storm.md]
@@ -13,8 +13,8 @@ related: [docs/bugs/daemon-worker-timeout-recovery-storm.md]
 - **Symptom:** On `amir-m5` with ~14 resident root workers, `aim prime run` and `aim prime resume` take 50 to 160 seconds or time out. Prompts inside a live session wait 10 to 20 seconds before they are accepted. The whole fleet feels laggy, and abandoned sessions accumulate because the operator detaches from locked-up sessions and starts new ones.
 - **Impact:** Prime is unusable at the operator's normal parallelism. Every new session makes the next one slower.
 - **Root cause (measured on amir-m5, reproduced and fixed on an isolated fleet here):** Every read-only authority check (worker fence poll every 250 ms per worker, worker command admission on every relayed command, supervisor ownership assertion on every journaled command, and the shutdown-admission read on every worker launch step) is serialized through one global filesystem mutation lock per registry directory, and there are two registry directories. The lock's contention path is expensive: every 10 ms retry performs a full publish attempt with fsync plus a synchronous `/bin/ps` spawn to classify the current holder. With N workers the lock is permanently oversubscribed, and every process's event loop is blocked in `execFileSync`/`fsyncSync` while it spins.
-- **Next action:** Pull the commit on amir-m5, reinstall, restart the supervisor, and confirm with the same reproduction script there.
-- **Status:** verifying (fixed and measured here, not yet deployed on amir-m5)
+- **Next action:** Recycle the 12 pre-fix workers on amir-m5 (stop and resume) when convenient; they still run the old bundle and spin on the lock among themselves, so prompts inside those sessions stay slow until then. New sessions are already fast.
+- **Status:** resolved (deployed on amir-m5 2026-09-01 23:10Z, proven on the live daemon)
 <!-- /bugs:block:tldr -->
 
 <!-- bugs:block:analysis -->
@@ -100,4 +100,20 @@ Not changed, noted for later: the guard's contention path still performs a full 
 - `packages/coding-agent/test/daemon-supervisor-ownership.test.ts`: `verifies authority without waiting for a held registry guard` holds the canonical guard path and requires both the supervisor's own assertion and the worker fence check to resolve promptly.
 - `scripts/bench-daemon-fleet.ts`: the reproduction and verification harness.
 - The amir-m5 hotfix and instrumentation (root-authority guard on roster-discovered identity, 120 s cold-start budgets, correlated startup traces, slow-path timings) are ported in the preceding commit; the timings above come from that instrumentation.
+
+## Deployment on amir-m5 (2026-09-01)
+
+Built from adc4c4e78, packed with `scripts/pack-prime-agent-release.mjs`, installed with `npm install -g --prefix ~/.prime/installs/lock-free-reads-20260901-1805`, and switched in by re-pointing `/opt/homebrew/bin/prime-agent` at the new bundle so the old package directory stayed intact for the still-running workers. The supervisor was replaced with the worker-preserving `restart` wire command (the fork removed the `daemon restart` CLI, so it was sent through the product's own `DaemonClient` from the built dist). The successor (build 6d9f6fc3) adopted all 12 workers and was serving 36 s after the request.
+
+Live measurement on that daemon with 13 old workers resident and the operator working on the box, one real interactive start (`prime-agent --provider anthropic --model claude-fable-5-1` in tmux):
+
+| Step | Time |
+| --- | --- |
+| Client probe to daemon ready | 287 ms |
+| Daemon create (worker spawn to root session ready) | 1,987 ms |
+| Wall clock from client launch to the create logged complete | 3,166 ms |
+
+Earlier the same day on the same daemon, creates took 49,084 ms and 92,322 ms and two failed past 140 s. The first create right after the restart still took 38 s while the new supervisor was refreshing the 12 adopted old workers through their contended admission path; the measurement above was taken once that settled.
+
+Since the new supervisor started it has logged two slow registry-guard acquisitions; every other slow acquisition on the box comes from the pre-fix workers.
 <!-- /bugs:block:implementation -->
