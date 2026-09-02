@@ -418,7 +418,9 @@ const DAEMON_WORK_ADMISSION_COMMAND_TYPES: ReadonlySet<DaemonCommand["type"]> = 
 const DAEMON_CLIENT_CAPABILITY_SET: ReadonlySet<string> = new Set(DAEMON_SUPPORTED_CLIENT_CAPABILITIES);
 const CLIENT_CATCHUP_RETRY_MS = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
-const SUPERVISOR_FENCE_POLL_MS = 250;
+// Safety net only: a supervisor socket close revokes the claim within 100 ms,
+// so the poll exists for the cases where the transport never closes.
+const SUPERVISOR_FENCE_POLL_MS = 2000;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
