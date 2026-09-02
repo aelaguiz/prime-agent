@@ -133,8 +133,22 @@ function formatAgeLabel(timestamp: string): string {
 	return minutes < 120 ? `${minutes}m ago` : `${Math.round(minutes / 60)}h ago`;
 }
 
-function canonicalSessionPath(path: string): string {
-	return resolve(canonicalizePath(path));
+/**
+ * `canonicalizePath` is `realpathSync`, one `lstat` per path component, and it is
+ * called once per live roster entry and once per saved session on every reconcile
+ * pass. Session files never move, so the resolution is memoized per input path;
+ * the cap is only a safety valve against unbounded growth.
+ */
+const CANONICAL_SESSION_PATH_CACHE_LIMIT = 10000;
+const canonicalSessionPathCache = new Map<string, string>();
+
+export function canonicalSessionPath(path: string): string {
+	const cached = canonicalSessionPathCache.get(path);
+	if (cached !== undefined) return cached;
+	const canonical = resolve(canonicalizePath(path));
+	if (canonicalSessionPathCache.size >= CANONICAL_SESSION_PATH_CACHE_LIMIT) canonicalSessionPathCache.clear();
+	canonicalSessionPathCache.set(path, canonical);
+	return canonical;
 }
 
 function fileIdentity(path: string): string {

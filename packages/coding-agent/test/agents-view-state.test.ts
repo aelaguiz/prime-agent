@@ -49,6 +49,20 @@ import { formatAgentDepthLabel } from "../src/modes/interactive/interactive-mode
 import type { InteractiveModeUiServices } from "../src/modes/interactive/interactive-mode-services.js";
 import type { Theme } from "../src/modes/interactive/theme/theme.js";
 
+const pathsMocks = vi.hoisted(() => ({ canonicalizePathCalls: [] as string[] }));
+
+// canonicalizePath is the only realpathSync call site behind session identity.
+vi.mock("../src/utils/paths.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../src/utils/paths.js")>();
+	return {
+		...actual,
+		canonicalizePath: (path: string) => {
+			pathsMocks.canonicalizePathCalls.push(path);
+			return actual.canonicalizePath(path);
+		},
+	};
+});
+
 function heartbeat(id: string, nextRunAt?: string, activeSessionId = "child") {
 	return {
 		job: {
@@ -1037,6 +1051,28 @@ describe("agents view state", () => {
 			const saved = makeSessionInfo({ id: "same", path: real });
 			expect(reconcileUnifiedSessions([daemon], [saved])).toHaveLength(1);
 			expect(resolveAgentsViewActiveSummaryForPath(real, [daemon])).toBe(daemon);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("resolves each session path with realpathSync at most once across reconcile passes", () => {
+		const root = mkdtempSync(join(tmpdir(), "session-view-canonical-memo-"));
+		try {
+			const livePath = join(root, "live.jsonl");
+			const savedPath = join(root, "saved.jsonl");
+			writeFileSync(livePath, "");
+			writeFileSync(savedPath, "");
+			const daemon = makeSummary({ activeSessionId: "live", sessionFile: livePath, sessionId: "live" });
+			const saved = makeSessionInfo({ id: "saved", path: savedPath });
+			pathsMocks.canonicalizePathCalls.length = 0;
+
+			const first = reconcileUnifiedSessions([daemon], [saved]);
+			const second = reconcileUnifiedSessions([daemon], [saved]);
+
+			expect(second.map((record) => record.identity)).toEqual(first.map((record) => record.identity));
+			expect(pathsMocks.canonicalizePathCalls.filter((path) => path === livePath)).toHaveLength(1);
+			expect(pathsMocks.canonicalizePathCalls.filter((path) => path === savedPath)).toHaveLength(1);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
 	chmodSync,
@@ -768,6 +769,29 @@ describe("process identity observations", () => {
 		} else {
 			expect(processStartId).toBeUndefined();
 		}
+	});
+
+	it("serves a memoized identity but never reports a PID that has since exited", async () => {
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1_000);"], { stdio: "ignore" });
+		const pid = child.pid as number;
+		const exited = new Promise<void>((resolveExit) => {
+			child.once("exit", () => resolveExit());
+		});
+		try {
+			expect(pid).toBeGreaterThan(0);
+			const warm = observeProcessIdentity(pid);
+			expect(warm.status).not.toBe("absent");
+			// Same object identity proves the second call was served from the memo.
+			expect(observeProcessIdentity(pid)).toBe(warm);
+		} finally {
+			child.kill("SIGKILL");
+		}
+		await exited;
+
+		// The memo is still warm, but the liveness re-probe on the hit invalidates it.
+		expect(observeProcessIdentity(pid)).toEqual({ status: "absent" });
+		expect(classifyProcessIdentityAuthority(pid, `token:${"a".repeat(64)}`)).toBe("exact-dead");
+		expect(isProcessIdentityCurrent(pid)).toBe(false);
 	});
 
 	it("rejects invalid Windows process start identities", () => {

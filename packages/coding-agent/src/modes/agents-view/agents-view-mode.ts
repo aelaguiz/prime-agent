@@ -73,6 +73,7 @@ import {
 	type AgentsViewSelectionKey,
 	buildAgentsViewRows,
 	buildUnifiedSessionIndex,
+	canonicalSessionPath,
 	createUnattachableChildOpenResult,
 	filterUnifiedSessions,
 	formatHeartbeatBadge,
@@ -100,6 +101,7 @@ import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-sto
 import { matchesSearchText } from "./session-view-search.js";
 
 const HEARTBEAT_POLL_INTERVAL_MS = 15000;
+const SAVED_CATALOG_STREAM_RECONCILE_MS = 100;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
 const EXIT_HINT_DURATION_MS = 2000;
@@ -2194,14 +2196,21 @@ export class AgentsViewMode implements Component, Focusable {
 		this.savedCatalogReady = false;
 		const successfulSessions = this.lastSuccessfulSavedSessions;
 		const progressiveSessions = new Map(
-			successfulSessions.map((session) => [resolvePath(canonicalizePath(session.path)), session]),
+			successfulSessions.map((session) => [canonicalSessionPath(session.path), session]),
 		);
 		try {
+			// Reconciling per streamed session is O(N) reconciles and O(N) repaints per
+			// refresh; stream progress at most every SAVED_CATALOG_STREAM_RECONCILE_MS and
+			// let the post-stream reconcile below publish the final catalog.
+			let lastStreamReconcileAt = 0;
 			const onSession = (session: AgentConnectionSavedSessionInfo) => {
 				if (generation !== this.savedCatalogGeneration) return;
-				progressiveSessions.set(resolvePath(canonicalizePath(session.path)), session);
+				progressiveSessions.set(canonicalSessionPath(session.path), session);
 				this.savedSessions = [...progressiveSessions.values()];
 				this.persistentState.savedSessions = this.savedSessions;
+				const now = Date.now();
+				if (now - lastStreamReconcileAt < SAVED_CATALOG_STREAM_RECONCILE_MS) return;
+				lastStreamReconcileAt = now;
 				this.reconcileCatalogs();
 			};
 			const sessions = await listDaemonSavedSessions(

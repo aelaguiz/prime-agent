@@ -777,10 +777,113 @@ function observePortableProcessIdentity(
 		: { status: "probe-uncertain" };
 }
 
+/**
+ * Identity probes are hot on an idle fleet: every fence check, command
+ * admission, and ownership pass asks again. The own-process identity cannot
+ * change while the process runs, so it is memoized for its lifetime; a foreign
+ * PID is memoized for a short TTL. Every hit still re-probes presence with
+ * `kill(pid, 0)` so a dead PID is never reported alive, and a hit is refused
+ * whenever trusting it would prove a mismatch against the expected identity.
+ */
+const PROCESS_IDENTITY_CACHE_TTL_MS = 5_000;
+const PROCESS_IDENTITY_CACHE_MAX_ENTRIES = 512;
+const PROCESS_IDENTITY_CACHE_EVICT_AGE_MS = 60_000;
+
+interface ProcessIdentityCacheEntry {
+	observation: ProcessIdentityObservation;
+	observedAtMs: number;
+}
+
+const processIdentityCache = new Map<number, ProcessIdentityCacheEntry>();
+let currentProcessIdentityObservation: ProcessIdentityObservation | undefined;
+
+/** Only the default probe path is memoized; injected seams always probe fresh. */
+function usesDefaultProcessIdentityProbes(options: ProcessIdentityObservationOptions): boolean {
+	return (
+		options.platform === undefined &&
+		options.processKill === undefined &&
+		options.readProcStat === undefined &&
+		options.readProcBootId === undefined &&
+		options.query === undefined &&
+		options.pathExists === undefined &&
+		options.windowsSystemRoot === undefined
+	);
+}
+
+function processIdentityCacheHitUsable(
+	observation: ProcessIdentityObservation,
+	expectedProcessStartId: string | undefined,
+): boolean {
+	// A cached exact identity may confirm an expectation but never disprove one:
+	// `exact-dead` always costs a fresh probe, never stale bytes.
+	if (observation.status === "absent") return false;
+	if (observation.status !== "present-exact") return true;
+	if (expectedProcessStartId === undefined || !isExactProcessStartId(expectedProcessStartId)) return true;
+	return observation.id === expectedProcessStartId;
+}
+
+function rememberProcessIdentity(pid: number, observation: ProcessIdentityObservation, nowMs: number): void {
+	// Absence is one `kill()` away and a reused PID must never inherit it.
+	if (observation.status === "absent") return;
+	processIdentityCache.delete(pid);
+	processIdentityCache.set(pid, { observation, observedAtMs: nowMs });
+	if (processIdentityCache.size <= PROCESS_IDENTITY_CACHE_MAX_ENTRIES) return;
+	for (const [cachedPid, entry] of processIdentityCache) {
+		if (nowMs - entry.observedAtMs >= PROCESS_IDENTITY_CACHE_EVICT_AGE_MS) processIdentityCache.delete(cachedPid);
+	}
+	for (const cachedPid of processIdentityCache.keys()) {
+		if (processIdentityCache.size <= PROCESS_IDENTITY_CACHE_MAX_ENTRIES) break;
+		processIdentityCache.delete(cachedPid);
+	}
+}
+
+function observeMemoizedProcessIdentity(
+	pid: number,
+	options: ProcessIdentityObservationOptions,
+	expectedProcessStartId?: string,
+): ProcessIdentityObservation {
+	if (!Number.isInteger(pid) || pid <= 0) return { status: "probe-uncertain" };
+	if (!usesDefaultProcessIdentityProbes(options)) return observeProcessIdentityUncached(pid, options);
+	if (pid === process.pid) {
+		// This PID and its argv0 capability token cannot change while it runs.
+		if (
+			currentProcessIdentityObservation?.status === "present-exact" ||
+			currentProcessIdentityObservation?.status === "present-coarse"
+		) {
+			return currentProcessIdentityObservation;
+		}
+		currentProcessIdentityObservation = observeProcessIdentityUncached(pid, options);
+		return currentProcessIdentityObservation;
+	}
+	const nowMs = Date.now();
+	const cached = processIdentityCache.get(pid);
+	if (
+		cached !== undefined &&
+		nowMs - cached.observedAtMs < PROCESS_IDENTITY_CACHE_TTL_MS &&
+		processIdentityCacheHitUsable(cached.observation, expectedProcessStartId)
+	) {
+		// A hit still proves liveness; ESRCH invalidates before any caller sees it.
+		const presence = probePidPresence(pid, defaultProcessKillProbe);
+		if (presence === "present") return cached.observation;
+		processIdentityCache.delete(pid);
+		return presenceObservation(presence);
+	}
+	const observation = observeProcessIdentityUncached(pid, options);
+	rememberProcessIdentity(pid, observation, nowMs);
+	return observation;
+}
+
 /** Observe whether a PID exists and, when possible, its durable start identity. */
 export function observeProcessIdentity(
 	pid: number,
 	options: ProcessIdentityObservationOptions = {},
+): ProcessIdentityObservation {
+	return observeMemoizedProcessIdentity(pid, options);
+}
+
+function observeProcessIdentityUncached(
+	pid: number,
+	options: ProcessIdentityObservationOptions,
 ): ProcessIdentityObservation {
 	if (!Number.isInteger(pid) || pid <= 0) return { status: "probe-uncertain" };
 	const processKill = options.processKill ?? defaultProcessKillProbe;
@@ -865,7 +968,7 @@ export function classifyProcessIdentityAuthority(
 	expectedProcessStartId?: string,
 	options: ProcessIdentityObservationOptions = {},
 ): ProcessIdentityAuthority {
-	const observation = observeProcessIdentity(pid, options);
+	const observation = observeMemoizedProcessIdentity(pid, options, expectedProcessStartId);
 	if (observation.status === "absent") return "exact-dead";
 	if (
 		observation.status === "present-exact" &&
@@ -893,7 +996,7 @@ export function matchesExactProcessIdentity(
 	options: ProcessIdentityObservationOptions = {},
 ): boolean {
 	if (!isExactProcessStartId(expectedProcessStartId)) return false;
-	const observation = observeProcessIdentity(pid, options);
+	const observation = observeMemoizedProcessIdentity(pid, options, expectedProcessStartId);
 	return observation.status === "present-exact" && observation.id === expectedProcessStartId;
 }
 
@@ -964,11 +1067,8 @@ export function getLegacyProcessStartId(
 	}
 }
 
-let currentProcessIdentityObservation: ProcessIdentityObservation | undefined;
-
 function getCurrentProcessIdentityObservation(): ProcessIdentityObservation {
-	currentProcessIdentityObservation ??= observeProcessIdentity(process.pid);
-	return currentProcessIdentityObservation;
+	return observeMemoizedProcessIdentity(process.pid, {});
 }
 
 function withLeaseGuard<T>(directory: string, action: (guard: AuthorityMutationGuard) => T): T {
