@@ -405,6 +405,10 @@ export interface ProcessIdentityObservationOptions {
 	windowsSystemRoot?: string;
 }
 
+// Only a genuinely slow probe is worth a lifecycle record; a loaded machine
+// crosses 100 ms routinely and the record costs a synchronous write.
+const SLOW_PROCESS_IDENTITY_QUERY_LOG_MS = 500;
+
 class ProcessIdentityOutputTooLargeError extends Error {}
 
 function runProcessQuery(command: string, args: string[], options: ProcessQueryOptions): string {
@@ -433,7 +437,7 @@ function boundedProcessQuery(
 		throw error;
 	} finally {
 		const elapsedMs = Date.now() - startedAt;
-		if (elapsedMs >= 100) {
+		if (elapsedMs >= SLOW_PROCESS_IDENTITY_QUERY_LOG_MS) {
 			const pidFlagIndex = args.indexOf("-p");
 			const targetPid = pidFlagIndex >= 0 ? Number(args[pidFlagIndex + 1]) : undefined;
 			recordProcessLifecycle("process_identity_query_timing", {

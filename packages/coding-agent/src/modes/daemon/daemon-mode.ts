@@ -421,6 +421,9 @@ const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS = 5000;
 // Safety net only: a supervisor socket close revokes the claim within 100 ms,
 // so the poll exists for the cases where the transport never closes.
 const SUPERVISOR_FENCE_POLL_MS = 2000;
+// A loaded machine routinely crosses 100 ms; only a genuinely slow check is
+// worth one stderr line the supervisor then relays through a sync log write.
+const SLOW_SUPERVISOR_CLAIM_CHECK_LOG_MS = 500;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -921,7 +924,7 @@ export class AgentDaemon {
 					boundClaim.ownerFingerprint,
 				);
 				const elapsedMs = Date.now() - startedAt;
-				if (elapsedMs >= 100) {
+				if (elapsedMs >= SLOW_SUPERVISOR_CLAIM_CHECK_LOG_MS) {
 					this.log(
 						`Worker fence phase=supervisor_claim_check_completed elapsedMs=${elapsedMs} ` +
 							`supervisorGeneration=${boundClaim.claim.supervisorGeneration?.slice(0, 8) ?? "unknown"}`,
@@ -4280,7 +4283,7 @@ export class AgentDaemon {
 				try {
 					const ownerFingerprint = await waitForPromptAdmission(claimCheck, parsedAdmission?.controller?.signal);
 					const commandClaimElapsedMs = Date.now() - commandClaimStartedAt;
-					if (commandClaimElapsedMs >= 100) {
+					if (commandClaimElapsedMs >= SLOW_SUPERVISOR_CLAIM_CHECK_LOG_MS) {
 						this.log(
 							`Worker command admission type=${typeof parsed.type === "string" ? parsed.type : "unknown"} ` +
 								`id=${typeof parsed.id === "string" ? parsed.id : "none"} phase=supervisor_claim_check_completed ` +
