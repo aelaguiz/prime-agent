@@ -370,6 +370,8 @@ interface ResidentWorker {
 	client?: DaemonWorkerClient;
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
+	/** In-flight snapshot refresh, shared by every client that asks while it runs. */
+	heartbeatRefresh?: Promise<WorkerHeartbeatRefresh>;
 	summaries: Map<string, SessionSummary>;
 	snapshotCache: Map<string, DaemonAttachResult>;
 	transcriptCaches: Map<string, SnapshotTranscriptCache>;
@@ -399,6 +401,10 @@ interface ResidentWorker {
 	rosterApplyChain?: Promise<void>;
 	rosterRepairPull?: Promise<void>;
 }
+
+type WorkerHeartbeatRefresh =
+	| { heartbeats: AgentConnectionHeartbeat[]; response?: undefined }
+	| { heartbeats?: undefined; response: DaemonResponse };
 
 interface WorkerStartupTrace {
 	startedAt: number;
@@ -2501,23 +2507,23 @@ export class DaemonSupervisor {
 				const snapshots: Array<{ heartbeats?: AgentConnectionHeartbeat[]; response?: DaemonResponse }> =
 					await Promise.all(
 						workers.map(async (worker) => {
-							if (worker.client && worker.descriptor.lifecycle === "ready") {
-								const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
-									failure(command.id, command.type, error, serializeDaemonError(error)),
-								);
-								if (response.success) {
-									const snapshot = heartbeatsFromResponse(response);
-									worker.heartbeatSnapshot = snapshot;
-									worker.heartbeatSnapshotStale = false;
-									return { heartbeats: snapshot };
-								}
-								this.log(`Could not list heartbeats from a worker: ${response.error}`);
-								if (worker.heartbeatSnapshot === undefined || worker.heartbeatSnapshotStale === true) {
-									return { response };
-								}
-							}
+							// Serve the supervisor's own catalog whenever it is current: only a
+							// worker that invalidated its snapshot costs a fan-out RPC.
 							if (worker.heartbeatSnapshot !== undefined && worker.heartbeatSnapshotStale !== true) {
 								return { heartbeats: worker.heartbeatSnapshot };
+							}
+							if (worker.client && worker.descriptor.lifecycle === "ready") {
+								const refreshed = await this.refreshWorkerHeartbeats(worker, command);
+								if (refreshed.heartbeats) {
+									return { heartbeats: refreshed.heartbeats };
+								}
+								// A slow or wedged worker degrades to its last snapshot, still
+								// marked stale so the next request retries, rather than failing
+								// the aggregate for every client.
+								if (worker.heartbeatSnapshot !== undefined) {
+									return { heartbeats: worker.heartbeatSnapshot };
+								}
+								return { response: responseWithId(refreshed.response, command.id) };
 							}
 							const state =
 								worker.descriptor.lifecycle === "ready" ? "disconnected" : worker.descriptor.lifecycle;
@@ -3890,6 +3896,7 @@ export class DaemonSupervisor {
 				worker.launchEnv = undefined;
 				worker.transientCreateCommand = undefined;
 			}
+			worker.heartbeatSnapshotStale = true;
 			this.broadcastHeartbeatsChanged();
 			this.traceWorkerStartup(workerId, startupTrace, "ready", {
 				childPid: child.pid,
@@ -4229,6 +4236,7 @@ export class DaemonSupervisor {
 			worker.descriptor.consecutiveFailures = 0;
 			worker.deferredRecoveryRounds = 0;
 			this.persistWorker(worker);
+			worker.heartbeatSnapshotStale = true;
 			this.broadcastHeartbeatsChanged();
 			recordProcessLifecycle("daemon_worker_recovery_result", {
 				status: "adopted",
@@ -4722,6 +4730,7 @@ export class DaemonSupervisor {
 							worker.descriptor.consecutiveFailures = 0;
 							worker.deferredRecoveryRounds = 0;
 							this.persistWorker(worker);
+							worker.heartbeatSnapshotStale = true;
 							this.broadcastHeartbeatsChanged();
 							recordProcessLifecycle("daemon_worker_recovery_result", {
 								status: "reconnected",
@@ -6155,6 +6164,29 @@ export class DaemonSupervisor {
 			return { ...response, id: command.id, data: this.publicSummary(worker, response.data) };
 		}
 		return responseWithId(response, command.id);
+	}
+
+	/**
+	 * Refresh one worker's heartbeat snapshot. Concurrent client requests share a
+	 * single in-flight fan-out per worker instead of each issuing its own RPC.
+	 */
+	private refreshWorkerHeartbeats(worker: ResidentWorker, command: DaemonCommand): Promise<WorkerHeartbeatRefresh> {
+		worker.heartbeatRefresh ??= (async (): Promise<WorkerHeartbeatRefresh> => {
+			const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
+				failure(command.id, command.type, error, serializeDaemonError(error)),
+			);
+			if (response.success) {
+				const snapshot = heartbeatsFromResponse(response);
+				worker.heartbeatSnapshot = snapshot;
+				worker.heartbeatSnapshotStale = false;
+				return { heartbeats: snapshot };
+			}
+			this.log(`Could not list heartbeats from a worker: ${response.error}`);
+			return { response };
+		})().finally(() => {
+			worker.heartbeatRefresh = undefined;
+		});
+		return worker.heartbeatRefresh;
 	}
 
 	private async attachClient(

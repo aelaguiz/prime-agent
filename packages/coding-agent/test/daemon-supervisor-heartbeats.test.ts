@@ -70,7 +70,68 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			success: true,
 			data: { heartbeats: [{ job: { id: "heartbeat-1" } }, { job: { id: "heartbeat-2" } }] },
 		});
+		// Both catalogs are current, so the second list costs no worker RPC at all.
+		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(2);
+	});
+
+	it("serves current workers from the catalog and refreshes only the stale one", async () => {
+		const supervisor = createSupervisorHarness();
+		const first = worker("ready");
+		const second = worker("ready");
+		supervisor.workers.set("first", first);
+		supervisor.workers.set("second", second);
+		supervisor.forwardToWorker = vi.fn(async (target, command) =>
+			success(command.id, command.type, {
+				heartbeats: [{ job: { id: target === first ? "heartbeat-1" : "heartbeat-2" } }],
+			}),
+		);
+
+		await supervisor.handleCommand({} as DaemonSocketClient, { id: "list-1", type: "heartbeats_list" });
+		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(2);
+
+		supervisor.handleWorkerFrame(second, {
+			header: { kind: "outbound", outboundType: "heartbeats_changed" },
+			payload: Buffer.alloc(0),
+		});
+		const refreshed = await supervisor.handleCommand({} as DaemonSocketClient, {
+			id: "list-2",
+			type: "heartbeats_list",
+		});
+
+		expect(refreshed).toMatchObject({
+			success: true,
+			data: { heartbeats: [{ job: { id: "heartbeat-1" } }, { job: { id: "heartbeat-2" } }] },
+		});
 		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(3);
+		expect(supervisor.forwardToWorker).toHaveBeenLastCalledWith(
+			second,
+			expect.objectContaining({ type: "heartbeats_list" }),
+			5000,
+		);
+	});
+
+	it("shares one in-flight refresh across concurrent client requests", async () => {
+		const supervisor = createSupervisorHarness();
+		const target = worker("ready");
+		supervisor.workers.set("target", target);
+		const gate = new Promise<void>((resolve) => setTimeout(resolve, 20));
+		supervisor.forwardToWorker = vi.fn(async (_target, command) => {
+			await gate;
+			return success(command.id, command.type, { heartbeats: [{ job: { id: "heartbeat-1" } }] });
+		});
+
+		const first = supervisor.handleCommand({} as DaemonSocketClient, { id: "list-a", type: "heartbeats_list" });
+		const second = supervisor.handleCommand({} as DaemonSocketClient, { id: "list-b", type: "heartbeats_list" });
+		const responses = await Promise.all([first, second]);
+
+		expect(supervisor.forwardToWorker).toHaveBeenCalledOnce();
+		for (const [index, response] of responses.entries()) {
+			expect(response).toMatchObject({
+				id: index === 0 ? "list-a" : "list-b",
+				success: true,
+				data: { heartbeats: [{ job: { id: "heartbeat-1" } }] },
+			});
+		}
 	});
 
 	it("returns a worker failure instead of a partial catalog", async () => {
@@ -94,7 +155,7 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(2);
 	});
 
-	it("does not fall back to a snapshot after the worker reports heartbeat changes", async () => {
+	it("keeps a worker stale and serves its last snapshot when the refresh fails", async () => {
 		const supervisor = createSupervisorHarness();
 		const target = {
 			...worker("ready"),
@@ -115,8 +176,14 @@ describe("daemon supervisor heartbeat aggregation", () => {
 			type: "heartbeats_list",
 		});
 
+		// The refresh was attempted and failed: the worker stays stale so the next
+		// request retries, and the client still gets the last known catalog.
+		expect(supervisor.forwardToWorker).toHaveBeenCalledOnce();
 		expect(target.heartbeatSnapshotStale).toBe(true);
-		expect(response).toMatchObject({ success: false, error: "worker unavailable" });
+		expect(response).toMatchObject({
+			success: true,
+			data: { heartbeats: [{ job: { id: "heartbeat-1" } }] },
+		});
 	});
 
 	it("fails rather than returning a partial catalog without a cached snapshot", async () => {
@@ -187,4 +254,5 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		);
 		expect(target.heartbeatSnapshot).toEqual([]);
 	});
+
 });
