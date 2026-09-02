@@ -932,6 +932,8 @@ interface RlmChildRun {
 	completeDeletion?: () => Promise<void>;
 	reportDeletionCleanupFailure?: (error: unknown) => Promise<void>;
 	emitUpdate?: () => void;
+	/** Drops a coalesced streaming update that has not fired yet. */
+	cancelPendingUpdate?: () => void;
 	lastEmittedUpdate?: string;
 	unsubscribe?: () => void;
 }
@@ -946,6 +948,8 @@ interface RlmSubagentModelSelection {
 }
 
 const KERNEL_STATE_LISTING_TIMEOUT_MS = 5000;
+/** Trailing-edge window for coalescing an RLM child's streamed token updates. */
+const RLM_CHILD_STREAM_UPDATE_INTERVAL_MS = 100;
 const RLM_MAX_DEPTH_STATE_CUSTOM_TYPE = "rlm_max_depth_state";
 
 function noopRlmChildAbort(): void {}
@@ -1000,6 +1004,102 @@ export function compactRlmText(text: string, maxLength = 160): string {
 		return compact;
 	}
 	return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+/**
+ * Longest collapsed prefix `compactRlmText` can still be influenced by: its 160
+ * character budget plus the single leading and single trailing space `trim()` may
+ * remove (collapsing leaves no whitespace runs), plus one more character so the
+ * "longer than the budget" branch is certain.
+ */
+const RLM_PREVIEW_PREFIX_LIMIT = 163;
+
+/**
+ * Incremental `compactRlmText` over a streaming assistant message.
+ *
+ * The old fan-in path re-read every text block and re-ran the whitespace regex over
+ * the whole accumulated answer on every streamed token, so one child message cost
+ * O(L^2) in answer length. Collapsing whitespace is a local transform, so each delta
+ * can be folded into a bounded collapsed prefix instead; once that prefix reaches
+ * `RLM_PREVIEW_PREFIX_LIMIT` the preview can no longer change and later deltas are
+ * skipped outright. The rendered text is identical to `compactRlmText` over the full
+ * accumulated answer.
+ */
+export class RlmAnswerPreviewTracker {
+	/** Index of the content block the next delta continues from. */
+	private blockIndex = 0;
+	/** Characters of `content[blockIndex]` already folded in. */
+	private blockOffset = 0;
+	private collapsed = "";
+	/** The last consumed character was whitespace, so a leading space folds into it. */
+	private trailingWhitespace = false;
+	/** The collapsed prefix is long enough that the preview is settled. */
+	private settled = false;
+	private preview = "";
+
+	/** Start a new assistant message. */
+	reset(): void {
+		this.blockIndex = 0;
+		this.blockOffset = 0;
+		this.collapsed = "";
+		this.trailingWhitespace = false;
+		this.settled = false;
+		this.preview = "";
+	}
+
+	/** Fold in whatever text `message` gained since the last call. */
+	update(message: AssistantMessage): string {
+		if (this.settled) return this.preview;
+		const content = message.content;
+		const anchor = content[this.blockIndex];
+		// A missing or shrunken anchor means the message was rebuilt rather than
+		// extended; rescan from the start instead of dropping text.
+		const anchorLost = this.blockOffset > 0 && (anchor?.type !== "text" || anchor.text.length < this.blockOffset);
+		if (this.blockIndex >= content.length || anchorLost) {
+			this.reset();
+		}
+		let chunk = "";
+		for (let index = this.blockIndex; index < content.length; index++) {
+			const block = content[index];
+			if (block.type !== "text") continue;
+			const offset = index === this.blockIndex ? this.blockOffset : 0;
+			if (offset === 0) chunk += block.text;
+			else if (offset < block.text.length) chunk += block.text.slice(offset);
+		}
+		const lastIndex = content.length - 1;
+		if (lastIndex >= 0) {
+			const last = content[lastIndex];
+			this.blockIndex = lastIndex;
+			this.blockOffset = last.type === "text" ? last.text.length : 0;
+		}
+		if (chunk) this._append(chunk);
+		this.preview = compactRlmText(this.collapsed);
+		return this.preview;
+	}
+
+	/**
+	 * Authoritative preview for a finished message. The terminal message can differ
+	 * from the streamed partials (extensions may replace it), so this rescans once —
+	 * the same single O(L) pass the old code paid on every token.
+	 */
+	finalize(message: AssistantMessage): string {
+		this.reset();
+		return this.update(message);
+	}
+
+	private _append(raw: string): void {
+		let collapsedChunk = raw.replace(/\s+/g, " ");
+		if (this.trailingWhitespace && collapsedChunk.startsWith(" ")) collapsedChunk = collapsedChunk.slice(1);
+		this.trailingWhitespace = /\s$/.test(raw);
+		if (!collapsedChunk) return;
+		const room = RLM_PREVIEW_PREFIX_LIMIT - this.collapsed.length;
+		if (room <= 0) {
+			this.settled = true;
+			return;
+		}
+		this.collapsed += collapsedChunk.length > room ? collapsedChunk.slice(0, room) : collapsedChunk;
+		if (this.collapsed.length >= RLM_PREVIEW_PREFIX_LIMIT) this.settled = true;
+	}
 }
 
 // Child-agent label: collapse to one line but keep the full prompt — the TUI
@@ -9486,9 +9586,14 @@ export class AgentSession {
 	}
 
 	private _findAssistantEntryForMessage(message: AssistantMessage): SessionMessageEntry | undefined {
-		return this.sessionManager
-			.getEntries()
-			.find((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message === message);
+		// Scan from the newest entry: callers look up recently appended assistant
+		// messages, so the match is normally within the last few entries.
+		const entries = this.sessionManager.getEntries();
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry.type === "message" && entry.message === message) return entry as SessionMessageEntry;
+		}
+		return undefined;
 	}
 
 	private _createRlmSubagentRuntimeOptions(options: {
@@ -9998,6 +10103,7 @@ export class AgentSession {
 	}
 
 	private _removeRlmSubagentTracking(childId: string, run?: RlmChildRun): void {
+		run?.cancelPendingUpdate?.();
 		run?.unsubscribe?.();
 		this._rlmChildUnsubscribes.get(childId)?.();
 		this._rlmChildUnsubscribes.delete(childId);
@@ -10500,6 +10606,8 @@ export class AgentSession {
 		if (!requestedSessionName) await this._assertRlmSubagentSessionNameAvailable(sessionName);
 		const startedAt = Date.now();
 		const parentAssistantForUsage = this._findLastAssistantMessage();
+		let parentUsageEntryId: string | undefined;
+		const answerPreview = new RlmAnswerPreviewTracker();
 		let runningToolCount = 0;
 		let childSession: AgentSession | undefined;
 		const run: RlmChildRun = {
@@ -10521,14 +10629,35 @@ export class AgentSession {
 		};
 		this._activeRlmChildRuns.set(run.id, run);
 		this._unsettledRlmChildRuns.add(run);
+		let pendingUpdateTimer: ReturnType<typeof setTimeout> | undefined;
+		const cancelPendingChildUpdate = () => {
+			if (!pendingUpdateTimer) return;
+			clearTimeout(pendingUpdateTimer);
+			pendingUpdateTimer = undefined;
+		};
 		const emitChildUpdate = () => {
+			cancelPendingChildUpdate();
 			const child = this._rlmChildSnapshotForRun(run);
 			const serialized = JSON.stringify(child);
 			if (serialized === run.lastEmittedUpdate) return;
 			run.lastEmittedUpdate = serialized;
 			this._emit({ type: "rlm_child_update", child });
 		};
+		// Token-rate updates are coalesced onto a trailing edge: a streamed answer used
+		// to push one snapshot (and one ancestor-chain re-emit) per token, which is the
+		// dominant fan-in cost when several children stream at once. Lifecycle changes
+		// (start, end, error, tool calls, recap) still emit immediately.
+		const scheduleChildUpdate = () => {
+			if (pendingUpdateTimer) return;
+			pendingUpdateTimer = setTimeout(() => {
+				pendingUpdateTimer = undefined;
+				if (this._disposed || this._disposing) return;
+				emitChildUpdate();
+			}, RLM_CHILD_STREAM_UPDATE_INTERVAL_MS);
+			pendingUpdateTimer.unref?.();
+		};
 		run.emitUpdate = emitChildUpdate;
+		run.cancelPendingUpdate = cancelPendingChildUpdate;
 		emitChildUpdate();
 
 		const publishChildSession = (child: AgentSession) => {
@@ -10619,14 +10748,31 @@ export class AgentSession {
 						if (assistant.stopReason !== "error" && assistant.stopReason !== "aborted") {
 							attributeChildUsage(parentAssistantForUsage?.usage ?? emptyUsage(), assistant.usage);
 							if (parentAssistantForUsage) {
-								const parentEntry = this._findAssistantEntryForMessage(parentAssistantForUsage);
-								if (parentEntry) {
+								// The parent's usage entry never moves for the life of the run, so
+								// resolve it once instead of copying the whole entry array per child
+								// message. A miss is not cached: the entry may not exist yet.
+								if (parentUsageEntryId === undefined) {
+									parentUsageEntryId = this._findAssistantEntryForMessage(parentAssistantForUsage)?.id;
+								}
+								if (parentUsageEntryId !== undefined) {
 									const messages = child.messages;
 									const assistantIndex = messages.lastIndexOf(assistant);
-									const precedingPrompt = messages
-										.slice(0, assistantIndex)
-										.reverse()
-										.find((message) => message.role === "user" || message.role === "custom");
+									// Walk backwards instead of slice().reverse().find(): the same
+									// result without two full copies of the child's message array.
+									// A replaced terminal message (index -1) keeps the old
+									// slice(0, -1) semantics of skipping only the last message.
+									let precedingPrompt: AgentMessage | undefined;
+									for (
+										let index = assistantIndex >= 0 ? assistantIndex - 1 : messages.length - 2;
+										index >= 0;
+										index--
+									) {
+										const candidate = messages[index];
+										if (candidate.role === "user" || candidate.role === "custom") {
+											precedingPrompt = candidate;
+											break;
+										}
+									}
 									const origin =
 										precedingPrompt?.role === "custom" && isAgentSessionMessage(precedingPrompt)
 											? precedingPrompt.details.id.startsWith("spawn:")
@@ -10634,7 +10780,7 @@ export class AgentSession {
 												: "agent_message"
 											: "direct_user";
 									this.sessionManager.appendChildUsageAttribution(
-										parentEntry.id,
+										parentUsageEntryId,
 										assistant.usage,
 										parentAssistantForUsage.usage,
 										origin,
@@ -10642,16 +10788,24 @@ export class AgentSession {
 								}
 							}
 						}
-						const text = compactRlmText(readAssistantText(assistant));
+						const text = answerPreview.finalize(assistant);
 						if (text) run.answerPreview = text;
 						void flushAgentTraceUpload(child.sessionManager).catch(() => undefined);
 						emitChildUpdate();
-					} else if (event.type === "message_start" || event.type === "message_update") {
+					} else if (event.type === "message_start") {
 						if (event.message.role === "assistant") {
-							const text = compactRlmText(readAssistantText(event.message as AssistantMessage));
+							answerPreview.reset();
+							const text = answerPreview.update(event.message as AssistantMessage);
 							if (text) run.answerPreview = text;
-							run.activity = { kind: "writing" };
+							if (run.activity?.kind !== "writing") run.activity = { kind: "writing" };
 							emitChildUpdate();
+						}
+					} else if (event.type === "message_update") {
+						if (event.message.role === "assistant") {
+							const text = answerPreview.update(event.message as AssistantMessage);
+							if (text) run.answerPreview = text;
+							if (run.activity?.kind !== "writing") run.activity = { kind: "writing" };
+							scheduleChildUpdate();
 						}
 					} else if (event.type === "tool_execution_start") {
 						run.toolUseCount += 1;
@@ -10790,6 +10944,9 @@ export class AgentSession {
 					}
 				}
 			} finally {
+				// Every terminal path above already emitted the settled snapshot, so a
+				// still-armed coalesced update would only re-emit stale streaming state.
+				cancelPendingChildUpdate();
 				if (run.detachedDeletion) {
 					run.deletionRunFinished = true;
 					if (!run.settled) {

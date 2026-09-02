@@ -19,7 +19,7 @@ import {
 	createAgentSessionMessage,
 	isAgentSessionMessage,
 } from "../src/core/agent-messages.js";
-import { AgentSession, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
+import { AgentSession, compactRlmText, type RlmChildAgentSnapshot } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import type { LoadExtensionsResult } from "../src/core/extensions/index.js";
 import { type HostRequestHandlers, ReplKernelManager } from "../src/core/kernel/index.js";
@@ -2420,6 +2420,101 @@ describe("AgentSession rlm recursion", () => {
 		releaseChild();
 		await waitFor(() => run.status === "done");
 	});
+
+	it(
+		"coalesces a streaming grandchild's token updates at the root and keeps the final preview",
+		async () => {
+			const tokenCount = 5000;
+			const streamPrompt = "stream a long answer";
+			let streamedAnswer = "";
+			const streamFn: StreamFn = (_model, context) => {
+				const prompt = userText(context);
+				if (prompt !== streamPrompt) return streamAnswer(`child answer: ${prompt}`);
+				const stream = createAssistantMessageEventStream();
+				void (async () => {
+					let accumulated = "";
+					stream.push({ type: "start", partial: assistantMessage("") });
+					stream.push({ type: "text_start", contentIndex: 0, partial: assistantMessage("") });
+					for (let index = 0; index < tokenCount; index++) {
+						const delta = `token${index} `;
+						accumulated += delta;
+						stream.push({
+							type: "text_delta",
+							contentIndex: 0,
+							delta,
+							partial: assistantMessage(accumulated),
+						});
+						// Ten real event-loop pauses, so the stream spans more than the
+						// trailing-edge window and mid-stream updates must still arrive.
+						if (index % 500 === 499) await sleep(20);
+					}
+					streamedAnswer = accumulated;
+					stream.push({
+						type: "text_end",
+						contentIndex: 0,
+						content: accumulated,
+						partial: assistantMessage(accumulated),
+					});
+					stream.push({ type: "done", reason: "stop", message: assistantMessage(accumulated) });
+				})();
+				return stream;
+			};
+
+			const root = createSession({ maxDepth: 3, streamFn });
+			let grandchildId: string | undefined;
+			let rootUpdates = 0;
+			let midStreamPreviews = 0;
+			let finalPreview: string | undefined;
+			root.subscribe((event) => {
+				if (event.type !== "rlm_child_update") return;
+				rootUpdates += 1;
+				if (event.child.id !== grandchildId) return;
+				if (event.child.status === "done") finalPreview = event.child.answerPreview;
+				else if (event.child.status === "running" && event.child.answerPreview) midStreamPreviews += 1;
+			});
+
+			const childHandle = await root.runRlmChild("level one");
+			await waitFor(() => root.getRlmChildSession(childHandle.rlm_child_id) !== undefined);
+			const child = root.getRlmChildSession(childHandle.rlm_child_id);
+			if (!child) throw new Error("Missing level-one child session");
+			await waitFor(() => (root as unknown as InspectableRlmSession)._activeRlmChildRuns.size === 0);
+
+			// Per-token fan-in work at the streaming child's own parent: the old code
+			// rebuilt (and JSON-stringified) a child snapshot on every streamed token,
+			// on top of rescanning the whole answer for the preview.
+			const snapshots = vi.spyOn(
+				child as unknown as { _rlmChildSnapshotForRun: (...args: unknown[]) => unknown },
+				"_rlmChildSnapshotForRun",
+			);
+			const updatesBeforeStream = rootUpdates;
+			const startedAt = performance.now();
+			const grandchildHandle = await child.runRlmChild(streamPrompt);
+			grandchildId = grandchildHandle.rlm_child_id;
+			const deadline = Date.now() + 120_000;
+			while (finalPreview === undefined) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for the streamed grandchild answer");
+				await sleep(5);
+			}
+			const elapsedMs = performance.now() - startedAt;
+			const streamUpdates = rootUpdates - updatesBeforeStream;
+			const snapshotBuilds = snapshots.mock.calls.length;
+			snapshots.mockRestore();
+			console.log(
+				`[C6] ${tokenCount}-token grandchild stream: ${elapsedMs.toFixed(0)} ms, ` +
+					`root rlm_child_update emits = ${streamUpdates}, parent snapshot rebuilds = ${snapshotBuilds}, ` +
+					`mid-stream previews = ${midStreamPreviews}`,
+			);
+
+			expect(streamUpdates).toBeGreaterThan(0);
+			expect(streamUpdates).toBeLessThan(200);
+			expect(snapshotBuilds).toBeLessThan(200);
+			// Coalescing must not starve viewers: a stream longer than the trailing-edge
+			// window still pushes live preview text before the terminal update.
+			expect(midStreamPreviews).toBeGreaterThan(0);
+			expect(finalPreview).toBe(compactRlmText(streamedAnswer));
+		},
+		180_000,
+	);
 
 	it("runs a child agent without requiring ripgrep", async () => {
 		const streamFn = vi.fn((_model, context: Context) => streamAnswer(`child answer: ${userText(context)}`));
