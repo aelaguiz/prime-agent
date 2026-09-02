@@ -7,6 +7,10 @@ import type { ActiveSessionState } from "./active-session-state.js";
 const SWEEP_INTERVAL_MS = 25_000;
 // Collapse a tool-use loop's rapid turn_end bursts into one summarization.
 const SETTLE_DEBOUNCE_MS = 2_000;
+// After a summary attempt fails, hold off on retrying that session until the
+// conversation moves on or this much time has passed. Without it, a summary
+// model that is unavailable makes every idle session re-attempt on every sweep.
+const SUMMARY_FAILURE_BACKOFF_MS = 5 * 60_000;
 
 const SUMMARY_MODEL_PROVIDER = "prime-inference";
 const SUMMARY_MODEL_ID = "qwen/qwen3-30b-a3b-instruct-2507";
@@ -210,6 +214,9 @@ export class DaemonSessionSummarizer {
 	private readonly inFlight = new Map<string, AbortController>();
 	// Sessions requested while one was running; get one more pass on completion.
 	private readonly rerunRequested = new Set<string>();
+	// Sessions whose last summary attempt failed, keyed to the message count it
+	// failed at so fresh conversation content clears the backoff immediately.
+	private readonly failureBackoff = new Map<string, { until: number; messageCount: number }>();
 
 	constructor(
 		private readonly listSessions: () => readonly ActiveSessionState[],
@@ -245,6 +252,7 @@ export class DaemonSessionSummarizer {
 			controller.abort();
 		}
 		this.rerunRequested.clear();
+		this.failureBackoff.clear();
 	}
 
 	/** Drop any pending work for a session that is closing. */
@@ -256,6 +264,7 @@ export class DaemonSessionSummarizer {
 		}
 		this.inFlight.get(activeSessionId)?.abort();
 		this.rerunRequested.delete(activeSessionId);
+		this.failureBackoff.delete(activeSessionId);
 	}
 
 	/** Seed in-memory status from the persisted entry when a session is added. */
@@ -298,14 +307,25 @@ export class DaemonSessionSummarizer {
 		const messageCount = messages.length;
 		const isWorking = isSessionWorking(state);
 		const previous = state.summaryState;
+		// A failed attempt backs off instead of retrying on the next sweep; new
+		// conversation content clears the backoff straight away.
+		const backoff = this.failureBackoff.get(id);
+		if (backoff) {
+			if (backoff.messageCount !== messageCount) {
+				this.failureBackoff.delete(id);
+			} else if (Date.now() < backoff.until) {
+				return;
+			}
+		}
 		// Idle sessions with a current verdict need no refresh; working sessions
 		// always refresh so the recap keeps up with the in-progress turn.
 		const contentUnchanged = previous?.basedOnMessageCount === messageCount;
 		const owesIdleVerdict = !isWorking && previous?.taskState === undefined;
-		// A blank recap means the model call hasn't succeeded yet (e.g. the
-		// needs_input fallback fired on a transient failure); keep retrying until a
-		// real summary lands so the recap isn't left permanently empty.
-		const owesSummary = !isWorking && !previous?.summary;
+		// A blank recap means the model call hasn't succeeded yet, so retry it —
+		// but only once the conversation has moved on. Treating a blank summary as
+		// owed at an unchanged message count is what pinned every idle session to
+		// one model attempt and one transcript append per sweep, forever.
+		const owesSummary = !isWorking && !previous?.summary && !contentUnchanged;
 		if (contentUnchanged && !isWorking && !owesIdleVerdict && !owesSummary) {
 			return;
 		}
@@ -322,6 +342,11 @@ export class DaemonSessionSummarizer {
 				isWorking,
 				signal: controller.signal,
 			});
+			if (generated) {
+				this.failureBackoff.delete(id);
+			} else {
+				this.failureBackoff.set(id, { until: Date.now() + SUMMARY_FAILURE_BACKOFF_MS, messageCount });
+			}
 			// A failed classification on an idle session would spin at "working"
 			// forever (the activity axis holds unjudged idle sessions there), so
 			// settle it to needs_input.
@@ -353,9 +378,12 @@ export class DaemonSessionSummarizer {
 				basedOnMessageCount: messageCount,
 			};
 			const changed = previous?.summary !== status.summary || previous?.taskState !== status.taskState;
+			const statusChanged = changed || previous?.basedOnMessageCount !== status.basedOnMessageCount;
 			state.summaryState = status;
-			// Persist only settled idle verdicts, never mid-stream.
-			if (!isWorking) {
+			// Persist only settled idle verdicts, never mid-stream, and only when the
+			// status actually moved: re-appending an identical record adds a
+			// transcript line and a permanent session-tree node for nothing.
+			if (!isWorking && statusChanged) {
 				try {
 					session.sessionManager.appendAgentStatus(status);
 				} catch {

@@ -71,23 +71,53 @@ describe("DaemonSessionSummarizer lifecycle", () => {
 		expect(state.summaryState).toMatchObject({ taskState: "needs_input", basedOnMessageCount: 2 });
 	});
 
-	test("retries after a needs_input fallback until a real summary lands", async () => {
+	test("does not retry a failed summary within the backoff window", async () => {
 		vi.useFakeTimers();
 		const generate = vi
 			.fn()
-			.mockResolvedValueOnce(undefined) // transient failure → blank needs_input fallback
+			.mockResolvedValueOnce(undefined) // transient failure
 			.mockResolvedValue({ summary: "Reviewed the diff", taskState: "completed" });
 		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
 		const state = makeState({ working: false });
+		// A real recap already exists one message back, so the new turn is summarized.
+		state.summaryState = { summary: "Opened the diff", taskState: "needs_input", basedOnMessageCount: 1 };
 
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
-		expect(state.summaryState).toMatchObject({ summary: "", taskState: "needs_input" });
+		expect(generate).toHaveBeenCalledOnce();
 
+		// Same conversation, inside the 5 min backoff: no second model call and no
+		// transcript record. This is the loop that appended an empty agent_status
+		// to every idle session on every sweep.
+		await vi.advanceTimersByTimeAsync(4 * 60_000);
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+		expect(generate).toHaveBeenCalledOnce();
+		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toHaveLength(0);
+
+		// Past the backoff the retry runs and the real summary lands.
+		await vi.advanceTimersByTimeAsync(2 * 60_000);
 		summarizer.notifyActivity(state);
 		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
 		expect(generate).toHaveBeenCalledTimes(2);
 		expect(state.summaryState).toMatchObject({ summary: "Reviewed the diff", taskState: "completed" });
+		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toHaveLength(1);
+	});
+
+	test("does not append a transcript record when the status is unchanged", async () => {
+		vi.useFakeTimers();
+		// The recap is already current; only the idle verdict is missing, so the
+		// pass runs but produces exactly the status that is already stored.
+		const generate = vi.fn().mockResolvedValue({ summary: "Editing the router" });
+		const summarizer = new DaemonSessionSummarizer(() => [], undefined, generate);
+		const state = makeState({ working: false });
+		state.summaryState = { summary: "Editing the router", taskState: undefined, basedOnMessageCount: 2 };
+
+		summarizer.notifyActivity(state);
+		await vi.advanceTimersByTimeAsync(SETTLE_MS + 500);
+		expect(generate).toHaveBeenCalledOnce();
+		expect(state.summaryState).toMatchObject({ summary: "Editing the router", basedOnMessageCount: 2 });
+		expect((state as unknown as { appendedStatuses: unknown[] }).appendedStatuses).toHaveLength(0);
 	});
 
 	test("refreshes a working session even when the message count is unchanged", async () => {
