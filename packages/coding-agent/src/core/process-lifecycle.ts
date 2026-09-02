@@ -27,7 +27,12 @@ const MAX_OBJECT_ENTRIES = 100;
 const MAX_ARRAY_ENTRIES = 100;
 const PROCESS_LOG_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
 const MAX_CRASH_REPORTS = 20;
-const HEARTBEAT_INTERVAL_MS = 60_000;
+const HEARTBEAT_INTERVAL_MS = 300_000;
+// The stale-log sweep costs one statSync per file in the shared processes
+// directory, so only the supervisor runs it, hourly, and never on startup.
+const PROCESS_LOG_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const PROCESS_LOG_PRUNE_DELAY_MS = 60_000;
+const PROCESS_LOG_PRUNE_ROLE = "daemon-supervisor";
 const NATIVE_REPORT_ROLES = new Set(["daemon-worker", "daemon-catalog", "update-restart-coordinator"]);
 
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
@@ -57,6 +62,7 @@ interface ProcessLifecycleState {
 	droppedEvents: number;
 	context: Record<string, JsonValue | undefined>;
 	heartbeat?: NodeJS.Timeout;
+	logPrune?: NodeJS.Timeout;
 	dispose?: () => void;
 	lastRejection?: { reason: unknown; reportPath?: string };
 }
@@ -432,6 +438,18 @@ function pruneStaleProcessLogs(): void {
 	}
 }
 
+function schedulePruneStaleProcessLogs(): void {
+	if (state.context.role !== PROCESS_LOG_PRUNE_ROLE) return;
+	const first = setTimeout(() => {
+		pruneStaleProcessLogs();
+		const repeat = setInterval(pruneStaleProcessLogs, PROCESS_LOG_PRUNE_INTERVAL_MS);
+		repeat.unref();
+		state.logPrune = repeat;
+	}, PROCESS_LOG_PRUNE_DELAY_MS);
+	first.unref();
+	state.logPrune = first;
+}
+
 function pruneCrashReports(directory: string): void {
 	try {
 		const reports = readdirSync(directory)
@@ -645,16 +663,18 @@ export function installProcessLifecycle(context: ProcessLifecycleContext = {}): 
 	for (const signal of SIGNALS) installSignalHandler(signal);
 
 	state.heartbeat = setInterval(() => {
-		writeEvent("process_heartbeat", {}, { includeResources: true });
+		writeEvent("process_heartbeat", {});
 	}, HEARTBEAT_INTERVAL_MS);
 	state.heartbeat.unref();
-	setImmediate(pruneStaleProcessLogs).unref();
+	schedulePruneStaleProcessLogs();
 
 	state.dispose = () => {
 		if (!state.installed) return;
 		state.installed = false;
 		if (state.heartbeat) clearInterval(state.heartbeat);
 		state.heartbeat = undefined;
+		if (state.logPrune) clearTimeout(state.logPrune);
+		state.logPrune = undefined;
 		process.removeListener("uncaughtExceptionMonitor", onUncaughtExceptionMonitor);
 		process.removeListener("unhandledRejection", onUnhandledRejection);
 		process.removeListener("beforeExit", onBeforeExit);
