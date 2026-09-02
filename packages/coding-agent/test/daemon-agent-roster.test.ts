@@ -459,6 +459,117 @@ describe("worker roster reporter", () => {
 		await new Promise((resolveSettle) => setImmediate(resolveSettle));
 		expect(internals.rosterReporter.lastComposed.get(agentId)?.summary.model).toMatchObject({ id: "m2" });
 	});
+
+	// Audit round 2, C4/C6: a message event anywhere used to recompose every row in
+	// the tree (message scan + stat + stringify per session) and push a frame per
+	// event. It must now touch exactly the row that moved and publish once per window.
+	it("recomposes only the touched row and publishes one debounced frame for a 40x500 tree", () => {
+		const SESSIONS = 40;
+		const MESSAGES = 500;
+		const EVENTS = 200;
+		// Recorded on the pre-change code path with this same shape, for the record:
+		// 0.365 ms/event, 8040 rows composed, 200 supervisor sends.
+		const BASELINE_MS_PER_EVENT = 0.365;
+
+		const directory = mkdtempSync(join(tmpdir(), "prime-roster-incremental-"));
+		tempDirs.push(directory);
+		mkdirSync(join(directory, "sessions"), { recursive: true });
+
+		const { daemon, sentDeltas } = makeWorkerReporter();
+		let composedRows = 0;
+		for (let index = 0; index < SESSIONS; index++) {
+			const sessionFile = join(directory, "sessions", `s${index}.jsonl`);
+			writeFileSync(sessionFile, '{"type":"header"}\n');
+			const messages = Array.from(
+				{ length: MESSAGES },
+				(_unused, m) =>
+					({
+						role: m % 2 === 0 ? "user" : "assistant",
+						content: `m${m}`,
+						timestamp: 1_700_000_000_000 + m,
+					}) as unknown as AgentMessage,
+			);
+			const state = makeState({ activeSessionId: `active-${index}`, sessionFile, messages });
+			// summaryForActiveSession reads the action snapshot exactly once per row,
+			// so this counts row composition without reaching into daemon internals.
+			(state.runtime.session as unknown as { getSessionActionSnapshot: () => unknown }).getSessionActionSnapshot =
+				() => {
+					composedRows++;
+					return { queuedCount: 0, steering: [], followUps: [] };
+				};
+			daemon.sessions.set(state.activeSessionId, state);
+		}
+
+		daemon.flushRoster();
+		expect(composedRows).toBe(SESSIONS);
+		expect(sentDeltas).toHaveLength(1);
+
+		const target = daemon.sessions.get("active-7");
+		if (!target) throw new Error("missing target session");
+		composedRows = 0;
+		sentDeltas.length = 0;
+
+		const started = process.hrtime.bigint();
+		for (let n = 1; n <= EVENTS; n++) {
+			(target.runtime.session.messages as AgentMessage[]).push({
+				role: "assistant",
+				content: `x${n}`,
+				timestamp: 1_700_000_500_000 + n,
+			} as unknown as AgentMessage);
+			daemon.observeRosterEvent(target, {
+				type: "session_event",
+				activeSessionId: target.activeSessionId,
+				event: { type: "message_end" },
+			});
+		}
+		// Nothing composed and nothing sent while the debounce window is still open.
+		expect(composedRows).toBe(0);
+		expect(sentDeltas).toHaveLength(0);
+		// What the trailing edge runs; it also cancels the armed timer.
+		daemon.flushRoster();
+		const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+		// One event in one session recomputes exactly one row...
+		expect(composedRows).toBe(1);
+		// ...and the whole burst costs one supervisor send carrying one row.
+		expect(sentDeltas).toHaveLength(1);
+		expect(sentDeltas[0]?.entries).toHaveLength(1);
+		expect(sentDeltas[0]?.entries[0]?.summary.activeSessionId).toBe("active-7");
+		expect(sentDeltas[0]?.entries[0]?.summary.messageCount).toBe(MESSAGES + EVENTS);
+
+		const msPerEvent = elapsedMs / EVENTS;
+		console.log(
+			`[roster perf] ${SESSIONS} sessions x ${MESSAGES} messages, ${EVENTS} message events: ` +
+				`before ${BASELINE_MS_PER_EVENT.toFixed(4)} ms/event ` +
+				`(${SESSIONS * (EVENTS + 1)} rows composed, ${EVENTS} supervisor sends) -> ` +
+				`after ${msPerEvent.toFixed(4)} ms/event (${composedRows} row composed, ${sentDeltas.length} supervisor send)`,
+		);
+		expect(msPerEvent).toBeLessThan(BASELINE_MS_PER_EVENT);
+
+		// The timer itself is a trailing edge: one frame per window, not one per event.
+		vi.useFakeTimers();
+		try {
+			for (let n = 1; n <= 10; n++) {
+				(target.runtime.session.messages as AgentMessage[]).push({
+					role: "assistant",
+					content: `y${n}`,
+					timestamp: 1_700_000_900_000 + n,
+				} as unknown as AgentMessage);
+				daemon.observeRosterEvent(target, {
+					type: "session_event",
+					activeSessionId: target.activeSessionId,
+					event: { type: "message_end" },
+				});
+			}
+			expect(sentDeltas).toHaveLength(1);
+			vi.advanceTimersByTime(300);
+			expect(sentDeltas).toHaveLength(2);
+			vi.advanceTimersByTime(1000);
+			expect(sentDeltas).toHaveLength(2);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
 });
 
 // --- Supervisor-side roster ledger ---

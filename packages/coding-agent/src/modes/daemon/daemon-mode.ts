@@ -424,6 +424,15 @@ const SUPERVISOR_FENCE_POLL_MS = 2000;
 // A loaded machine routinely crosses 100 ms; only a genuinely slow check is
 // worth one stderr line the supervisor then relays through a sync log write.
 const SLOW_SUPERVISOR_CLAIM_CHECK_LOG_MS = 500;
+// Per-turn session traffic (tool starts/ends, message ends, streamed child
+// updates) is the highest-rate roster trigger there is; coalescing it on a
+// trailing edge bounds the supervisor's view lag instead of paying a compose
+// per token. Lifecycle changes keep the immediate setImmediate path.
+const ROSTER_FLUSH_DEBOUNCE_MS = 250;
+// Safety net for the incremental row cache: fields that no session event
+// carries (a child tree that stops running, a summarizer verdict landing on a
+// sibling) converge within this window at the cost of one full compose.
+const ROSTER_FULL_RECOMPOSE_INTERVAL_MS = 5000;
 const UPDATE_RESTART_MARKER =
 	"<prime_agent_update_interrupted>\n" +
 	"Prime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been partially completed.\n" +
@@ -672,6 +681,20 @@ export class AgentDaemon {
 		snapshotPending: false,
 	};
 	private rosterFlushScheduled = false;
+	/** Trailing-edge coalescer for per-turn roster triggers; lifecycle changes bypass it. */
+	private rosterFlushTimer?: ReturnType<typeof setTimeout>;
+	/** Last composed row per activeSessionId; reused whole when the session did not change. */
+	private rosterRowCache?: Map<string, WorkerRosterEntry>;
+	/** Memoized passivated rows, keyed by agentId, so a departed session stops re-serializing. */
+	private rosterPassivatedCache?: Map<
+		string,
+		{ source: WorkerRosterEntry; heartbeat: boolean; cron: boolean; entry: WorkerRosterEntry }
+	>;
+	/** Sessions whose row must be recomposed on the next flush. */
+	private rosterDirtySessionIds?: Set<string>;
+	private rosterLastFullComposeAt?: number;
+	/** childId -> activeSessionId, revalidated in O(1) on every hit. */
+	private rlmChildActiveSessionIdMemo?: Map<string, string>;
 	private rosterHeartbeatTimer?: ReturnType<typeof setInterval>;
 	private rlmSpawnLedgerInstance?: RlmSpawnLedger;
 	/** Immutable per-worker ledger/catalog directory, bound by the root create command. */
@@ -7645,11 +7668,12 @@ export class AgentDaemon {
 				return;
 			}
 			if (!ROSTER_SESSION_EVENT_TRIGGERS.has(message.event.type)) return;
-		} else if (
-			message.type !== "session_status" &&
-			message.type !== "session_closed" &&
-			message.type !== "session_replaced"
-		) {
+			// Per-turn traffic: only the emitting session's row can have moved, and
+			// the supervisor tolerates one debounce window of lag on it.
+			this.scheduleRosterFlushForSession(state.activeSessionId);
+			return;
+		}
+		if (message.type !== "session_status" && message.type !== "session_closed" && message.type !== "session_replaced") {
 			return;
 		}
 		this.scheduleRosterFlush();
@@ -7657,13 +7681,18 @@ export class AgentDaemon {
 
 	private observeRosterChildUpdate(state: ActiveSessionState, child: AgentConnectionRlmChildAgentSnapshot): void {
 		const bound = child.activeSessionId !== undefined || this.hasSessionForRlmChild(state, child.id);
-		const entry = this.queuedChildRosterEntry(state, child);
 		if (!bound && (child.status === "queued" || child.status === "running")) {
+			const entry = this.queuedChildRosterEntry(state, child);
 			this.rosterReporter.queuedChildren.set(entry.agentId, entry);
 		} else {
-			this.rosterReporter.queuedChildren.delete(entry.agentId);
+			// A bound (or terminal) child needs no placeholder row, and building one
+			// per streamed token is pure waste — the agentId alone drops the entry.
+			this.rosterReporter.queuedChildren.delete(this.queuedChildRosterAgentId(state, child.id));
 		}
-		this.scheduleRosterFlush();
+		// Every streamed child token arrives here. The child's own row is refreshed by
+		// the child session's events; the parent's row (hasRunningRlmChildren, activity)
+		// is the only thing this can move, so mark it and let the debounce publish.
+		this.scheduleRosterFlushForSession(state.activeSessionId);
 	}
 
 	private hasSessionForRlmChild(parentState: ActiveSessionState, childId: string): boolean {
@@ -7674,6 +7703,17 @@ export class AgentDaemon {
 			}
 		}
 		return false;
+	}
+
+	/** The agentId queuedChildRosterEntry would produce, without composing the row. */
+	private queuedChildRosterAgentId(state: ActiveSessionState, childId: string): string {
+		return rosterAgentIdForSummary({
+			runtimeKind: "subagent",
+			rlmChildId: childId,
+			sessionId: childId,
+			parentSessionPath: state.runtime.session.sessionFile,
+			parentActiveSessionId: state.activeSessionId,
+		});
 	}
 
 	private queuedChildRosterEntry(
@@ -7704,8 +7744,16 @@ export class AgentDaemon {
 		return { agentId: rosterAgentIdForSummary(summary), queuedChild: true, summary };
 	}
 
+	/**
+	 * Immediate (setImmediate-coalesced) flush for a caller that cannot name the
+	 * session it moved: a lifecycle transition, a cron/model change, a client
+	 * attach. Every cached row is invalidated because any of them may have moved.
+	 */
 	private scheduleRosterFlush(): void {
-		if (!this.options.worker || this.rosterFlushScheduled || this.shuttingDown) return;
+		if (!this.options.worker || this.shuttingDown) return;
+		this.rosterRowCache?.clear();
+		this.rosterPassivatedCache?.clear();
+		if (this.rosterFlushScheduled) return;
 		this.rosterFlushScheduled = true;
 		setImmediate(() => {
 			this.rosterFlushScheduled = false;
@@ -7717,13 +7765,110 @@ export class AgentDaemon {
 		});
 	}
 
+	/**
+	 * Trailing-edge flush for per-turn traffic: only the named session's row is
+	 * recomposed, and a burst of events collapses into one supervisor frame.
+	 */
+	private scheduleRosterFlushForSession(activeSessionId: string): void {
+		if (!this.options.worker || this.shuttingDown) return;
+		(this.rosterDirtySessionIds ??= new Set()).add(activeSessionId);
+		if (this.rosterFlushScheduled || this.rosterFlushTimer !== undefined) return;
+		this.rosterFlushTimer = setTimeout(() => {
+			this.rosterFlushTimer = undefined;
+			try {
+				this.flushRoster();
+			} catch (error) {
+				this.log(`could not publish roster delta: ${String(error)}`);
+			}
+		}, ROSTER_FLUSH_DEBOUNCE_MS);
+		this.rosterFlushTimer.unref();
+	}
+
+	/**
+	 * O(1) check that a cached row still describes the session. Everything read
+	 * here is a plain field; the expensive projections (message scan, action
+	 * snapshot, child-tree recursion, stat) only run when this fails, when the
+	 * session is marked dirty, or on the periodic full recompose.
+	 */
+	private rosterRowStillCurrent(state: ActiveSessionState, entry: WorkerRosterEntry): boolean {
+		const session = state.runtime.session;
+		const summary = entry.summary;
+		return (
+			summary.sessionId === session.sessionId &&
+			summary.sessionFile === session.sessionFile &&
+			summary.messageCount === session.messages.length &&
+			summary.isStreaming === session.isStreaming &&
+			summary.isCompacting === session.isCompacting &&
+			summary.isSessionActive === session.isSessionActive &&
+			summary.attachedClients === state.clients.size &&
+			summary.thinkingLevel === session.thinkingLevel &&
+			summary.model === session.model
+		);
+	}
+
+	private composeRosterRow(
+		state: ActiveSessionState,
+		registrations: ReturnType<typeof scheduledJobRegistrations>,
+	): WorkerRosterEntry {
+		const sessionFile = state.runtime.session.sessionFile;
+		const resolvedSessionFile = sessionFile ? resolve(sessionFile) : undefined;
+		// Mirrors buildSessionList's active-only branch (the worker never passes saved sessions).
+		return workerRosterEntryFromSummary(
+			summaryForActiveSession(
+				state,
+				undefined,
+				registrations.activeHeartbeatSessionIds.has(state.activeSessionId),
+				registrations.heartbeatSessionIds.has(state.activeSessionId) ||
+					(resolvedSessionFile !== undefined && registrations.heartbeatSessionFiles.has(resolvedSessionFile)),
+				registrations.cronSessionIds.has(state.activeSessionId) ||
+					(resolvedSessionFile !== undefined && registrations.cronSessionFiles.has(resolvedSessionFile)),
+			),
+		);
+	}
+
 	private flushRoster(): void {
 		const reporter = this.rosterReporter;
+		// A completed flush satisfies any pending debounced request.
+		if (this.rosterFlushTimer !== undefined) {
+			clearTimeout(this.rosterFlushTimer);
+			this.rosterFlushTimer = undefined;
+		}
 		const entries = new Map<string, WorkerRosterEntry>();
 		const scheduledJobs = this.cronStore.list();
-		for (const summary of buildSessionList([...this.sessions.values()], [], scheduledJobs)) {
-			const entry = workerRosterEntryFromSummary(summary);
+		const registrations = scheduledJobRegistrations(scheduledJobs);
+		const rowCache = (this.rosterRowCache ??= new Map());
+		const dirty = (this.rosterDirtySessionIds ??= new Set());
+		const now = Date.now();
+		if (
+			this.rosterLastFullComposeAt === undefined ||
+			now - this.rosterLastFullComposeAt >= ROSTER_FULL_RECOMPOSE_INTERVAL_MS
+		) {
+			rowCache.clear();
+			this.rosterPassivatedCache?.clear();
+			this.rosterLastFullComposeAt = now;
+			// Same cadence for the child memo, whose keys outlive their sessions.
+			const memo = this.rlmChildActiveSessionIdMemo;
+			if (memo) {
+				for (const [childId, activeSessionId] of memo) {
+					if (this.sessions.get(activeSessionId)?.runtime.metadata.rlmChildId !== childId) memo.delete(childId);
+				}
+			}
+		}
+		for (const state of this.sessions.values()) {
+			const cached = dirty.has(state.activeSessionId) ? undefined : rowCache.get(state.activeSessionId);
+			const entry =
+				cached !== undefined && this.rosterRowStillCurrent(state, cached)
+					? cached
+					: this.composeRosterRow(state, registrations);
+			rowCache.set(state.activeSessionId, entry);
 			entries.set(entry.agentId, entry);
+		}
+		dirty.clear();
+		// Every live session just wrote its key, so a larger cache means stale keys.
+		if (rowCache.size > this.sessions.size) {
+			for (const activeSessionId of rowCache.keys()) {
+				if (!this.sessions.has(activeSessionId)) rowCache.delete(activeSessionId);
+			}
 		}
 		for (const [agentId, queued] of reporter.queuedChildren) {
 			if (entries.has(agentId)) {
@@ -7760,25 +7905,48 @@ export class AgentDaemon {
 			entries.delete(agentId);
 			reporter.queuedChildren.delete(agentId);
 		}
-		const registrations = scheduledJobRegistrations(scheduledJobs);
+		const passivatedCache = (this.rosterPassivatedCache ??= new Map());
 		for (const [agentId, previous] of reporter.lastComposed) {
 			if (!entries.has(agentId) && !reporter.removedAgentIds.has(agentId)) {
 				const file = previous.summary.sessionFile ? resolve(previous.summary.sessionFile) : undefined;
-				entries.set(
-					agentId,
+				const heartbeat = file !== undefined && registrations.heartbeatSessionFiles.has(file);
+				const cron = file !== undefined && registrations.cronSessionFiles.has(file);
+				const cached = passivatedCache.get(agentId);
+				// Passivation is idempotent, so a hit on either side of the last
+				// mapping is the same row and keeps its identity (and its JSON).
+				const reusable =
+					cached !== undefined &&
+					cached.heartbeat === heartbeat &&
+					cached.cron === cron &&
+					(cached.source === previous || cached.entry === previous)
+						? cached.entry
+						: undefined;
+				const entry =
+					reusable ??
 					passivatedWorkerRosterEntry(previous, {
-						hasRegisteredHeartbeat: file !== undefined && registrations.heartbeatSessionFiles.has(file),
-						hasRegisteredCronJob: file !== undefined && registrations.cronSessionFiles.has(file),
-					}),
-				);
+						hasRegisteredHeartbeat: heartbeat,
+						hasRegisteredCronJob: cron,
+					});
+				passivatedCache.set(agentId, { source: previous, heartbeat, cron, entry });
+				entries.set(agentId, entry);
 			}
+		}
+		for (const agentId of passivatedCache.keys()) {
+			if (!reporter.lastComposed.has(agentId)) passivatedCache.delete(agentId);
 		}
 		const changed: WorkerRosterEntry[] = [];
 		const nextJson = new Map<string, string>();
 		for (const entry of entries.values()) {
-			const json = JSON.stringify(entry);
+			const previousJson = reporter.lastComposedJson.get(entry.agentId);
+			// A row object carried over by reference cannot have changed, so its
+			// serialization is carried over too — that is the per-flush stringify
+			// of every unchanged session, gone.
+			const json =
+				previousJson !== undefined && reporter.lastComposed.get(entry.agentId) === entry
+					? previousJson
+					: JSON.stringify(entry);
 			nextJson.set(entry.agentId, json);
-			if (reporter.lastComposedJson.get(entry.agentId) !== json) changed.push(entry);
+			if (previousJson !== json) changed.push(entry);
 		}
 		const removedAgentIds = [...reporter.removedAgentIds.keys()];
 		reporter.lastComposed = new Map(entries);
@@ -8047,13 +8215,30 @@ export class AgentDaemon {
 		) {
 			return;
 		}
-		const childId = message.event.child.id;
+		const activeSessionId = this.activeSessionIdForRlmChild(message.event.child.id);
+		if (activeSessionId !== undefined) message.event.child.activeSessionId = activeSessionId;
+	}
+
+	/**
+	 * Resolve a child run to its resident session. A streamed child emits one of
+	 * these per token, so the mapping is memoized; every hit is revalidated in
+	 * O(1) against the live session map, which makes a stale entry self-healing
+	 * without any bookkeeping on the session map's mutators.
+	 */
+	private activeSessionIdForRlmChild(childId: string): string | undefined {
+		const memo = (this.rlmChildActiveSessionIdMemo ??= new Map());
+		const cached = memo.get(childId);
+		if (cached !== undefined) {
+			if (this.sessions.get(cached)?.runtime.metadata.rlmChildId === childId) return cached;
+			memo.delete(childId);
+		}
 		for (const candidate of this.sessions.values()) {
 			if (candidate.runtime.metadata.rlmChildId === childId) {
-				message.event.child.activeSessionId = candidate.activeSessionId;
-				return;
+				memo.set(childId, candidate.activeSessionId);
+				return candidate.activeSessionId;
 			}
 		}
+		return undefined;
 	}
 
 	private addSessionEventMeta(state: ActiveSessionState, message: DaemonOutbound): DaemonOutbound {
@@ -8179,6 +8364,10 @@ export class AgentDaemon {
 		if (this.rosterHeartbeatTimer) {
 			clearInterval(this.rosterHeartbeatTimer);
 			this.rosterHeartbeatTimer = undefined;
+		}
+		if (this.rosterFlushTimer) {
+			clearTimeout(this.rosterFlushTimer);
+			this.rosterFlushTimer = undefined;
 		}
 		this.log(`shutting down (exit ${exitCode}); closing ${this.sessions.size} active session(s)`);
 		const closingReason = this.getShutdownClosingReason();
