@@ -372,6 +372,8 @@ interface ResidentWorker {
 	client?: DaemonWorkerClient;
 	heartbeatSnapshot?: AgentConnectionHeartbeat[];
 	heartbeatSnapshotStale?: boolean;
+	/** Bumped on every invalidation; a refresh that straddles one must stay stale. */
+	heartbeatChangeSeq?: number;
 	/** In-flight snapshot refresh, shared by every client that asks while it runs. */
 	heartbeatRefresh?: Promise<WorkerHeartbeatRefresh>;
 	summaries: Map<string, SessionSummary>;
@@ -3900,6 +3902,7 @@ export class DaemonSupervisor {
 				worker.transientCreateCommand = undefined;
 			}
 			worker.heartbeatSnapshotStale = true;
+			worker.heartbeatChangeSeq = (worker.heartbeatChangeSeq ?? 0) + 1;
 			this.broadcastHeartbeatsChanged();
 			this.traceWorkerStartup(workerId, startupTrace, "ready", {
 				childPid: child.pid,
@@ -4240,6 +4243,7 @@ export class DaemonSupervisor {
 			worker.deferredRecoveryRounds = 0;
 			this.persistWorker(worker);
 			worker.heartbeatSnapshotStale = true;
+			worker.heartbeatChangeSeq = (worker.heartbeatChangeSeq ?? 0) + 1;
 			this.broadcastHeartbeatsChanged();
 			recordProcessLifecycle("daemon_worker_recovery_result", {
 				status: "adopted",
@@ -4734,6 +4738,7 @@ export class DaemonSupervisor {
 							worker.deferredRecoveryRounds = 0;
 							this.persistWorker(worker);
 							worker.heartbeatSnapshotStale = true;
+							worker.heartbeatChangeSeq = (worker.heartbeatChangeSeq ?? 0) + 1;
 							this.broadcastHeartbeatsChanged();
 							recordProcessLifecycle("daemon_worker_recovery_result", {
 								status: "reconnected",
@@ -6174,6 +6179,7 @@ export class DaemonSupervisor {
 	 * single in-flight fan-out per worker instead of each issuing its own RPC.
 	 */
 	private refreshWorkerHeartbeats(worker: ResidentWorker, command: DaemonCommand): Promise<WorkerHeartbeatRefresh> {
+		const changeSeq = worker.heartbeatChangeSeq ?? 0;
 		worker.heartbeatRefresh ??= (async (): Promise<WorkerHeartbeatRefresh> => {
 			const response = await this.forwardToWorker(worker, command, 5000).catch((error: unknown) =>
 				failure(command.id, command.type, error, serializeDaemonError(error)),
@@ -6181,7 +6187,11 @@ export class DaemonSupervisor {
 			if (response.success) {
 				const snapshot = heartbeatsFromResponse(response);
 				worker.heartbeatSnapshot = snapshot;
-				worker.heartbeatSnapshotStale = false;
+				// A change that landed while this RPC was in flight is not in the reply:
+				// keep the worker stale so the next request refreshes it again.
+				if ((worker.heartbeatChangeSeq ?? 0) === changeSeq) {
+					worker.heartbeatSnapshotStale = false;
+				}
 				return { heartbeats: snapshot };
 			}
 			this.log(`Could not list heartbeats from a worker: ${response.error}`);
@@ -6715,6 +6725,7 @@ export class DaemonSupervisor {
 		}
 		if (outboundType === "heartbeats_changed") {
 			worker.heartbeatSnapshotStale = true;
+			worker.heartbeatChangeSeq = (worker.heartbeatChangeSeq ?? 0) + 1;
 			this.broadcastHeartbeatsChanged();
 			return;
 		}

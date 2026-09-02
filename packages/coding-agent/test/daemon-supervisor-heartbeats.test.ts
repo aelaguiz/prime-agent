@@ -257,6 +257,42 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(target.heartbeatSnapshot).toEqual([]);
 	});
 
+	it("keeps a worker stale when a heartbeat change lands mid-refresh", async () => {
+		const supervisor = createSupervisorHarness();
+		const target = { ...worker("ready"), heartbeatSnapshotStale: false };
+		supervisor.workers.set("target", target);
+		let calls = 0;
+		supervisor.forwardToWorker = vi.fn(async (_target, command) => {
+			calls += 1;
+			if (calls === 1) {
+				// The worker changed after it computed this reply: the change is not in it.
+				supervisor.handleWorkerFrame(target, {
+					header: { kind: "outbound", outboundType: "heartbeats_changed" },
+					payload: Buffer.alloc(0),
+				});
+			}
+			return success(command.id, command.type, {
+				heartbeats: [{ job: { id: calls === 1 ? "heartbeat-1" : "heartbeat-2" } }],
+			});
+		});
+
+		const first = await supervisor.handleCommand({} as DaemonSocketClient, {
+			id: "list-1",
+			type: "heartbeats_list",
+		});
+		expect(first).toMatchObject({ success: true, data: { heartbeats: [{ job: { id: "heartbeat-1" } }] } });
+		expect(target.heartbeatSnapshotStale).toBe(true);
+
+		const second = await supervisor.handleCommand({} as DaemonSocketClient, {
+			id: "list-2",
+			type: "heartbeats_list",
+		});
+
+		expect(second).toMatchObject({ success: true, data: { heartbeats: [{ job: { id: "heartbeat-2" } }] } });
+		expect(supervisor.forwardToWorker).toHaveBeenCalledTimes(2);
+		expect(target.heartbeatSnapshotStale).toBe(false);
+	});
+
 	it("collapses a burst of worker heartbeat changes into one client broadcast", () => {
 		const supervisor = createSupervisorHarness();
 		const writes: string[] = [];
