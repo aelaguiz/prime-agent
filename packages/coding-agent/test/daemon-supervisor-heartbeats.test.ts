@@ -8,6 +8,7 @@ import { DaemonSupervisor } from "../src/modes/daemon/daemon-supervisor.js";
 
 interface SupervisorHarness {
 	workers: Map<string, unknown>;
+	clients: Set<unknown>;
 	forwardToWorker(worker: unknown, command: DaemonCommand, timeoutMs?: number): Promise<DaemonResponse>;
 	handleCommand(client: DaemonSocketClient, command: DaemonCommand): Promise<DaemonResponse | undefined>;
 	handleWorkerFrame(worker: unknown, frame: unknown): void;
@@ -16,6 +17,7 @@ interface SupervisorHarness {
 const tempDirs: string[] = [];
 
 afterEach(() => {
+	vi.useRealTimers();
 	for (const directory of tempDirs.splice(0)) {
 		rmSync(directory, { recursive: true, force: true });
 	}
@@ -255,4 +257,37 @@ describe("daemon supervisor heartbeat aggregation", () => {
 		expect(target.heartbeatSnapshot).toEqual([]);
 	});
 
+	it("collapses a burst of worker heartbeat changes into one client broadcast", () => {
+		const supervisor = createSupervisorHarness();
+		const writes: string[] = [];
+		supervisor.clients.add({
+			socket: {
+				destroyed: false,
+				write: (line: unknown) => {
+					writes.push(String(line));
+					return true;
+				},
+			},
+		});
+		const target = worker("ready");
+		supervisor.workers.set("target", target);
+		const changed = () =>
+			supervisor.handleWorkerFrame(target, {
+				header: { kind: "outbound", outboundType: "heartbeats_changed" },
+				payload: Buffer.alloc(0),
+			});
+		vi.useFakeTimers();
+
+		for (let index = 0; index < 5; index++) {
+			changed();
+		}
+		expect(writes).toHaveLength(0);
+
+		vi.advanceTimersByTime(1_000);
+		expect(writes.filter((line) => line.includes("heartbeats_changed"))).toHaveLength(1);
+
+		changed();
+		vi.advanceTimersByTime(1_000);
+		expect(writes.filter((line) => line.includes("heartbeats_changed"))).toHaveLength(2);
+	});
 });

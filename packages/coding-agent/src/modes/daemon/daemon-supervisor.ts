@@ -220,6 +220,8 @@ const WORKER_PROCESS_IDENTITY_TIMEOUT_MS = 2_000;
 const STARTUP_WORKER_CONNECTION_CONCURRENCY = 8;
 const ROSTER_WATCHDOG_INTERVAL_MS = 15_000;
 const ROSTER_STALE_AFTER_MS = 3 * ROSTER_HEARTBEAT_INTERVAL_MS;
+// A burst of worker heartbeat changes costs clients one refresh, not one each.
+const HEARTBEATS_CHANGED_DEBOUNCE_MS = 1_000;
 const SUPERVISOR_SERVER_CAPABILITIES: readonly DaemonServerCapability[] = [
 	...DAEMON_DEFAULT_SERVER_CAPABILITIES,
 	"agent_roster",
@@ -817,6 +819,7 @@ export class DaemonSupervisor {
 	private readonly publishedRosterIds = new Set<string>();
 	private rosterPushScheduled = false;
 	private rosterWatchdogTimer?: ReturnType<typeof setInterval>;
+	private heartbeatsChangedTimer?: ReturnType<typeof setTimeout>;
 	private idleEvictionTimer?: ReturnType<typeof setTimeout>;
 	private idleEvictionSweep?: Promise<void>;
 	private idleEvictionFence?: Promise<void>;
@@ -7861,10 +7864,21 @@ export class DaemonSupervisor {
 		return this.writeSerialized(client, serializeJsonLine(message));
 	}
 
+	/**
+	 * Trailing-edge debounce: a burst of worker heartbeat changes wakes every
+	 * client once per second instead of once per change.
+	 */
 	private broadcastHeartbeatsChanged(): void {
-		for (const client of this.clients) {
-			this.write(client, { type: "heartbeats_changed" });
+		if (this.heartbeatsChangedTimer || this.shuttingDown) {
+			return;
 		}
+		this.heartbeatsChangedTimer = setTimeout(() => {
+			this.heartbeatsChangedTimer = undefined;
+			for (const client of this.clients) {
+				this.write(client, { type: "heartbeats_changed" });
+			}
+		}, HEARTBEATS_CHANGED_DEBOUNCE_MS);
+		this.heartbeatsChangedTimer.unref();
 	}
 
 	private writeSerialized(client: DaemonSocketClient, line: string | Uint8Array): boolean {
@@ -7959,6 +7973,8 @@ export class DaemonSupervisor {
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
 		this.clearRosterWatchdogTimer();
+		clearTimeout(this.heartbeatsChangedTimer);
+		this.heartbeatsChangedTimer = undefined;
 		await this.idleEvictionSweep?.catch(() => undefined);
 		for (const cleanup of this.signalCleanupHandlers.splice(0)) {
 			await this.runCleanupStep("signal handler", cleanup);
@@ -8059,6 +8075,8 @@ export class DaemonSupervisor {
 		this.shuttingDown = true;
 		this.clearIdleEvictionTimer();
 		this.clearRosterWatchdogTimer();
+		clearTimeout(this.heartbeatsChangedTimer);
+		this.heartbeatsChangedTimer = undefined;
 		await this.idleEvictionSweep?.catch(() => undefined);
 		if (closingReason) {
 			for (const client of this.clients) {
