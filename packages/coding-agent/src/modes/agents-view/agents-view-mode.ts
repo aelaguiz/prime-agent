@@ -100,7 +100,6 @@ import {
 import { AgentsViewRosterStore, STALE_ROSTER_DAEMON_MESSAGE } from "./roster-store.js";
 import { matchesSearchText } from "./session-view-search.js";
 
-const HEARTBEAT_POLL_INTERVAL_MS = 15000;
 const SAVED_CATALOG_STREAM_RECONCILE_MS = 100;
 const RECONNECT_TIMEOUT_MS = 120000;
 const RECONNECT_RETRY_MS = 1000;
@@ -650,7 +649,6 @@ export class AgentsViewMode implements Component, Focusable {
 	private reconnectTimedOut = false;
 	private daemonShutdownReceived = false;
 	private resolveRun: ((result: AgentsViewRunResult) => void) | undefined;
-	private heartbeatPollTimer: NodeJS.Timeout | undefined;
 	private animationTimer: NodeJS.Timeout | undefined;
 	private ctrlCExitHintExpiresAt = 0;
 	private ctrlCExitHintTimer: ReturnType<typeof setTimeout> | undefined;
@@ -854,6 +852,8 @@ export class AgentsViewMode implements Component, Focusable {
 		this.client = client;
 		if (!client.isConnected) await client.reconnect();
 		this.unsubscribeClientMessage = client.onMessage((message) => {
+			// Heartbeat freshness is push-driven: the supervisor sends heartbeats_changed,
+			// so there is no unconditional poll behind it.
 			if (message.type === "heartbeats_changed") void this.refreshHeartbeats();
 		});
 		this.persistentState.rosterStore ??= new AgentsViewRosterStore();
@@ -892,8 +892,6 @@ export class AgentsViewMode implements Component, Focusable {
 		this.resolveMissingSelectionAnchor();
 		void this.refreshHeartbeats();
 		this.loadStartupNotices();
-		this.heartbeatPollTimer = setInterval(() => void this.refreshHeartbeats(), HEARTBEAT_POLL_INTERVAL_MS);
-		this.heartbeatPollTimer.unref?.();
 		this.animationTimer = setInterval(() => {
 			const hasRunning = this.rows.some((row) => row.section === "running");
 			const hasStaleAge = this.rows.some((row) => row.summary.lastHeardFromAt !== undefined);
@@ -2357,10 +2355,6 @@ export class AgentsViewMode implements Component, Focusable {
 		this.stopped = true;
 		this.savedCatalogGeneration += 1;
 		this.heartbeatCatalogGeneration += 1;
-		if (this.heartbeatPollTimer) {
-			clearInterval(this.heartbeatPollTimer);
-			this.heartbeatPollTimer = undefined;
-		}
 		if (this.animationTimer) {
 			clearInterval(this.animationTimer);
 			this.animationTimer = undefined;
