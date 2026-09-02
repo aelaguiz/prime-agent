@@ -160,6 +160,31 @@ describe("agent trace upload", () => {
 		expect(calls).toHaveLength(0);
 	});
 
+	it("caches the traces-enabled flag instead of reloading settings per upload", async () => {
+		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "cached-enabled-session");
+		const settingsManager = SettingsManager.inMemory({ agentTraces: { enabled: false } });
+		const reloadSpy = vi.spyOn(settingsManager, "reload");
+		const calls: FetchCall[] = [];
+		const options = {
+			sessionFile: sessionManager.getSessionFile(),
+			authStorage: AuthStorage.inMemory({
+				[PRIME_AGENT_TRACES_PROVIDER_ID]: { type: "api_key" as const, key: "trace-key" },
+			}),
+			settingsManager,
+			baseUrl: "https://api.example.test",
+			fetchFn: createFetchRecorder(calls),
+		};
+
+		expect((await uploadAgentTraceFile(options)).status).toBe("disabled");
+		expect((await uploadAgentTraceFile(options)).status).toBe("disabled");
+		expect(reloadSpy).toHaveBeenCalledTimes(1);
+
+		// A real settings change still invalidates the cached flag.
+		settingsManager.setAgentTracesEnabled(true);
+		expect((await uploadAgentTraceFile(options)).status).toBe("uploaded");
+		expect(reloadSpy).toHaveBeenCalledTimes(2);
+	});
+
 	it("allows an explicit one-shot upload without enabling automatic sharing", async () => {
 		const sessionManager = writeSession(tempDir, join(tempDir, "sessions"), "one-shot-session");
 		const calls: FetchCall[] = [];

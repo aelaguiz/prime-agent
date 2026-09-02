@@ -671,13 +671,27 @@ export async function getPrimeAgentTraceCredential(
 	return undefined;
 }
 
+// The enabled flag is read on every persisted transcript entry, and the reload
+// behind it used to re-read settings.json from disk each time. Cache it per
+// settings manager and key the cache to the manager's revision, which the
+// existing reload path bumps, so a real settings change still invalidates it.
+const tracesEnabledCache = new WeakMap<SettingsManager, { revision: number; enabled: boolean }>();
+
 async function getAgentTracesEnabled(
 	options: Pick<AgentTraceUploadOptions, "reloadConfig" | "settingsManager">,
 ): Promise<boolean> {
-	if (options.reloadConfig !== false) {
-		await options.settingsManager.reload().catch(() => undefined);
+	const settingsManager = options.settingsManager;
+	if (options.reloadConfig === false) {
+		return settingsManager.getAgentTracesEnabled();
 	}
-	return options.settingsManager.getAgentTracesEnabled();
+	const cached = tracesEnabledCache.get(settingsManager);
+	if (cached && cached.revision === settingsManager.getSettingsRevision()) {
+		return cached.enabled;
+	}
+	await settingsManager.reload().catch(() => undefined);
+	const enabled = settingsManager.getAgentTracesEnabled();
+	tracesEnabledCache.set(settingsManager, { revision: settingsManager.getSettingsRevision(), enabled });
+	return enabled;
 }
 
 async function uploadAgentTraceFileWithRequestGate(

@@ -185,6 +185,33 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	describe("lock-free reads", () => {
+		it("reads settings while a writer holds the exclusive lock", () => {
+			const settingsPath = join(agentDir, "settings.json");
+			writeFileSync(settingsPath, JSON.stringify({ theme: "dark" }));
+			// proper-lockfile takes a mkdir-based lock; hold one as a writer would.
+			mkdirSync(`${settingsPath}.lock`);
+
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			expect(manager.getTheme()).toBe("dark");
+			expect(manager.drainErrors()).toEqual([]);
+		});
+
+		it("bumps the settings revision on reload and on a write", async () => {
+			const manager = SettingsManager.create(projectDir, agentDir);
+
+			const initial = manager.getSettingsRevision();
+			await manager.reload();
+			const afterReload = manager.getSettingsRevision();
+			expect(afterReload).toBeGreaterThan(initial);
+
+			manager.setAgentTracesEnabled(true);
+			expect(manager.getSettingsRevision()).toBeGreaterThan(afterReload);
+			await manager.flush();
+		});
+	});
+
 	describe("onboardingShown", () => {
 		it("defaults to false and persists globally", async () => {
 			const manager = SettingsManager.create(projectDir, agentDir);

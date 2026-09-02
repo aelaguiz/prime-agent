@@ -216,6 +216,13 @@ export type SettingsScope = "global" | "project";
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	/**
+	 * Lock-free read of the raw settings content. Reads never need the exclusive
+	 * write lock: writes land through a temp file plus `rename`, so a reader sees
+	 * either the whole old file or the whole new one. Optional so a custom
+	 * storage without it still works through `withLock`.
+	 */
+	read?(scope: SettingsScope): string | undefined;
 }
 
 export interface SettingsError {
@@ -230,6 +237,20 @@ export class FileSettingsStorage implements SettingsStorage {
 	constructor(cwd: string, agentDir: string) {
 		this.globalSettingsPath = join(agentDir, "settings.json");
 		this.projectSettingsPath = join(cwd, CONFIG_DIR_NAME, "settings.json");
+	}
+
+	read(scope: SettingsScope): string | undefined {
+		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		try {
+			return readFileSync(path, "utf-8");
+		} catch (error) {
+			// A missing file is "no settings"; anything else is a real read error
+			// and stays visible to the caller, as it was under the lock.
+			if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+				return undefined;
+			}
+			throw error;
+		}
 	}
 
 	private acquireLockSyncWithRetry(path: string): () => void {
@@ -310,6 +331,10 @@ export class InMemorySettingsStorage implements SettingsStorage {
 	private global: string | undefined;
 	private project: string | undefined;
 
+	read(scope: SettingsScope): string | undefined {
+		return scope === "global" ? this.global : this.project;
+	}
+
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		const current = scope === "global" ? this.global : this.project;
 		const next = fn(current);
@@ -337,6 +362,9 @@ export class SettingsManager {
 	private projectSettingsLoadError: Error | null = null; // Track if project settings file had parse errors
 	private writeQueue: Promise<void> = Promise.resolve();
 	private errors: SettingsError[];
+	// Bumped whenever the in-memory settings change (reload, overrides, any
+	// setter) so callers can cache a derived value and know when it went stale.
+	private revision = 0;
 
 	private constructor(
 		storage: SettingsStorage,
@@ -393,10 +421,14 @@ export class SettingsManager {
 
 	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope): Settings {
 		let content: string | undefined;
-		storage.withLock(scope, (current) => {
-			content = current;
-			return undefined;
-		});
+		if (storage.read) {
+			content = storage.read(scope);
+		} else {
+			storage.withLock(scope, (current) => {
+				content = current;
+				return undefined;
+			});
+		}
 
 		if (!content) {
 			return {};
@@ -495,8 +527,14 @@ export class SettingsManager {
 		return structuredClone(this.projectSettings);
 	}
 
+	/** Monotonic counter of in-memory settings changes; a cache key for readers. */
+	getSettingsRevision(): number {
+		return this.revision;
+	}
+
 	async reload(): Promise<void> {
 		await this.writeQueue;
+		this.revision++;
 		const globalLoad = SettingsManager.tryLoadFromStorage(this.storage, "global");
 		if (!globalLoad.error) {
 			this.globalSettings = globalLoad.settings;
@@ -525,12 +563,14 @@ export class SettingsManager {
 
 	/** Apply additional overrides on top of current settings */
 	applyOverrides(overrides: Partial<Settings>): void {
+		this.revision++;
 		this.runtimeOverrides = deepMergeSettings(this.runtimeOverrides, overrides);
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
 	/** Mark a global field as modified during this session */
 	private markModified(field: keyof Settings, nestedKey?: string): void {
+		this.revision++;
 		this.modifiedFields.add(field);
 		if (nestedKey) {
 			if (!this.modifiedNestedFields.has(field)) {
@@ -542,6 +582,7 @@ export class SettingsManager {
 
 	/** Mark a project field as modified during this session */
 	private markProjectModified(field: keyof Settings, nestedKey?: string): void {
+		this.revision++;
 		this.modifiedProjectFields.add(field);
 		if (nestedKey) {
 			if (!this.modifiedProjectNestedFields.has(field)) {
