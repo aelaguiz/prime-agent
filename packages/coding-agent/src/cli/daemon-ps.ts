@@ -666,6 +666,9 @@ export async function discoverDaemons(
 		...scanSocketDir().filter((socketPath) => !trackedWorkerSockets.has(socketPath)),
 		...supervisorSockets,
 	]);
+	for (const socketPath of [...sockets]) {
+		if (isKernelInfrastructureSocketPath(socketPath)) sockets.delete(socketPath);
+	}
 	const defaultSocket = normalizeSocketPath(defaultDaemonSocketPath());
 
 	const infos = await Promise.all(
@@ -703,6 +706,13 @@ export async function discoverDaemons(
 		}),
 	);
 	return sortDaemons(infos);
+}
+
+// Python kernel fork servers and kernels listen on `control.sock` inside
+// `prime-agent-forkserver-*` / `prime-agent-kernel-*` temp dirs. They are not
+// daemons and vanish within seconds, so never probe or query them.
+function isKernelInfrastructureSocketPath(socketPath: string): boolean {
+	return /\/prime-agent-(?:forkserver|kernel)-[^/]+\//.test(socketPath);
 }
 
 export function sortDaemons(infos: DaemonInfo[]): DaemonInfo[] {
