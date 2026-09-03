@@ -973,8 +973,10 @@ export async function findActiveDaemonSessionAcrossDaemons(
 	const lookup = options.lookup ?? findActiveDaemonSessionSummary;
 	const discoverSocketPaths = options.discoverSocketPaths ?? discoverActiveDaemonSocketPaths;
 	const failures: Array<{ socketPath: string; error: Error }> = [];
+	let defaultDaemonAnswered = false;
 	try {
 		const summary = await lookup(defaultSocketPath, selector);
+		defaultDaemonAnswered = true;
 		if (summary) return { socketPath: defaultSocketPath, summary };
 	} catch (error) {
 		if (error instanceof AmbiguousActiveAgentError) throw error;
@@ -1005,7 +1007,12 @@ export async function findActiveDaemonSessionAcrossDaemons(
 	if (matches.length === 1) return matches[0];
 	if (matches.length > 1) throw new AmbiguousActiveAgentError(selector, true);
 	failures.push(...results.filter((result): result is { socketPath: string; error: Error } => "error" in result));
-	if (failures.length > 0) {
+	// Secondary daemons are best-effort: transient sockets (kernel fork servers,
+	// daemons mid-shutdown) show up in discovery and vanish before the query.
+	// When the default daemon answered and nothing matched, the session is
+	// simply not active anywhere we can see; let the caller resume it from its
+	// transcript instead of failing the whole resume.
+	if (failures.length > 0 && !defaultDaemonAnswered) {
 		const first = failures[0]!;
 		throw new Error(
 			`Could not query ${failures.length} background service${failures.length === 1 ? "" : "s"}; ` +
