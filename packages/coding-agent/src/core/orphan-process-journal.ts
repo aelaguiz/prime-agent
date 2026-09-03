@@ -18,7 +18,7 @@ import {
 	unlinkSync,
 	writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	isExactProcessStartId,
 	matchesExactProcessIdentity,
@@ -160,6 +160,11 @@ const WINDOWS_SYSTEM32 = `${WINDOWS_SYSTEM_ROOT}\\System32`;
 const WINDOWS_TASKKILL_PATH = `${WINDOWS_SYSTEM32}\\taskkill.exe`;
 const WINDOWS_TASKKILL_TIMEOUT_MS = 2_000;
 const ORPHAN_JOURNAL_STRICT_MAX_BYTES = 64 * 1024 * 1024;
+// Compaction thresholds. A retire rewrites the live set once the append log has
+// outgrown either bound; an enroll never rewrites, so a spawn stays O(1).
+const ORPHAN_JOURNAL_COMPACT_MIN_BYTES = 256 * 1024;
+const ORPHAN_JOURNAL_COMPACT_MIN_RECORDS = 512;
+const JOURNAL_MEMORY_INDEX_MAX_PATHS = 16;
 
 export interface OrphanProcessJournalAppendLockRecord {
 	version: 1;
@@ -874,16 +879,49 @@ function candidateKey(ownerPid: number, candidate: ActiveOrphanProcessCandidate)
 	]);
 }
 
-function parseJournalContents(
-	path: string,
-	contents: string,
-	failOnInvalidRecord: boolean,
-): Omit<JournalSnapshot, "device" | "inode" | "size"> {
+/** One reduced live record: the candidate view plus the v2 record that created it. */
+interface JournalLiveEntry {
+	candidate: ActiveOrphanProcessCandidate & { ownerPid: number };
+	/** Absent only for legacy-v1 anchors, which compaction refuses to rewrite. */
+	record?: OrphanProcessJournalRecord;
+}
+
+interface JournalReduction {
+	generation?: string;
+	sequence?: number;
+	live: Map<string, JournalLiveEntry>;
+	hasTruncatedTail: boolean;
+	/** Any legacy-v1 line at all. Such a file is never rewritten by compaction. */
+	hasLegacyRecords: boolean;
+	/** Verbatim header line, so compaction reproduces the exact v2 header bytes. */
+	headerLine?: string;
+}
+
+/** The single projection from a stored v2 record to its reduced candidate. */
+function journalRecordCandidate(
+	record: OrphanProcessJournalRecord,
+): ActiveOrphanProcessCandidate & { ownerPid: number } {
+	const kernelProcessStartId = record.kernelAuthorityProcessStartId ?? record.kernelProcessStartId;
+	const processStartId = record.authorityProcessStartId ?? record.processStartId;
+	return {
+		ownerPid: record.ownerPid,
+		pid: record.pid,
+		...(record.kernelPid !== undefined ? { kernelPid: record.kernelPid } : {}),
+		...(kernelProcessStartId !== undefined ? { kernelProcessStartId } : {}),
+		...(record.admissionGeneration !== undefined ? { admissionGeneration: record.admissionGeneration } : {}),
+		...(record.kernelLineage !== undefined ? { kernelLineage: record.kernelLineage } : {}),
+		...(processStartId !== undefined ? { processStartId } : {}),
+	};
+}
+
+function reduceJournalContents(path: string, contents: string, failOnInvalidRecord: boolean): JournalReduction {
 	const lines = contents.split("\n");
 	const hasTruncatedTail = contents.length > 0 && !contents.endsWith("\n");
-	const candidates = new Map<string, ActiveOrphanProcessCandidate & { ownerPid: number }>();
+	const live = new Map<string, JournalLiveEntry>();
 	let generation: string | undefined;
 	let sequence: number | undefined;
+	let headerLine: string | undefined;
+	let hasLegacyRecords = false;
 	let headerSeen = false;
 
 	for (const [index, line] of lines.entries()) {
@@ -903,9 +941,10 @@ function parseJournalContents(
 				if (failOnInvalidRecord) throw invalidJournalError(path, "legacy record after generation header");
 				continue;
 			}
+			hasLegacyRecords = true;
 			if (!parsed.active) {
-				const hasPriorEnrollment = [...candidates.values()].some(
-					(candidate) => candidate.ownerPid === parsed.ownerPid && candidate.pid === parsed.pid,
+				const hasPriorEnrollment = [...live.values()].some(
+					(entry) => entry.candidate.ownerPid === parsed.ownerPid && entry.candidate.pid === parsed.pid,
 				);
 				if (!hasPriorEnrollment && failOnInvalidRecord) {
 					throw invalidJournalError(path, "legacy retirement hint without prior enrollment");
@@ -920,7 +959,7 @@ function parseJournalContents(
 				...(parsed.kernelPid !== undefined ? { kernelPid: parsed.kernelPid } : {}),
 				...(parsed.processStartId ? { processStartId: parsed.processStartId } : {}),
 			};
-			candidates.set(candidateKey(parsed.ownerPid, candidate), candidate);
+			live.set(candidateKey(parsed.ownerPid, candidate), { candidate });
 			continue;
 		}
 
@@ -930,6 +969,7 @@ function parseJournalContents(
 				continue;
 			}
 			headerSeen = true;
+			headerLine = line;
 			generation = parsed.generation;
 			sequence = parsed.sequence;
 			continue;
@@ -945,24 +985,14 @@ function parseJournalContents(
 				continue;
 			}
 			sequence = parsed.sequence;
-			const kernelProcessStartId = parsed.kernelAuthorityProcessStartId ?? parsed.kernelProcessStartId;
-			const processStartId = parsed.authorityProcessStartId ?? parsed.processStartId;
-			const candidate: ActiveOrphanProcessCandidate & { ownerPid: number } = {
-				ownerPid: parsed.ownerPid,
-				pid: parsed.pid,
-				...(parsed.kernelPid !== undefined ? { kernelPid: parsed.kernelPid } : {}),
-				...(kernelProcessStartId !== undefined ? { kernelProcessStartId } : {}),
-				...(parsed.admissionGeneration !== undefined ? { admissionGeneration: parsed.admissionGeneration } : {}),
-				...(parsed.kernelLineage !== undefined ? { kernelLineage: parsed.kernelLineage } : {}),
-				...(processStartId !== undefined ? { processStartId } : {}),
-			};
+			const candidate = journalRecordCandidate(parsed);
 			const key = candidateKey(parsed.ownerPid, candidate);
 			if (parsed.state === "enrolled") {
-				if (candidates.has(key) && failOnInvalidRecord) {
+				if (live.has(key) && failOnInvalidRecord) {
 					throw invalidJournalError(path, "duplicate enrollment without retirement");
 				}
-				candidates.set(key, candidate);
-			} else if (!candidates.delete(key) && failOnInvalidRecord) {
+				live.set(key, { candidate, record: parsed });
+			} else if (!live.delete(key) && failOnInvalidRecord) {
 				throw invalidJournalError(path, "retirement without matching enrollment");
 			}
 			continue;
@@ -971,7 +1001,21 @@ function parseJournalContents(
 		if (failOnInvalidRecord) throw invalidJournalError(path, "unrecognized complete record");
 	}
 
-	return { generation, sequence, candidates: [...candidates.values()], hasTruncatedTail };
+	return { generation, sequence, live, hasTruncatedTail, hasLegacyRecords, headerLine };
+}
+
+function parseJournalContents(
+	path: string,
+	contents: string,
+	failOnInvalidRecord: boolean,
+): Omit<JournalSnapshot, "device" | "inode" | "size"> {
+	const reduction = reduceJournalContents(path, contents, failOnInvalidRecord);
+	return {
+		generation: reduction.generation,
+		sequence: reduction.sequence,
+		candidates: [...reduction.live.values()].map((entry) => entry.candidate),
+		hasTruncatedTail: reduction.hasTruncatedTail,
+	};
 }
 
 function decodeJournalUtf8Strict(path: string, bytes: Uint8Array): string {
@@ -1017,44 +1061,243 @@ function assertExpectedGeneration(
 	}
 }
 
+interface JournalIdentity {
+	device: bigint;
+	inode: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
+/**
+ * One process's reduced view of a journal, loaded once and then advanced by
+ * every append this process makes. Disk stays the authority: the index is only
+ * reused when the open descriptor and the pathname still name the same inode
+ * with exactly the bytes and timestamps this process last observed, so any
+ * other writer, truncation, or replacement forces a full re-read.
+ */
+interface JournalMemoryIndex extends JournalIdentity {
+	generation: string;
+	sequence: number;
+	live: Map<string, JournalLiveEntry>;
+	headerLine: string;
+	/** False once a legacy-v1 anchor is present; compaction cannot re-emit those. */
+	compactable: boolean;
+}
+
+const journalMemoryIndexes = new Map<string, JournalMemoryIndex>();
+const journalCompactionDisabled = new Set<string>();
+
+function forgetJournalMemoryIndex(path: string): void {
+	journalMemoryIndexes.delete(path);
+}
+
+function rememberJournalMemoryIndex(path: string, index: JournalMemoryIndex): void {
+	journalMemoryIndexes.delete(path);
+	journalMemoryIndexes.set(path, index);
+	for (const oldest of journalMemoryIndexes.keys()) {
+		if (journalMemoryIndexes.size <= JOURNAL_MEMORY_INDEX_MAX_PATHS) break;
+		journalMemoryIndexes.delete(oldest);
+	}
+}
+
+/** Exact same-inode proof for the open descriptor and the pathname together. */
+function currentJournalIdentity(descriptor: number, path: string): JournalIdentity {
+	const opened = fstatSync(descriptor, { bigint: true });
+	const current = lstatSync(path, { bigint: true });
+	if (
+		!opened.isFile() ||
+		current.isSymbolicLink() ||
+		!current.isFile() ||
+		opened.dev !== current.dev ||
+		opened.ino !== current.ino ||
+		opened.size !== current.size
+	) {
+		throw invalidJournalError(path, "authority was replaced");
+	}
+	return {
+		device: opened.dev,
+		inode: opened.ino,
+		size: opened.size,
+		mtimeNs: opened.mtimeNs,
+		ctimeNs: opened.ctimeNs,
+	};
+}
+
+function sameJournalIdentity(left: JournalIdentity, right: JournalIdentity): boolean {
+	return (
+		left.device === right.device &&
+		left.inode === right.inode &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+function applyJournalIdentity(index: JournalMemoryIndex, identity: JournalIdentity): void {
+	index.device = identity.device;
+	index.inode = identity.inode;
+	index.size = identity.size;
+	index.mtimeNs = identity.mtimeNs;
+	index.ctimeNs = identity.ctimeNs;
+}
+
+/** Reuses the in-memory reduction, or rebuilds it from one full strict read. */
+function loadJournalMemoryIndex(
+	path: string,
+	descriptor: number,
+	expectedGeneration: string,
+	identity: JournalIdentity,
+): JournalMemoryIndex {
+	const cached = journalMemoryIndexes.get(path);
+	if (cached !== undefined && cached.generation === expectedGeneration && sameJournalIdentity(cached, identity)) {
+		return cached;
+	}
+	const reduction = reduceJournalContents(path, readJournalUtf8Strict(path, descriptor), true);
+	assertExpectedGeneration(path, reduction.generation, expectedGeneration);
+	if (reduction.hasTruncatedTail) throw invalidJournalError(path, "cannot append after a torn final record");
+	if (reduction.sequence === undefined || reduction.generation === undefined || reduction.headerLine === undefined) {
+		throw invalidJournalError(path, "missing generation sequence");
+	}
+	const index: JournalMemoryIndex = {
+		generation: reduction.generation,
+		sequence: reduction.sequence,
+		live: reduction.live,
+		headerLine: reduction.headerLine,
+		compactable: !reduction.hasLegacyRecords,
+		...identity,
+	};
+	rememberJournalMemoryIndex(path, index);
+	return index;
+}
+
+/** Best-effort durability for the compaction rename; the rename itself is atomic. */
+function syncJournalDirectory(path: string): void {
+	if (process.platform === "win32") return;
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(dirname(path), constants.O_RDONLY);
+		fsyncSync(descriptor);
+	} catch {
+		// A directory that refuses fsync still leaves the rename atomic.
+	} finally {
+		if (descriptor !== undefined) closeSync(descriptor);
+	}
+}
+
+/**
+ * Rewrites the journal from the in-memory live set: the verbatim header, then
+ * one enrolled record per live candidate renumbered from 1. Output goes to a
+ * private 0600 temp file that is fsynced and renamed over the authority, so a
+ * crash at any point leaves either the complete previous log or the complete
+ * compacted one. Called only from the retire path, under the append lock, after
+ * the retirement record is already durable.
+ */
+function compactJournalAuthority(path: string, index: JournalMemoryIndex): void {
+	if (!index.compactable || journalCompactionDisabled.has(path)) return;
+	if (index.size < BigInt(ORPHAN_JOURNAL_COMPACT_MIN_BYTES) && index.sequence < ORPHAN_JOURNAL_COMPACT_MIN_RECORDS) {
+		return;
+	}
+	// Rewriting a log that is mostly still live buys nothing and costs a full write.
+	if (index.live.size * 2 > index.sequence) return;
+	const compacted = new Map<string, JournalLiveEntry>();
+	const lines: string[] = [index.headerLine];
+	for (const [key, entry] of index.live) {
+		if (entry.record === undefined) return;
+		const record: OrphanProcessJournalRecord = { ...entry.record, sequence: lines.length };
+		lines.push(JSON.stringify(record));
+		compacted.set(key, { candidate: entry.candidate, record });
+	}
+	const temporaryPath = `${path}.compact-${process.pid}-${randomUUID()}`;
+	let descriptor: number | undefined;
+	try {
+		descriptor = openSync(
+			temporaryPath,
+			constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | noFollowFlag(),
+			0o600,
+		);
+		if (process.platform !== "win32") fchmodSync(descriptor, 0o600);
+		writeAllSync(descriptor, `${lines.join("\n")}\n`);
+		fsyncSync(descriptor);
+		closeSync(descriptor);
+		descriptor = undefined;
+		renameSync(temporaryPath, path);
+		syncJournalDirectory(path);
+		const reopened = openSync(path, constants.O_RDONLY | noFollowFlag());
+		try {
+			applyJournalIdentity(index, currentJournalIdentity(reopened, path));
+		} finally {
+			closeSync(reopened);
+		}
+		index.sequence = lines.length - 1;
+		index.live = compacted;
+	} catch {
+		// The retirement is already durable in whichever file survived. Never retry.
+		journalCompactionDisabled.add(path);
+		forgetJournalMemoryIndex(path);
+		if (descriptor !== undefined) {
+			try {
+				closeSync(descriptor);
+			} catch {
+				// An unclosable descriptor is inert.
+			}
+		}
+		try {
+			rmSync(temporaryPath, { force: true });
+		} catch {
+			// Temp residue is inert; it is never canonical authority.
+		}
+	}
+}
+
+interface AppendJournalRecordOptions {
+	/** Retire-only: rewrite the live set once the log outgrows the thresholds. */
+	compactWhenLarge?: boolean;
+}
+
 function appendRecordToExistingAuthority(
 	path: string,
 	expectedGeneration: string,
 	record: Omit<OrphanProcessJournalRecord, "sequence">,
+	options: AppendJournalRecordOptions = {},
 ): void {
 	withJournalWriteLock(path, () => {
 		const descriptor = openSync(path, constants.O_RDWR | constants.O_APPEND);
 		try {
-			const contents = readJournalUtf8Strict(path, descriptor);
-			const snapshot = parseJournalContents(path, contents, true);
-			assertExpectedGeneration(path, snapshot.generation, expectedGeneration);
-			if (snapshot.hasTruncatedTail) throw invalidJournalError(path, "cannot append after a torn final record");
-			if (snapshot.sequence === undefined) throw invalidJournalError(path, "missing generation sequence");
-			const recordProcessStartId = record.authorityProcessStartId ?? record.processStartId;
-			const recordKernelProcessStartId = record.kernelAuthorityProcessStartId ?? record.kernelProcessStartId;
-			const transitionAlreadyActive = snapshot.candidates.some(
-				(candidate) =>
-					candidate.ownerPid === record.ownerPid &&
-					candidate.pid === record.pid &&
-					candidate.processStartId === recordProcessStartId &&
-					candidate.kernelPid === record.kernelPid &&
-					candidate.kernelProcessStartId === recordKernelProcessStartId &&
-					candidate.admissionGeneration === record.admissionGeneration &&
-					candidate.kernelLineage === record.kernelLineage,
-			);
-			if ((record.state === "enrolled") === transitionAlreadyActive) {
+			const identity = currentJournalIdentity(descriptor, path);
+			const index = loadJournalMemoryIndex(path, descriptor, expectedGeneration, identity);
+			const sequencedRecord: OrphanProcessJournalRecord = { ...record, sequence: index.sequence + 1 };
+			const candidate = journalRecordCandidate(sequencedRecord);
+			const key = candidateKey(record.ownerPid, candidate);
+			if ((record.state === "enrolled") === index.live.has(key)) {
 				throw invalidJournalError(path, `invalid ${record.state} transition`);
 			}
-			if (!openedPathIsCurrent(descriptor, path)) throw invalidJournalError(path, "authority was replaced");
-			const sequencedRecord: OrphanProcessJournalRecord = { ...record, sequence: snapshot.sequence + 1 };
-			writeAllSync(descriptor, `${JSON.stringify(sequencedRecord)}\n`);
-			fsyncSync(descriptor);
-			if (!openedPathIsCurrent(descriptor, path)) throw invalidJournalError(path, "authority was replaced");
-			const confirmed = readJournalSnapshot(path, true, false);
-			assertExpectedGeneration(path, confirmed.generation, expectedGeneration);
-			if (confirmed.hasTruncatedTail || confirmed.sequence !== sequencedRecord.sequence) {
+			const line = `${JSON.stringify(sequencedRecord)}\n`;
+			let appended: JournalIdentity;
+			try {
+				writeAllSync(descriptor, line);
+				fsyncSync(descriptor);
+				appended = currentJournalIdentity(descriptor, path);
+			} catch (error) {
+				forgetJournalMemoryIndex(path);
+				throw error;
+			}
+			// One exclusive fsynced append: the only durable state is old bytes plus
+			// exactly this record on the same inode. Anything else re-reads next time.
+			if (
+				appended.device !== identity.device ||
+				appended.inode !== identity.inode ||
+				appended.size !== identity.size + BigInt(Buffer.byteLength(line, "utf8"))
+			) {
+				forgetJournalMemoryIndex(path);
 				throw invalidJournalError(path, "authority changed after append");
 			}
+			index.sequence = sequencedRecord.sequence;
+			if (record.state === "enrolled") index.live.set(key, { candidate, record: sequencedRecord });
+			else index.live.delete(key);
+			applyJournalIdentity(index, appended);
+			rememberJournalMemoryIndex(path, index);
+			if (options.compactWhenLarge) compactJournalAuthority(path, index);
 		} finally {
 			closeSync(descriptor);
 		}
@@ -1063,6 +1306,7 @@ function appendRecordToExistingAuthority(
 
 /** Creates and fsyncs an immutable random generation header before launch. */
 export function initializeOrphanProcessJournal(path: string): OrphanProcessJournalAuthority {
+	forgetJournalMemoryIndex(path);
 	const generation = randomUUID();
 	const header: OrphanProcessJournalHeader = {
 		version: 2,
@@ -1181,6 +1425,7 @@ export function bindOrUpgradeOrphanProcessJournalAuthority(
 	beforeLegacyUpgrade?: (generation: string) => void,
 ): OrphanProcessJournalAuthority {
 	return withJournalWriteLock(path, () => {
+		forgetJournalMemoryIndex(path);
 		const descriptor = openSync(path, constants.O_RDWR | constants.O_APPEND);
 		try {
 			let contents = readJournalUtf8Strict(path, descriptor);
@@ -1327,17 +1572,22 @@ function appendOrphanProcessRetirement(
 	const authority = configuredJournalAuthority();
 	if (!authority) return true;
 	if (!candidate.processStartId) return false;
-	appendRecordToExistingAuthority(authority.path, authority.generation, {
-		version: 2,
-		type: "process",
-		generation: authority.generation,
-		pid: candidate.pid,
-		ownerPid: process.pid,
-		...journalCandidateLineageFields(candidate),
-		...recordIdentityFields(candidate.processStartId, "processStartId", "authorityProcessStartId"),
-		state: "retired",
-		recordedAt: new Date().toISOString(),
-	});
+	appendRecordToExistingAuthority(
+		authority.path,
+		authority.generation,
+		{
+			version: 2,
+			type: "process",
+			generation: authority.generation,
+			pid: candidate.pid,
+			ownerPid: process.pid,
+			...journalCandidateLineageFields(candidate),
+			...recordIdentityFields(candidate.processStartId, "processStartId", "authorityProcessStartId"),
+			state: "retired",
+			recordedAt: new Date().toISOString(),
+		},
+		{ compactWhenLarge: true },
+	);
 	return true;
 }
 
@@ -1593,6 +1843,7 @@ export function clearOrphanProcessJournal(
 ): boolean {
 	try {
 		return withJournalWriteLock(path, () => {
+			forgetJournalMemoryIndex(path);
 			let descriptor: number | undefined;
 			let quarantinedDescriptor: number | undefined;
 			const quarantinePath = `${path}.quarantine-${process.pid}-${randomUUID()}`;
