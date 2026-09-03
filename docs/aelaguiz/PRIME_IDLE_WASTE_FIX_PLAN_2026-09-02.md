@@ -133,3 +133,7 @@ Pre-existing failures reproduced on pristine `main`, not introduced here: `daemo
 Isolated fleet regression on the round-two head (`scripts/idle-fleet-measure.py`): five real workers resumed on real transcripts with six TUIs, 0 `agent_status` appends and 0 heartbeat records in 76 s idle, fleet CPU sum avg 7.3 % over 21 processes, clean `shutdown --force`, 0 processes left.
 
 Still deferred (audit tier 2 and 3, in order of likely payoff): fsync group-commit across the command journal, recovery journal, descriptor persist and the orphan-journal guard; the cron store rescan; the RLM ledger re-parse; the six blocking `git` spawns per turn; kernel-per-session memory.
+
+### Deployed
+
+Merged to `main` (`c8bc03079`), path-resume fix cherry-picked on top (`748188587`), built with `npm run build`, packed and installed as `~/.prime/installs/main-c8bc030` (bundle `a592690b…`), old installs and the worktree removed. Full stop and restore of 28 roots on 2026-09-02 evening (procedure and gotchas: aimgr `docs/PRIME_AGENT_OPERATIONS_RUNBOOK.md` §9). Live after: TUI clients 0.5 % CPU total (was 418 %), workers 0.2 % (was 213 %), supervisor 0 %, no `lstat` or `posix_spawn` in samples, no heartbeat fan-out. The pack script does not build; the build id must be compared against the previous install before switching.
