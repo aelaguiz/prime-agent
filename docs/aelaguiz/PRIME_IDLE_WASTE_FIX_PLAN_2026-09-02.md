@@ -103,3 +103,33 @@ Focused tests run once per lane (no full suite, no `npm run check`, husky bypass
 Process lessons for next time: four lanes on one worktree share one git index, so commit with `git commit --no-verify -- <owned files>`; the husky pre-commit hook runs the whole `npm run check` and must be bypassed for this kind of work.
 
 Not deployed. Deploy path (step 5 above) is a separate go: pack, install to `~/.prime/installs/idle-waste-fix-20260902`, re-point the symlink, worker-preserving supervisor restart, then restart panes one by one so the TUIs and workers pick up the new bundle, then re-sample.
+
+---
+
+## 5. Round two: the working-fleet costs (audit worker C1, C4, C6)
+
+Same frame, same worktree, same rules (owned files, focused tests only, `--no-verify`, no push). These three bite while agents are working, not idle, and are the rest of what the worker profiles pointed at.
+
+| # | Fix | Where | Behaviour after | Lane |
+|---|---|---|---|---|
+| R1 | Orphan-process journal kept in memory: index loaded once per process and updated on append; one `fsync` per append; compaction (temp file + rename) only past a size or record threshold on the retire path; identity checks through the memoized `observeProcessIdentity`; on-disk format unchanged | `core/orphan-process-journal.ts:723-790, 1020-1062` | per bash call: 2 full re-reads + ~20 `lstat` + 6 `fsync` + 4 `ps` → 0 reads, 1 `fsync`, 0 `ps` | O |
+| R2 | Incremental roster rows (recompute only the session whose event arrived, no `statSync` on unchanged sessions), flush to the supervisor debounced to 250 ms trailing edge with immediate flush on lifecycle transitions, send only when the fingerprint changed; no per-token flush scheduling | `modes/daemon/daemon-mode.ts:7473, 7635-7806, 8037-8052`; `modes/daemon/daemon-session-list.ts:148-315` | O(events × sessions × messages) → O(events) plus one bounded flush per window | R |
+| R3 | RLM child token fan-in: incremental preview from the delta (bounded tail window), at most one `rlm_child_update` per child per ~100 ms plus immediate on lifecycle, parent-chain walk instead of two tree scans | `core/agent-session.ts:10524-10532, 10606-10667` | O(L²) per child answer → O(L); 5,000 tokens → tens of ancestor emits | C |
+
+Proof for this round: per-lane micro-timings in the new tests (journal with 2,000 records: enroll+retire reads the file zero times; 40 sessions × 500 messages: one event recomputes one row and sends at most once per window; 5,000-token child stream: bounded emits, identical final preview), then the isolated fleet run (`scripts/idle-fleet-measure.py`) again for create/resume/list/shutdown regression, then the live re-sample after deploy.
+
+### Round two results
+
+Three commits, each reviewed line by line; all lanes ran only their focused tests with `--no-verify`:
+
+| Commit | Fix | Measured (same harness before on `main`, after on the branch) | Review notes |
+|---|---|---|---|
+| `2a0a7ae5c` | R1 orphan journal in memory, one `fsync` per append, compaction on retire past 256 KB or 512 records | journal reads per enroll+retire **5 → 0**; per cycle at 2,005 records 31.3 → 28.8 ms, at 8,005 records 50.7 → 28.4 ms (flat in journal size now); journal after 100 cycles on the 1.9 MB case 1,948,120 B / 8,205 rec → 48,437 B / 203 rec | index valid only while descriptor and path share inode, size, `mtimeNs`, `ctimeNs`; compaction = temp file + `fsync` + `rename` + dir `fsync` + reopen, inside the existing guard; legacy-v1 journals never rewritten; a failed compaction disables itself. Remaining floor ≈ 26 ms per cycle is the guard's six `fsync`s (deferred fsync group-commit item). |
+| `0e6ade64c` | R2 incremental roster rows, 250 ms trailing debounce, immediate on lifecycle, per-token flush removed | 40 sessions × 500 messages, 200 events in one session: **0.365 → 0.0014 ms per event**, rows composed **8,040 → 1**, supervisor sends **200 → 1** | dirty-set driven recompute with an O(1) currency guard for untouched rows, cached JSON reused by reference, full recompose every 5 s as safety net, timer cleared on shutdown; wire shape unchanged |
+| `414e34a8b` | R3 incremental child preview (bounded 163-char prefix, settles), `message_update` coalesced to 100 ms trailing, lifecycle immediate, parent-chain caches | 5,000-token grandchild stream: parent snapshot rebuilds + `JSON.stringify` **5,009 → 9**, root emits 32 → 11, median wall 748 → 530 ms (floored by the test's own 200 ms sleeps), final preview identical | `finalize` rescans the terminal message so the final text cannot differ; lifecycle emits cancel a pending coalesced emit; timer unref'd and dispose-guarded |
+
+Pre-existing failures reproduced on pristine `main`, not introduced here: `daemon-agent-roster.test.ts` 9 of 24 (RLM ledger and delete paths), `daemon-mode.test.ts` 3 of 194 (ledger mocks), one Python-runtime test in each of `orphan-process-journal.test.ts` and `agent-session-recursion.test.ts` (`prime-agent-runtime/.venv` absent on this machine).
+
+Isolated fleet regression on the round-two head (`scripts/idle-fleet-measure.py`): five real workers resumed on real transcripts with six TUIs, 0 `agent_status` appends and 0 heartbeat records in 76 s idle, fleet CPU sum avg 7.3 % over 21 processes, clean `shutdown --force`, 0 processes left.
+
+Still deferred (audit tier 2 and 3, in order of likely payoff): fsync group-commit across the command journal, recovery journal, descriptor persist and the orphan-journal guard; the cron store rescan; the RLM ledger re-parse; the six blocking `git` spawns per turn; kernel-per-session memory.
