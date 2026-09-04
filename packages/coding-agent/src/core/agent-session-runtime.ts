@@ -361,6 +361,8 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		) {
 			throw new Error("A different AIM credential handoff completed first");
 		}
+		// The new credential is what a rate-limited goal was waiting for.
+		await this.session.resumeGoalAfterCredentialHandoff();
 	}
 
 	/** Join or perform the one policy-gated Codex advance for an unopened failed request. */
