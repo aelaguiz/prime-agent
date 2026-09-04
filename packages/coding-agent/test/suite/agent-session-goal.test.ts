@@ -161,6 +161,25 @@ describe("AgentSession goals", () => {
 		return harness;
 	}
 
+	async function createGoalHarnessWithoutRetry(): Promise<Harness> {
+		const sessionRef: { current?: AgentSession } = {};
+		const harness = await createHarness({
+			tools: [createFauxIpythonTool(sessionRef)],
+			settings: { retry: { enabled: false } },
+		});
+		sessionRef.current = harness.session;
+		harnesses.push(harness);
+		return harness;
+	}
+
+	async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!predicate()) {
+			if (Date.now() > deadline) throw new Error("condition was not met in time");
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+	}
+
 	it("keeps continuing until the model completes the goal through ipython", async () => {
 		const harness = await createGoalHarness();
 		harness.setResponses([
@@ -594,22 +613,82 @@ describe("AgentSession goals", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
-	it("does not resume an errored goal", async () => {
-		const harness = await createHarness({ settings: { retry: { enabled: false } } });
-		harnesses.push(harness);
+	it("resumes an errored goal with /goal resume", async () => {
+		const harness = await createGoalHarnessWithoutRetry();
 		harness.setResponses([
 			fauxAssistantMessage("", { stopReason: "error", errorMessage: "invalid_api_key" }),
-			fauxAssistantMessage("should not run"),
+			fauxAssistantMessage(fauxToolCall("ipython", COMPLETE_GOAL_CELL), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Goal complete."),
 		]);
 
 		await harness.session.prompt("/goal do work");
+		expect(harness.session.goalState).toMatchObject({ active: false, status: "error" });
+
 		await harness.session.prompt("/goal resume");
 
 		expect(harness.session.goalState).toMatchObject({
 			active: false,
-			status: "error",
+			status: "complete",
+			objective: "do work",
+		});
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("pauses the goal instead of ending it on a provider rate limit", async () => {
+		const harness = await createGoalHarnessWithoutRetry();
+		harness.setResponses([
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "Provider usage limit reached (rate_limit_error, 429); resets at 2026-09-03T15:00:00.000Z",
+			}),
+			fauxAssistantMessage("should not run"),
+		]);
+
+		await harness.session.prompt("/goal do work");
+
+		expect(harness.session.goalState).toMatchObject({
+			active: false,
+			status: "paused",
+			objective: "do work",
+			lastReason: expect.stringContaining("429"),
 		});
 		expect(harness.getPendingResponseCount()).toBe(1);
+	});
+
+	it("resumes a provider-paused goal after a credential handoff", async () => {
+		const harness = await createGoalHarnessWithoutRetry();
+		harness.setResponses([
+			fauxAssistantMessage("", {
+				stopReason: "error",
+				errorMessage: "Provider overloaded (overloaded_error): Overloaded [request_id: req_test]",
+			}),
+			fauxAssistantMessage(fauxToolCall("ipython", COMPLETE_GOAL_CELL), { stopReason: "toolUse" }),
+			fauxAssistantMessage("Goal complete."),
+		]);
+		await harness.session.prompt("/goal do work");
+		expect(harness.session.goalState.status).toBe("paused");
+
+		await expect(harness.session.resumeGoalAfterCredentialHandoff()).resolves.toBe(true);
+		await waitFor(() => harness.session.goalState.status === "complete");
+
+		expect(harness.session.goalState).toMatchObject({ objective: "do work", status: "complete" });
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("does not resume a user-paused goal after a credential handoff", async () => {
+		const waiting = createWaitingTool();
+		const harness = await createGoalHarness([waiting.tool]);
+		harness.setResponses([fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" })]);
+
+		const waitForStart = waiting.waitForStart(harness);
+		const promptPromise = harness.session.prompt("/goal complete the long task");
+		await waitForStart;
+		await harness.session.prompt("/goal pause");
+		waiting.release();
+		await promptPromise;
+
+		await expect(harness.session.resumeGoalAfterCredentialHandoff()).resolves.toBe(false);
+		expect(harness.session.goalState).toMatchObject({ active: false, status: "paused" });
 	});
 
 	it("reports active goal elapsed time on status reads and goal.get", async () => {

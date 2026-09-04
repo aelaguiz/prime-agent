@@ -1156,6 +1156,15 @@ function attributeChildUsage(parentUsage: Usage, childUsage: Usage): void {
 	parentUsage.totalTokens = parentContextTokens;
 }
 
+/**
+ * Provider failures that an account rotation or a retry fixes. They are not a
+ * verdict on the goal, so the goal is paused (not ended) and can be re-armed by
+ * `/goal resume` or automatically after an AIM credential handoff.
+ */
+const TRANSIENT_PROVIDER_FAILURE_PATTERN =
+	/rate.?limit|usage.?limit|\b429\b|overloaded|connection error|timed out|fetch failed|websocket|ECONNRESET|ETIMEDOUT|requires reauthentication/i;
+const PROVIDER_PAUSE_REASON_PREFIX = "Paused by provider failure: ";
+
 export class AgentSession {
 	readonly agent: Agent;
 	readonly sessionManager: SessionManager;
@@ -1954,7 +1963,11 @@ export class AgentSession {
 			this._emitGoalUpdate();
 			return;
 		}
-		if (this._goalState.status !== "paused" && this._goalState.status !== "budget_limited") {
+		if (
+			this._goalState.status !== "paused" &&
+			this._goalState.status !== "budget_limited" &&
+			this._goalState.status !== "error"
+		) {
 			this._emitGoalUpdate();
 			return;
 		}
@@ -2002,8 +2015,49 @@ export class AgentSession {
 				this._goalAbortInProgress = false;
 				return;
 			}
-			this._finishGoalWithError(message.errorMessage || "Assistant response failed");
+			const errorMessage = message.errorMessage || "Assistant response failed";
+			if (this._isTransientProviderFailure(message)) {
+				this._pauseGoal(`${PROVIDER_PAUSE_REASON_PREFIX}${errorMessage}`);
+				return;
+			}
+			this._finishGoalWithError(errorMessage);
 		}
+	}
+
+	private _isTransientProviderFailure(message: AssistantMessage): boolean {
+		const kind = this._getProviderStreamFailureKind(message);
+		if (kind === "rate_limit" || kind === "usage_limit" || kind === "overloaded" || kind === "server_error") {
+			return true;
+		}
+		if (kind !== undefined && kind !== "unknown") {
+			return false;
+		}
+		return TRANSIENT_PROVIDER_FAILURE_PATTERN.test(message.errorMessage ?? "");
+	}
+
+	/**
+	 * After an AIM credential handoff, re-arm a goal that a provider failure
+	 * paused (or, for sessions recorded before pausing existed, errored with a
+	 * transient message) and queue one continuation. A goal the user paused, or
+	 * one that ended for a real reason, is left alone. Returns true when the
+	 * goal is active again.
+	 */
+	async resumeGoalAfterCredentialHandoff(): Promise<boolean> {
+		const goal = this._goalState;
+		if (!goal.objective) {
+			return false;
+		}
+		const providerPaused =
+			goal.status === "paused" && (goal.lastReason ?? "").startsWith(PROVIDER_PAUSE_REASON_PREFIX);
+		const transientError = goal.status === "error" && TRANSIENT_PROVIDER_FAILURE_PATTERN.test(goal.lastError ?? "");
+		if (!providerPaused && !transientError) {
+			return false;
+		}
+		await this._resumeGoal();
+		// Outside a prompt() there is nothing else to drain the queued
+		// continuation, so start the turn now.
+		this._scheduleSessionInputPump();
+		return this._goalState.status === "active";
 	}
 
 	private _stopGoalContinuationForTerminalMessage(message: AssistantMessage): boolean {

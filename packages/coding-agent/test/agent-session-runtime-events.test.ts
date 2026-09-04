@@ -196,6 +196,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				model: { provider: "anthropic", id: request.expectedModel },
 				isSessionActive: true,
 				hasRunningRlmChildren: vi.fn(() => true),
+				resumeGoalAfterCredentialHandoff: vi.fn(async () => true),
 				sessionManager,
 				sessionId: "session-identity",
 			};
@@ -243,10 +244,11 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			);
 			expect(phases).toEqual(["prepare", "append", "flush", "commit"]);
 			expect(authStorage.getAimCredentialBinding()).toMatchObject({ binding: "handoff-bound" });
+			expect(session.resumeGoalAfterCredentialHandoff).toHaveBeenCalledTimes(1);
 		});
 
 		it("does not publish the prepared credential when the durable flush fails", async () => {
-			const { runtime, sessionManager, authStorage, phases } = createAimHandoffRuntime();
+			const { runtime, session, sessionManager, authStorage, phases } = createAimHandoffRuntime();
 			sessionManager.appendCustomEntryWithRollback.mockImplementation(() => {
 				phases.push("append");
 				phases.push("flush");
@@ -257,6 +259,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 
 			expect(authStorage.getAimCredentialBinding()).toMatchObject({ binding: "session-bound" });
 			expect(phases).toEqual(["prepare", "append", "flush"]);
+			expect(session.resumeGoalAfterCredentialHandoff).not.toHaveBeenCalled();
 		});
 	});
 });
