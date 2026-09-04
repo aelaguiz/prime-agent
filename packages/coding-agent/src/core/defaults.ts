@@ -9,6 +9,8 @@ type ModelIdentity = {
 
 const MODEL_THINKING_DEFAULTS: Readonly<Record<string, ThinkingLevel>> = {
 	"openai-codex/gpt-5.6-sol": "max",
+	"openai-codex/gpt-6-astra": "max",
+	"openai-codex/gpt-6-astra-1m": "max",
 	"anthropic/claude-fable-5": "xhigh",
 	"anthropic/claude-fable-5-1": "xhigh",
 	"anthropic/claude-opus-5": "xhigh",
