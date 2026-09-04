@@ -244,6 +244,7 @@ const OPENAI_RESPONSES_NONE_REASONING_MODELS = new Set([
 	"gpt-5.6-sol",
 	"gpt-5.6-terra",
 	"gpt-5.6-luna",
+	"gpt-6-astra",
 ]);
 
 function mergeThinkingLevelMap(model: Model<any>, map: NonNullable<Model<any>["thinkingLevelMap"]>): void {
@@ -256,7 +257,8 @@ function supportsOpenAiXhigh(modelId: string): boolean {
 		modelId.includes("gpt-5.3") ||
 		modelId.includes("gpt-5.4") ||
 		modelId.includes("gpt-5.5") ||
-		modelId.includes("gpt-5.6")
+		modelId.includes("gpt-5.6") ||
+		modelId.includes("gpt-6")
 	);
 }
 
@@ -293,7 +295,7 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (supportsOpenAiXhigh(model.id)) {
 		mergeThinkingLevelMap(model, { xhigh: "xhigh" });
 	}
-	if (model.id.includes("gpt-5.6")) {
+	if (model.id.includes("gpt-5.6") || model.id.includes("gpt-6")) {
 		mergeThinkingLevelMap(model, { minimal: null, max: "max" });
 	}
 	// Per-family effort support per the Anthropic effort docs. Opus 4.6 / Sonnet 4.6
@@ -341,7 +343,8 @@ function applyThinkingLevelMetadata(model: Model<any>): void {
 	if (
 		model.provider === "openai-codex" &&
 		supportsOpenAiXhigh(model.id) &&
-		!model.id.includes("gpt-5.6")
+		!model.id.includes("gpt-5.6") &&
+		!model.id.includes("gpt-6")
 	) {
 		mergeThinkingLevelMap(model, { minimal: "low" });
 	}
@@ -2092,6 +2095,36 @@ async function generateModels() {
 			reasoning: true,
 			input: ["text", "image"],
 			cost: { input: 5, output: 30, cacheRead: 0.5, cacheWrite: 6.25 },
+			contextWindow: 1000000,
+			maxTokens: CODEX_MAX_TOKENS,
+			compactionThreshold: 900000,
+		},
+		// GPT-6 Astra (launched 2026-09-03). API list price $10/$50 per 1M; cache
+		// rates follow the gpt-5.6 ratios. Context limits mirror gpt-5.6-sol until
+		// the Codex backend shows otherwise; an under-declared window degrades
+		// gracefully.
+		{
+			id: "gpt-6-astra",
+			name: "GPT-6 Astra",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
+			contextWindow: CODEX_CONTEXT,
+			maxTokens: CODEX_MAX_TOKENS,
+		},
+		{
+			id: "gpt-6-astra-1m",
+			requestModelId: "gpt-6-astra",
+			name: "GPT-6 Astra (1M)",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: CODEX_BASE_URL,
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 10, output: 50, cacheRead: 1, cacheWrite: 12.5 },
 			contextWindow: 1000000,
 			maxTokens: CODEX_MAX_TOKENS,
 			compactionThreshold: 900000,
