@@ -264,10 +264,12 @@ recovers (auto-reconnect + ensure) and reports rather than crashing.
 `run_bash` (`execute_bash_and_wait`, 120s default cap, `transient` param), plus
 `scripts/install-mcp-serve.sh` (launchd plist, KeepAlive, port 7717, logs to
 `~/.prime/agent/logs/mcp-serve.log`).
-**Accept:** heartbeat list shows real fleet data; ask_session answers on a live session without
-touching its transcript (verify message count unchanged); install script idempotent
-(install/uninstall) and reviewed but NOT deployed to other machines yet (rollout is a separate,
-explicitly-approved step).
+**Accept:** ALL control/write verification against test sessions on a throwaway daemon only
+(Amir's explicit rule: never test against live sessions). heartbeats_list may READ the live daemon;
+heartbeat_manage is verified only on throwaway-daemon jobs. ask_session verified on a test session
+(message count unchanged proves the transcript is untouched). run_bash on a test session's worker.
+Install script idempotent (install/uninstall) and reviewed but NOT deployed anywhere yet (deploy and
+rollout are separate, explicitly-approved steps).
 
 ---
 
