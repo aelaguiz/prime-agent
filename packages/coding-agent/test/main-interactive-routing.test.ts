@@ -14,6 +14,7 @@ import {
 	type InteractiveDaemonStartupDecision,
 	isClientOwnedDaemonSession,
 	parseAgentsViewCommand,
+	resolveActiveDaemonSessionSummary,
 	resolveRuntimeSessionOptions,
 	selectActiveDaemonSessionSummary,
 	shouldEnsureDaemonBeforeActiveSessionLookup,
@@ -241,6 +242,27 @@ describe("daemon-backed interactive session manager routing", () => {
 		});
 
 		expect(selectActiveDaemonSessionSummary([activeSummary], selector)).toBe(activeSummary);
+	});
+
+	test("resolves a session path from the daemon list without entering the get_state timeout lane", async () => {
+		const sessionFile = "/tmp/project/session.jsonl";
+		const activeSummary = makeSessionSummary({
+			id: "active-1",
+			activeSessionId: "active-1",
+			sessionFile,
+		});
+		let getStateCalled = false;
+
+		await expect(
+			resolveActiveDaemonSessionSummary(sessionFile, {
+				getState: async () => {
+					getStateCalled = true;
+					throw new Error("path selectors must not use get_state");
+				},
+				list: async () => [activeSummary],
+			}),
+		).resolves.toBe(activeSummary);
+		expect(getStateCalled).toBe(false);
 	});
 
 	test("rejects an ambiguous active name", () => {

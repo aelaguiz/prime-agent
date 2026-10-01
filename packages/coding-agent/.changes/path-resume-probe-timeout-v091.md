@@ -1,0 +1,1 @@
+- Fixed saved-session path resumes timing out while the background service refreshed slow workers.
