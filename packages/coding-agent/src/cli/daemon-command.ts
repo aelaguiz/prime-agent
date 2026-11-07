@@ -34,6 +34,7 @@ const DAEMON_CLIENT_COMMANDS = new Set([
 	"detach",
 	"kill",
 	"rename",
+	"handoff-aim-credential",
 	"prompt",
 	"send",
 	"agent-messages",
@@ -179,6 +180,9 @@ async function runDaemonClientCommand(parsed: ParsedDaemonClientCommand): Promis
 				return;
 			case "rename":
 				await runRename(client, parsed.positionals, parsed.json);
+				return;
+			case "handoff-aim-credential":
+				await runHandoffAimCredential(client, parsed.positionals, parsed.json);
 				return;
 			case "prompt":
 				await runPrompt(client, parsed.positionals);
@@ -836,6 +840,42 @@ async function runRename(client: DaemonClient, args: string[], json: boolean): P
 		return;
 	}
 	printJson(data);
+}
+
+async function runHandoffAimCredential(client: DaemonClient, args: string[], json: boolean): Promise<void> {
+	const usage =
+		"Usage: daemon handoff-aim-credential <selector> <provider> <expectedModel> <expectedBinding> <expectedIdentityFingerprint> <requestedBinding> <requestedIdentityFingerprint> --json";
+	if (!json || args.length !== 7) {
+		throw new Error(usage);
+	}
+
+	const [
+		activeSessionId,
+		provider,
+		expectedModel,
+		expectedBinding,
+		expectedIdentityFingerprint,
+		requestedBinding,
+		requestedIdentityFingerprint,
+	] = args as [string, string, string, string, string, string, string];
+	if (provider !== "openai-codex" && provider !== "anthropic") {
+		throw new Error(`${usage}\nProvider must be openai-codex or anthropic.`);
+	}
+
+	await printResponseData(
+		client,
+		{
+			type: "handoff_aim_credential",
+			activeSessionId,
+			provider,
+			expectedModel,
+			expectedBinding,
+			expectedIdentityFingerprint,
+			requestedBinding,
+			requestedIdentityFingerprint,
+		},
+		true,
+	);
 }
 
 async function runPrompt(client: DaemonClient, args: string[]): Promise<void> {

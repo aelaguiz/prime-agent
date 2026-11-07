@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { registerOAuthProvider } from "@earendil-works/pi-ai/oauth";
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { AIM_CREDENTIAL_BINDING_CUSTOM_TYPE, AIM_EXTERNAL_CREDENTIAL_PROTOCOL } from "../src/core/aim-external-auth.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { clearConfigValueCache } from "../src/core/resolve-config-value.js";
 
@@ -11,6 +12,7 @@ describe("AuthStorage", () => {
 	let tempDir: string;
 	let authJsonPath: string;
 	let authStorage: AuthStorage;
+	let trustedHelperDir: string | undefined;
 
 	beforeEach(() => {
 		tempDir = join(tmpdir(), `pi-test-auth-storage-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -19,6 +21,9 @@ describe("AuthStorage", () => {
 	});
 
 	afterEach(() => {
+		if (trustedHelperDir && existsSync(trustedHelperDir)) {
+			rmSync(trustedHelperDir, { recursive: true, force: true });
+		}
 		if (tempDir && existsSync(tempDir)) {
 			rmSync(tempDir, { recursive: true });
 		}
@@ -931,6 +936,178 @@ describe("AuthStorage", () => {
 					}
 				}
 			});
+		});
+	});
+
+	describe("AIM external credentials", () => {
+		test("strictly resolves the pinned session binding and commits a handoff without persisting secrets", async () => {
+			const helperPath = join(tempDir, "aim-credential-helper.mjs");
+			const requestLogPath = join(tempDir, "aim-credential-requests.jsonl");
+			trustedHelperDir = join(
+				process.cwd(),
+				`.aim-helper-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+			);
+			mkdirSync(trustedHelperDir, { mode: 0o700 });
+			const helperExecutable = join(trustedHelperDir, "resolve-credential");
+			writeFileSync(helperExecutable, `#!/bin/sh\nexec "${toShPath(process.execPath)}" "$@"\n`, {
+				mode: 0o700,
+			});
+			writeFileSync(
+				helperPath,
+				`import { appendFileSync } from "node:fs";
+
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const request = JSON.parse(input);
+appendFileSync(process.argv[2], JSON.stringify(request) + "\\n");
+const response = {
+  schemaVersion: 1,
+  ok: true,
+  provider: request.provider,
+  binding: request.binding,
+  identityFingerprint: request.expectedIdentityFingerprint,
+  credentialVersion: 7,
+  accessToken: "aim-test-secret:" + request.binding,
+  expiresAt: Date.now() + 60 * 60 * 1000,
+};
+if (request.binding === "invalid-response") response.unexpected = true;
+process.stdout.write(JSON.stringify(response));
+`,
+			);
+			writeAuthJson({
+				anthropic: {
+					type: "external",
+					source: "aimgr",
+					protocol: AIM_EXTERNAL_CREDENTIAL_PROTOCOL,
+					executable: helperExecutable,
+					args: [helperPath, requestLogPath],
+					binding: "descriptor-default",
+					expectedIdentityFingerprint: "identity-default",
+				},
+			});
+
+			authStorage = AuthStorage.create(authJsonPath);
+			const persistInitialBinding = vi.fn();
+			authStorage.startAimExternalSession(
+				[
+					{
+						type: "custom",
+						customType: AIM_CREDENTIAL_BINDING_CUSTOM_TYPE,
+						data: {
+							provider: "anthropic",
+							source: "aimgr",
+							binding: "session-bound",
+							identityFingerprint: "identity-session",
+						},
+					},
+				],
+				persistInitialBinding,
+			);
+
+			expect(authStorage.getAimCredentialBinding("anthropic")).toEqual({
+				provider: "anthropic",
+				source: "aimgr",
+				binding: "session-bound",
+				identityFingerprint: "identity-session",
+			});
+			expect(authStorage.getAimCredentialBindings()).toEqual([
+				{
+					provider: "anthropic",
+					source: "aimgr",
+					binding: "session-bound",
+					identityFingerprint: "identity-session",
+				},
+			]);
+			expect(authStorage.getAimExecutable("anthropic")).toBe(helperExecutable);
+			expect(authStorage.getAimExecutable("openai-codex")).toBeUndefined();
+			const initialAccess = await authStorage.getApiKeyWithSourceToken("anthropic");
+			expect(initialAccess?.apiKey).toBe("aim-test-secret:session-bound");
+			expect(JSON.stringify(initialAccess?.sourceToken)).not.toContain("aim-test-secret");
+			expect(persistInitialBinding).not.toHaveBeenCalled();
+
+			await expect(
+				authStorage.prepareAimCredentialHandoff("anthropic", "invalid-response", "identity-invalid"),
+			).rejects.toMatchObject({ code: "protocol_mismatch" });
+			expect(authStorage.getAimCredentialBinding("anthropic")?.binding).toBe("session-bound");
+
+			const resolved = await authStorage.prepareAimCredentialHandoff(
+				"anthropic",
+				"handoff-bound",
+				"identity-handoff",
+			);
+			expect(authStorage.getAimCredentialBinding("anthropic")?.binding).toBe("session-bound");
+			authStorage.commitAimCredentialHandoff(resolved);
+
+			expect(authStorage.getAimCredentialBinding("anthropic")).toEqual({
+				provider: "anthropic",
+				source: "aimgr",
+				binding: "handoff-bound",
+				identityFingerprint: "identity-handoff",
+			});
+			await expect(authStorage.getApiKey("anthropic")).resolves.toBe("aim-test-secret:handoff-bound");
+
+			const initialPersistencePhases: string[] = [];
+			const defaultAuthStorage = AuthStorage.create(authJsonPath);
+			defaultAuthStorage.startAimExternalSession([], (binding) => {
+				initialPersistencePhases.push("persist-binding");
+				expect(binding).toEqual({
+					provider: "anthropic",
+					source: "aimgr",
+					binding: "descriptor-default",
+					identityFingerprint: "identity-default",
+				});
+				expect(JSON.stringify(binding)).not.toContain("aim-test-secret");
+				const loggedRequests = readFileSync(requestLogPath, "utf8").trim().split("\n");
+				expect(JSON.parse(loggedRequests.at(-1) ?? "{}")).toMatchObject({
+					binding: "descriptor-default",
+				});
+			});
+			const defaultAccessPromise = defaultAuthStorage.getApiKey("anthropic");
+			expect(initialPersistencePhases).toEqual([]);
+			await expect(defaultAccessPromise).resolves.toBe("aim-test-secret:descriptor-default");
+			initialPersistencePhases.push("token-returned");
+			expect(initialPersistencePhases).toEqual(["persist-binding", "token-returned"]);
+
+			expect(
+				readFileSync(requestLogPath, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line)),
+			).toEqual([
+				{
+					schemaVersion: 1,
+					operation: "resolve",
+					provider: "anthropic",
+					binding: "session-bound",
+					expectedIdentityFingerprint: "identity-session",
+				},
+				{
+					schemaVersion: 1,
+					operation: "resolve",
+					provider: "anthropic",
+					binding: "invalid-response",
+					expectedIdentityFingerprint: "identity-invalid",
+				},
+				{
+					schemaVersion: 1,
+					operation: "resolve",
+					provider: "anthropic",
+					binding: "handoff-bound",
+					expectedIdentityFingerprint: "identity-handoff",
+				},
+				{
+					schemaVersion: 1,
+					operation: "resolve",
+					provider: "anthropic",
+					binding: "descriptor-default",
+					expectedIdentityFingerprint: "identity-default",
+				},
+			]);
+
+			const persistedAuth = readFileSync(authJsonPath, "utf8");
+			expect(persistedAuth).not.toContain("aim-test-secret");
+			expect(persistedAuth).not.toContain("session-bound");
+			expect(persistedAuth).not.toContain("handoff-bound");
 		});
 	});
 

@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { closeOpenAICodexWebSocketSessions } from "@earendil-works/pi-ai/openai-codex-responses";
 import type { AgentSession } from "./agent-session.js";
 import type { AgentSessionRuntimeConfig } from "./agent-session-config.js";
 import type {
@@ -8,7 +9,9 @@ import type {
 	AgentSessionServices,
 } from "./agent-session-services.js";
 import { flushAgentTraceUpload } from "./agent-traces.js";
+import { AIM_CREDENTIAL_BINDING_CUSTOM_TYPE, type AimCredentialProvider } from "./aim-external-auth.js";
 import { isNoModelsAvailableMessage } from "./auth-guidance.js";
+import type { AuthStorage } from "./auth-storage.js";
 import type { ReplacedSessionContext, SessionShutdownEvent, SessionStartEvent } from "./extensions/index.js";
 import { emitSessionShutdownEvent } from "./extensions/runner.js";
 import type { CreateRlmSubagentRuntimeOptions, RlmSubagentRuntime, SubagentRuntimeHost } from "./rlm-runtime.js";
@@ -45,6 +48,7 @@ export type CreateAgentSessionRuntimeFactory = (options: {
 	sessionStartEvent?: SessionStartEvent;
 	sessionConfig?: AgentSessionRuntimeConfig;
 	sessionOptions?: AgentSessionCreationOptions;
+	authStorage?: AuthStorage;
 }) => Promise<CreateAgentSessionRuntimeResult>;
 
 export type AgentSessionRuntimeKind = "top-level" | "subagent";
@@ -63,6 +67,15 @@ export interface AgentSessionRuntimeMetadata {
 	/** Source of the IPython cell that spawned this subagent, for display. */
 	spawnCode?: string;
 	sessionDir?: string;
+}
+
+export interface AimCredentialHandoffRequest {
+	provider: AimCredentialProvider;
+	expectedModel: string;
+	expectedBinding: string;
+	expectedIdentityFingerprint: string;
+	requestedBinding: string;
+	requestedIdentityFingerprint: string;
 }
 
 function extractUserMessageText(content: string | Array<{ type: string; text?: string }>): string {
@@ -91,6 +104,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 	private subagentRuntimeHost?: SubagentRuntimeHost;
 	private subagentRuntimes = new Map<string, AgentSessionRuntime>();
 	private disposePromise?: Promise<void>;
+	private aimCredentialHandoffInProgress = false;
 
 	constructor(
 		private _session: AgentSession,
@@ -332,6 +346,82 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 		return [...this.subagentRuntimes.values()];
 	}
 
+	/** Atomically rebind one idle live root tree after the caller durably records the transition. */
+	async handoffAimCredential(
+		request: AimCredentialHandoffRequest,
+		getTreeRuntimes: () => readonly AgentSessionRuntime[],
+	): Promise<void> {
+		if (this._metadata.kind !== "top-level") throw new Error("AIM credential handoff requires a top-level session");
+		if (this.aimCredentialHandoffInProgress) throw new Error("AIM credential handoff is already in progress");
+		this.aimCredentialHandoffInProgress = true;
+		const initialTree = [...getTreeRuntimes()];
+		const pauses = initialTree.map((runtime) => runtime.session.acquireQueuedWorkPause());
+		try {
+			this.assertAimCredentialHandoffState(request, initialTree);
+			const resolved = await this.services.authStorage.prepareAimCredentialHandoff(
+				request.provider,
+				request.requestedBinding,
+				request.requestedIdentityFingerprint,
+			);
+
+			const currentTree = [...getTreeRuntimes()];
+			if (
+				currentTree.length !== initialTree.length ||
+				currentTree.some((runtime, index) => runtime !== initialTree[index])
+			) {
+				throw new Error("Session tree changed during AIM credential handoff");
+			}
+			this.assertAimCredentialHandoffState(request, currentTree);
+
+			const binding = {
+				provider: request.provider,
+				source: "aimgr" as const,
+				binding: request.requestedBinding,
+				identityFingerprint: request.requestedIdentityFingerprint,
+			};
+			this.session.sessionManager.appendCustomEntryWithRollback(AIM_CREDENTIAL_BINDING_CUSTOM_TYPE, binding);
+			this.services.authStorage.commitAimCredentialHandoff(resolved);
+			if (request.provider === "openai-codex") {
+				closeOpenAICodexWebSocketSessions(this.session.sessionId);
+			}
+		} finally {
+			for (const pause of pauses.reverse()) pause.release();
+			this.aimCredentialHandoffInProgress = false;
+		}
+	}
+
+	private assertAimCredentialHandoffState(
+		request: AimCredentialHandoffRequest,
+		tree: readonly AgentSessionRuntime[],
+	): void {
+		if (tree.length === 0 || tree[0] !== this || new Set(tree).size !== tree.length) {
+			throw new Error("AIM credential handoff received an invalid session tree");
+		}
+		if (request.requestedBinding === request.expectedBinding) {
+			throw new Error("AIM credential handoff requires a different binding");
+		}
+		const model = this.session.model;
+		if (!model || model.provider !== request.provider || model.id !== request.expectedModel) {
+			throw new Error("Session provider or model changed before AIM credential handoff");
+		}
+		const current = this.services.authStorage.getAimCredentialBinding(request.provider);
+		if (
+			!current ||
+			current.binding !== request.expectedBinding ||
+			current.identityFingerprint !== request.expectedIdentityFingerprint
+		) {
+			throw new Error("Session credential binding changed before AIM credential handoff");
+		}
+		for (const runtime of tree) {
+			if (runtime.services.authStorage !== this.services.authStorage) {
+				throw new Error("Session descendants do not share the root credential state");
+			}
+			if (runtime.session.isSessionActive || runtime.session.hasRunningRlmChildren()) {
+				throw new Error("Session tree must be completely idle for AIM credential handoff");
+			}
+		}
+	}
+
 	async createRlmSubagentRuntime(options: CreateRlmSubagentRuntimeOptions): Promise<RlmSubagentRuntime> {
 		const sessionManager = SessionManager.create(options.parentSession.sessionManager.getCwd(), options.sessionDir);
 		if (options.parentSession.sessionFile) {
@@ -345,6 +435,7 @@ export class AgentSessionRuntime implements SubagentRuntimeHost {
 				cwd: sessionManager.getCwd(),
 				agentDir: this.services.agentDir,
 				sessionManager,
+				authStorage: this.services.authStorage,
 				sessionStartEvent: { type: "session_start", reason: "startup" },
 				sessionConfig: this.sessionConfig,
 				sessionOptions: {
@@ -766,6 +857,7 @@ export async function createAgentSessionRuntime(
 		sessionStartEvent?: SessionStartEvent;
 		sessionConfig?: AgentSessionRuntimeConfig;
 		sessionOptions?: AgentSessionCreationOptions;
+		authStorage?: AuthStorage;
 		runtimeMetadata?: AgentSessionRuntimeMetadata;
 		sessionLease?: SessionLease;
 	},

@@ -1,6 +1,11 @@
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+	classifyTrackedWorkerLiveness,
+	cleanupExactDeadWorkerTombstone,
 	type DaemonInfo,
 	evaluateShutdownQuietPeriod,
 	isWorkerSocketPath,
@@ -112,6 +117,138 @@ describe("verifyHelloSupervisorPid", () => {
 		expect(verifyHelloSupervisorPid(process.pid, processStartId)).toBe(process.pid);
 		if (processStartId) {
 			expect(verifyHelloSupervisorPid(process.pid, `${processStartId}-stale`)).toBeUndefined();
+		}
+	});
+});
+
+describe("tracked worker persistent state", () => {
+	it("distinguishes exact-dead, live, and uncertain process identities", () => {
+		expect(classifyTrackedWorkerLiveness(false, undefined, undefined)).toBe("exact-dead");
+		expect(classifyTrackedWorkerLiveness(true, "start-a", "start-b")).toBe("exact-dead");
+		expect(classifyTrackedWorkerLiveness(true, "start-a", "start-a")).toBe("live");
+		expect(classifyTrackedWorkerLiveness(true, undefined, "start-a")).toBe("uncertain");
+		expect(classifyTrackedWorkerLiveness(true, "start-a", undefined)).toBe("uncertain");
+	});
+
+	it("cleans only exact-dead tombstones with no unverifiable child", async () => {
+		const root = mkdtempSync(join(tmpdir(), "prime-dead-worker-"));
+		try {
+			const workerId = "dead-worker";
+			const supervisorSocketPath = join(root, "daemon.sock");
+			const descriptorKey = createHash("sha256").update(supervisorSocketPath).digest("hex").slice(0, 12);
+			const descriptorDirectory = join(root, "daemon-workers", descriptorKey);
+			mkdirSync(descriptorDirectory, { recursive: true });
+			const descriptorPath = join(descriptorDirectory, `${workerId}.json`);
+			const socketPath = join(defaultDaemonSocketDir(), `worker-${descriptorKey}-${workerId.slice(0, 12)}.sock`);
+			const unsafeSocketPath = join(root, "not-a-worker-socket");
+			const recoveryJournalPath = join(descriptorDirectory, `${workerId}.recovery.jsonl`);
+			const orphanProcessJournalPath = join(descriptorDirectory, `${workerId}.orphans.jsonl`);
+			const currentProcessStartId = getProcessStartId(process.pid);
+			expect(currentProcessStartId).toBeDefined();
+			const descriptor = {
+				version: 1,
+				workerId,
+				pid: process.pid,
+				processStartId: `${currentProcessStartId}-reused`,
+				socketPath: unsafeSocketPath,
+				recoveryJournalPath,
+				orphanProcessJournalPath: orphanProcessJournalPath as string | undefined,
+				supervisorSocketPath,
+				authenticationToken: "test-token",
+				rootActiveSessionId: "active-test",
+				createdAt: new Date(0).toISOString(),
+				updatedAt: new Date(0).toISOString(),
+				lifecycle: "failed",
+				consecutiveFailures: 0,
+				stopRequestedAt: undefined as string | undefined,
+			};
+			const writeDescriptor = () => writeFileSync(descriptorPath, `${JSON.stringify(descriptor)}\n`);
+			writeDescriptor();
+			writeFileSync(unsafeSocketPath, "must not be unlinked\n");
+			writeFileSync(recoveryJournalPath, "recovery\n");
+			writeFileSync(
+				orphanProcessJournalPath,
+				`${JSON.stringify({
+					version: 1,
+					pid: 123,
+					ownerPid: descriptor.pid,
+					active: true,
+					recordedAt: new Date(0).toISOString(),
+				})}\n`,
+			);
+
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				skipped: "worker is not stop-tombstoned",
+			});
+			descriptor.stopRequestedAt = new Date(1).toISOString();
+			writeDescriptor();
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				skipped: "worker artifact paths are not canonical",
+			});
+			expect(existsSync(unsafeSocketPath)).toBe(true);
+
+			descriptor.socketPath = socketPath;
+			descriptor.orphanProcessJournalPath = undefined;
+			writeDescriptor();
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				skipped: "worker artifact paths are not canonical",
+			});
+			for (const path of [descriptorPath, recoveryJournalPath, orphanProcessJournalPath]) {
+				expect(existsSync(path)).toBe(true);
+			}
+
+			descriptor.orphanProcessJournalPath = orphanProcessJournalPath;
+			writeDescriptor();
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				skipped: "worker child process identity is live or uncertain",
+			});
+			for (const path of [descriptorPath, recoveryJournalPath, orphanProcessJournalPath]) {
+				expect(existsSync(path)).toBe(true);
+			}
+
+			writeFileSync(
+				orphanProcessJournalPath,
+				`${JSON.stringify({
+					version: 1,
+					pid: process.pid,
+					ownerPid: descriptor.pid - 1,
+					processStartId: currentProcessStartId,
+					active: true,
+					recordedAt: new Date(2).toISOString(),
+				})}\n`,
+			);
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				skipped: "worker child process identity is live or uncertain",
+			});
+			for (const path of [descriptorPath, recoveryJournalPath, orphanProcessJournalPath]) {
+				expect(existsSync(path)).toBe(true);
+			}
+
+			writeFileSync(
+				orphanProcessJournalPath,
+				`${JSON.stringify({
+					version: 1,
+					pid: process.pid,
+					ownerPid: descriptor.pid - 1,
+					active: false,
+					recordedAt: new Date(3).toISOString(),
+				})}\n`,
+			);
+			writeFileSync(socketPath, "not a unix socket\n");
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				skipped: "could not remove dead worker socket file",
+			});
+			expect(existsSync(socketPath)).toBe(true);
+			rmSync(socketPath);
+			expect(await cleanupExactDeadWorkerTombstone(descriptorPath, descriptor.workerId, root)).toEqual({
+				reaped: "removed exact-dead worker tombstone dead-worker",
+			});
+			for (const path of [descriptorPath, socketPath, recoveryJournalPath, orphanProcessJournalPath]) {
+				expect(existsSync(path)).toBe(false);
+			}
+			expect(existsSync(unsafeSocketPath)).toBe(true);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });

@@ -1,9 +1,14 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, unlinkSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import chalk from "chalk";
 import { APP_NAME, getAgentDir, VERSION } from "../config.js";
-import { isOrphanProcessIdentityCurrent, readActiveOrphanProcesses } from "../core/orphan-process-journal.js";
+import {
+	isOrphanProcessIdentityCurrent,
+	readActiveOrphanProcessCandidates,
+	readActiveOrphanProcesses,
+} from "../core/orphan-process-journal.js";
 import { getProcessStartId } from "../core/session-lease.js";
 import { DaemonClient } from "../modes/daemon/daemon-client.js";
 import {
@@ -352,7 +357,9 @@ export async function discoverDaemons(): Promise<DaemonInfo[]> {
 	}
 
 	const workerSockets = new Set(
-		findAllTrackedWorkers().map((worker) => normalizeSocketPath(worker.descriptor.supervisorSocketPath)),
+		findAllTrackedWorkers()
+			.filter((worker) => getTrackedWorkerLiveness(worker.descriptor) !== "exact-dead")
+			.map((worker) => normalizeSocketPath(worker.descriptor.supervisorSocketPath)),
 	);
 	const sockets = new Set<string>([
 		...processBySocket.keys(),
@@ -927,6 +934,35 @@ interface TrackedWorker {
 	descriptorPath: string;
 }
 
+export type TrackedWorkerLiveness = "live" | "exact-dead" | "uncertain";
+
+export function classifyTrackedWorkerLiveness(
+	pidExists: boolean,
+	expectedProcessStartId: string | undefined,
+	observedProcessStartId: string | undefined,
+): TrackedWorkerLiveness {
+	if (!pidExists) {
+		return "exact-dead";
+	}
+	if (!expectedProcessStartId || !observedProcessStartId) {
+		return "uncertain";
+	}
+	return expectedProcessStartId === observedProcessStartId ? "live" : "exact-dead";
+}
+
+function getTrackedWorkerLiveness(descriptor: DaemonWorkerDescriptor): TrackedWorkerLiveness {
+	return getTrackedProcessLiveness(descriptor.pid, descriptor.processStartId);
+}
+
+function getTrackedProcessLiveness(pid: number, expectedProcessStartId: string | undefined): TrackedWorkerLiveness {
+	const pidExists = isProcessAlive(pid);
+	return classifyTrackedWorkerLiveness(
+		pidExists,
+		expectedProcessStartId,
+		pidExists ? getProcessStartId(pid) : undefined,
+	);
+}
+
 async function forceStopTrackedWorkers(
 	supervisorSocketPath: string,
 	assertAdmission: () => Promise<void>,
@@ -1010,17 +1046,23 @@ function findAllTrackedWorkers(): TrackedWorker[] {
 				continue;
 			}
 			const descriptorPath = join(directory, fileName);
-			try {
-				const value: unknown = JSON.parse(readFileSync(descriptorPath, "utf8"));
-				if (isTrackedWorkerDescriptor(value)) {
-					workers.push({ descriptor: value, descriptorPath });
-				}
-			} catch {
-				// Invalid or concurrently removed descriptors are not safe shutdown targets.
+			const descriptor = readTrackedWorkerDescriptor(descriptorPath);
+			if (descriptor) {
+				workers.push({ descriptor, descriptorPath });
 			}
 		}
 	}
 	return workers;
+}
+
+function readTrackedWorkerDescriptor(descriptorPath: string): DaemonWorkerDescriptor | undefined {
+	try {
+		const value: unknown = JSON.parse(readFileSync(descriptorPath, "utf8"));
+		return isTrackedWorkerDescriptor(value) ? value : undefined;
+	} catch {
+		// Invalid or concurrently removed descriptors are not safe shutdown targets.
+		return undefined;
+	}
 }
 
 function isTrackedWorkerDescriptor(value: unknown): value is DaemonWorkerDescriptor {
@@ -1038,6 +1080,112 @@ function isTrackedWorkerDescriptor(value: unknown): value is DaemonWorkerDescrip
 		typeof descriptor.socketPath === "string" &&
 		typeof descriptor.recoveryJournalPath === "string"
 	);
+}
+
+function orphanJournalAllowsCleanup(path: string): boolean {
+	let activeOrphans: ReturnType<typeof readActiveOrphanProcessCandidates>;
+	try {
+		activeOrphans = readActiveOrphanProcessCandidates(path);
+	} catch {
+		return false;
+	}
+	return activeOrphans.every(
+		(record) =>
+			Boolean(record.processStartId) &&
+			getTrackedProcessLiveness(record.pid, record.processStartId) === "exact-dead",
+	);
+}
+
+function workerArtifactPathsAreCanonical(
+	descriptor: DaemonWorkerDescriptor,
+	descriptorPath: string,
+	agentDir: string,
+): boolean {
+	const descriptorKey = createHash("sha256").update(descriptor.supervisorSocketPath).digest("hex").slice(0, 12);
+	const descriptorDirectory = join(agentDir, "daemon-workers", descriptorKey);
+	const workerSocketPath =
+		process.platform === "win32"
+			? `\\\\.\\pipe\\prime-agent-worker-${descriptorKey}-${descriptor.workerId.slice(0, 12)}`
+			: join(defaultDaemonSocketDir(), `worker-${descriptorKey}-${descriptor.workerId.slice(0, 12)}.sock`);
+	return (
+		descriptorPath === join(descriptorDirectory, `${descriptor.workerId}.json`) &&
+		descriptor.recoveryJournalPath === join(descriptorDirectory, `${descriptor.workerId}.recovery.jsonl`) &&
+		descriptor.orphanProcessJournalPath === join(descriptorDirectory, `${descriptor.workerId}.orphans.jsonl`) &&
+		descriptor.socketPath === workerSocketPath
+	);
+}
+
+function removeWorkerSocketFile(socketPath: string): boolean {
+	try {
+		if (!existsSync(socketPath)) {
+			return true;
+		}
+		if (process.platform !== "win32" && !lstatSync(socketPath).isSocket()) {
+			return false;
+		}
+		unlinkSync(socketPath);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+export async function cleanupExactDeadWorkerTombstone(
+	descriptorPath: string,
+	expectedWorkerId: string,
+	agentDir: string = getAgentDir(),
+): Promise<ReapOutcome> {
+	let descriptor = readTrackedWorkerDescriptor(descriptorPath);
+	if (!descriptor || descriptor.workerId !== expectedWorkerId) {
+		return { skipped: "worker descriptor changed or disappeared" };
+	}
+	if (!descriptor.stopRequestedAt) {
+		return { skipped: "worker is not stop-tombstoned" };
+	}
+	if (!workerArtifactPathsAreCanonical(descriptor, descriptorPath, agentDir)) {
+		return { skipped: "worker artifact paths are not canonical" };
+	}
+	if (getTrackedWorkerLiveness(descriptor) !== "exact-dead") {
+		return { skipped: "worker process is live or its identity is uncertain" };
+	}
+	if (await canConnectToSocket(descriptor.socketPath, 250)) {
+		return { skipped: "worker socket is reachable" };
+	}
+	if (descriptor.orphanProcessJournalPath && !orphanJournalAllowsCleanup(descriptor.orphanProcessJournalPath)) {
+		return { skipped: "worker child process identity is live or uncertain" };
+	}
+
+	// Discovery and cleanup are separate moments. Re-read and re-probe before
+	// unlinking so a replacement descriptor or process is never treated as dead.
+	descriptor = readTrackedWorkerDescriptor(descriptorPath);
+	if (
+		!descriptor ||
+		descriptor.workerId !== expectedWorkerId ||
+		!descriptor.stopRequestedAt ||
+		!workerArtifactPathsAreCanonical(descriptor, descriptorPath, agentDir) ||
+		getTrackedWorkerLiveness(descriptor) !== "exact-dead"
+	) {
+		return { skipped: "worker descriptor or process changed during cleanup" };
+	}
+	if (await canConnectToSocket(descriptor.socketPath, 250)) {
+		return { skipped: "worker socket became reachable during cleanup" };
+	}
+	if (descriptor.orphanProcessJournalPath && !orphanJournalAllowsCleanup(descriptor.orphanProcessJournalPath)) {
+		return { skipped: "worker child process identity changed during cleanup" };
+	}
+	if (!removeWorkerSocketFile(descriptor.socketPath)) {
+		return { skipped: "could not remove dead worker socket file" };
+	}
+	try {
+		rmSync(descriptorPath, { force: true });
+		rmSync(descriptor.recoveryJournalPath, { force: true });
+		if (descriptor.orphanProcessJournalPath) {
+			rmSync(descriptor.orphanProcessJournalPath, { force: true });
+		}
+		return { reaped: `removed exact-dead worker tombstone ${descriptor.workerId}` };
+	} catch (error) {
+		return { skipped: `could not clean dead worker ${descriptor.workerId}: ${String(error)}` };
+	}
 }
 
 async function stopTrackedProcess(
@@ -1079,6 +1227,17 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 	const daemons = await discoverDaemons();
 	const reaped: Array<{ socketPath: string; action: string }> = [];
 	const skipped: Array<{ socketPath: string; reason: string }> = [];
+	for (const worker of findAllTrackedWorkers()) {
+		if (!worker.descriptor.stopRequestedAt || getTrackedWorkerLiveness(worker.descriptor) !== "exact-dead") {
+			continue;
+		}
+		apply(
+			await cleanupExactDeadWorkerTombstone(worker.descriptorPath, worker.descriptor.workerId),
+			worker.descriptor.socketPath,
+			reaped,
+			skipped,
+		);
+	}
 
 	for (const action of planReap(daemons, force)) {
 		const { socketPath, pid } = action.daemon;
@@ -1136,7 +1295,7 @@ export async function runReap(json: boolean, force: boolean): Promise<void> {
 	}
 }
 
-type ReapOutcome = { reaped: string } | { skipped: string };
+export type ReapOutcome = { reaped: string } | { skipped: string };
 
 function apply(
 	outcome: ReapOutcome,

@@ -166,6 +166,59 @@ describe("daemon command", () => {
 		).toBe(true);
 	});
 
+	it("sends a one-shot secret-free AIM credential handoff request", async () => {
+		await expect(
+			handleDaemonCommand([
+				"daemon",
+				"--socket",
+				"/tmp/prime-agent.sock",
+				"handoff-aim-credential",
+				"active-1",
+				"openai-codex",
+				"gpt-5.6-sol",
+				"alpha",
+				"aimgr-id-v1:alpha",
+				"beta",
+				"aimgr-id-v1:beta",
+				"--json",
+			]),
+		).resolves.toBe(true);
+
+		const client = daemonClientMock.instances[0];
+		expect(client?.requests).toEqual([
+			{
+				type: "handoff_aim_credential",
+				activeSessionId: "active-1",
+				provider: "openai-codex",
+				expectedModel: "gpt-5.6-sol",
+				expectedBinding: "alpha",
+				expectedIdentityFingerprint: "aimgr-id-v1:alpha",
+				requestedBinding: "beta",
+				requestedIdentityFingerprint: "aimgr-id-v1:beta",
+			},
+		]);
+		expect(client?.messageListenerCountAtClose).toBe(0);
+		expect(client?.closeListenerCountAtClose).toBe(0);
+	});
+
+	it.each([
+		{
+			name: "requires JSON output",
+			args: ["active-1", "openai-codex", "gpt-5.6-sol", "alpha", "fp-a", "beta", "fp-b"],
+		},
+		{
+			name: "rejects unsupported providers",
+			args: ["active-1", "google", "gemini", "alpha", "fp-a", "beta", "fp-b", "--json"],
+		},
+	])("$name for AIM credential handoff", async ({ args }) => {
+		await expect(
+			handleDaemonCommand(["daemon", "--socket", "/tmp/prime-agent.sock", "handoff-aim-credential", ...args]),
+		).resolves.toBe(true);
+
+		expect(daemonClientMock.instances[0]?.requests).toEqual([]);
+		expect(process.exitCode).toBe(1);
+	});
+
 	it("ignores stale agent_end events before a daemon prompt starts", async () => {
 		daemonClientMock.behavior.promptSucceeds = true;
 		daemonClientMock.behavior.emitStaleAgentEndOnAttach = true;

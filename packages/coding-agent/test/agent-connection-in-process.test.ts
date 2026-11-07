@@ -3,6 +3,7 @@ import { getModel } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent, AgentSessionEventListener, PromptOptions } from "../src/core/agent-session.js";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.js";
+import type { AimCredentialBinding } from "../src/core/aim-external-auth.js";
 import { emptyGoalState } from "../src/core/goals.js";
 import { InProcessAgentConnection } from "../src/modes/agent-connection/in-process-agent-connection.js";
 import type { AgentConnectionEvent, AgentConnectionState } from "../src/modes/agent-connection/types.js";
@@ -20,12 +21,18 @@ interface FakeSessionControl {
 
 class FakeRuntime {
 	private _session: RuntimeSession;
+	readonly services;
 	rebindSession: RuntimeRebindCallback;
 	beforeSessionInvalidate: RuntimeBeforeInvalidateCallback;
 	disposed = false;
 
-	constructor(session: RuntimeSession) {
+	constructor(session: RuntimeSession, credentialBindings: AimCredentialBinding[] = []) {
 		this._session = session;
+		this.services = {
+			authStorage: {
+				getAimCredentialBindings: () => credentialBindings,
+			},
+		};
 	}
 
 	get session(): RuntimeSession {
@@ -254,7 +261,14 @@ describe("InProcessAgentConnection", () => {
 	it("builds initial snapshots from the current runtime", async () => {
 		const messages = [userMessage("snapshot context", 1)];
 		const session = createFakeSession("snapshot", messages);
-		const runtime = new FakeRuntime(session.session);
+		const runtime = new FakeRuntime(session.session, [
+			{
+				provider: "anthropic",
+				source: "aimgr",
+				binding: "claude-primary",
+				identityFingerprint: "identity-claude-primary",
+			},
+		]);
 		const connection = new InProcessAgentConnection(asRuntime(runtime));
 
 		const snapshot = await connection.getInitialSnapshot();
@@ -265,6 +279,13 @@ describe("InProcessAgentConnection", () => {
 				sessionId: "snapshot",
 				messageCount: 1,
 				leafId: "snapshot-leaf",
+				credentialBindings: [
+					{
+						provider: "anthropic",
+						source: "aimgr",
+						binding: "claude-primary",
+					},
+				],
 			},
 			messages: [userMessage("snapshot context", 1)],
 			sessionContext: {

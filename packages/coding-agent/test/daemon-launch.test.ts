@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	ensureInteractiveDaemonRunning,
 	probeDaemonVersion,
@@ -13,6 +13,8 @@ import {
 } from "../src/cli/daemon-launch.js";
 import { ENV_AGENT_DIR, getDaemonLogPath, VERSION } from "../src/config.js";
 import { DAEMON_PROTOCOL_VERSION, DAEMON_SCHEMA_ID } from "../src/modes/daemon/daemon-protocol.js";
+import * as daemonRuntimeIdentity from "../src/modes/daemon/daemon-runtime-identity.js";
+import { getDaemonRuntimeIdentity } from "../src/modes/daemon/daemon-runtime-identity.js";
 
 interface FakeDaemonOptions {
 	/** Sessions returned for a `list` command. */
@@ -25,6 +27,7 @@ interface FakeDaemonOptions {
 	protocolVersion?: number;
 	appVersion?: string;
 	schemaId?: string;
+	buildId?: string | null;
 	serverCapabilities?: string[];
 	onCommand?: (command: { type: string }) => void;
 }
@@ -47,8 +50,16 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 			type: "daemon_hello",
 			socketPath,
 			protocol: { name: "prime-agent.daemon", version: options.protocolVersion ?? DAEMON_PROTOCOL_VERSION },
-			appVersion: options.appVersion,
+			appVersion: options.appVersion ?? VERSION,
 			schemaId: options.schemaId ?? DAEMON_SCHEMA_ID,
+			...(options.buildId === null
+				? {}
+				: {
+						runtime: {
+							...getDaemonRuntimeIdentity(),
+							buildId: options.buildId ?? getDaemonRuntimeIdentity().buildId,
+						},
+					}),
 			clientId: "fake-client",
 			serverCapabilities: options.serverCapabilities ?? [],
 		});
@@ -101,8 +112,12 @@ async function startFakeDaemon(options: FakeDaemonOptions = {}): Promise<FakeDae
 		socketPath,
 		close: () =>
 			new Promise<void>((resolve) => {
-				server.close(() => resolve());
-				rmSync(dir, { recursive: true, force: true });
+				const finish = () => {
+					rmSync(dir, { recursive: true, force: true });
+					resolve();
+				};
+				if (server.listening) server.close(finish);
+				else finish();
 			}),
 	};
 }
@@ -243,20 +258,73 @@ describe("ensureInteractiveDaemonRunning", () => {
 		expect(commands).not.toContain("shutdown");
 	});
 
-	it("does not replace a stale daemon with busy private client sessions", async () => {
+	it.each([
+		["missing", null],
+		["different", "different-runtime-build"],
+	])("never reuses a daemon with a %s runtime build identity", async (_label, buildId) => {
+		const daemon = await startFakeDaemon({ buildId });
+		cleanups.push(daemon.close);
+
+		await expect(probeDaemonVersion(daemon.socketPath)).resolves.toMatchObject({ status: "stale" });
+	});
+
+	it("does not classify or replace a daemon when local runtime identity fails", async () => {
+		const commands: string[] = [];
+		const daemon = await startFakeDaemon({ onCommand: (command) => commands.push(command.type) });
+		cleanups.push(daemon.close);
+		const identity = vi.spyOn(daemonRuntimeIdentity, "getDaemonRuntimeIdentity").mockImplementation(() => {
+			throw new Error("local identity unavailable");
+		});
+		try {
+			await expect(probeDaemonVersion(daemon.socketPath)).rejects.toThrow("local identity unavailable");
+			expect(commands).toEqual([]);
+		} finally {
+			identity.mockRestore();
+		}
+	});
+
+	it("does not replace a build-mismatched daemon with busy private client sessions", async () => {
 		const commands: string[] = [];
 		const daemon = await startFakeDaemon({
 			protocolVersion: DAEMON_PROTOCOL_VERSION,
 			appVersion: VERSION,
-			schemaId: "stale-schema",
+			schemaId: DAEMON_SCHEMA_ID,
+			buildId: "busy-old-runtime-build",
 			busyClientOwnedSessionCount: 1,
 			onCommand: (command) => commands.push(command.type),
 		});
 		cleanups.push(daemon.close);
 
-		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("stale");
+		await expect(ensureInteractiveDaemonRunning(daemon.socketPath)).rejects.toThrow("incompatible");
 		expect(commands).toContain("list");
 		expect(commands).not.toContain("shutdown");
+	});
+
+	it("shuts down an idle build-mismatched daemon before starting its successor", async () => {
+		const commands: string[] = [];
+		const stale = await startFakeDaemon({
+			buildId: "idle-old-runtime-build",
+			sessions: [],
+			onCommand: (command) => commands.push(command.type),
+		});
+		const entrypoint = join(dirname(stale.socketPath), "replacement-crashes.mjs");
+		writeFileSync(entrypoint, "process.exit(7);\n");
+		const originalEntrypoint = process.argv[1]!;
+		process.argv[1] = entrypoint;
+
+		try {
+			await expect(ensureInteractiveDaemonRunning(stale.socketPath)).rejects.toThrow(
+				/Prime Agent daemon exited during startup \(code 7\)/,
+			);
+			expect(commands.filter((command) => command === "list" || command === "shutdown")).toEqual([
+				"list",
+				"shutdown",
+			]);
+			await expect(probeDaemonVersion(stale.socketPath)).resolves.toEqual({ status: "absent" });
+		} finally {
+			process.argv[1] = originalEntrypoint;
+			await stale.close();
+		}
 	});
 
 	it("does not treat a live daemon as absent when cold startup delays the first connection", async () => {
@@ -356,6 +424,7 @@ describe("ensureInteractiveDaemonRunning", () => {
 				protocol: { name: "prime-agent.daemon", version: DAEMON_PROTOCOL_VERSION },
 				appVersion: VERSION,
 				schemaId: DAEMON_SCHEMA_ID,
+				runtime: getDaemonRuntimeIdentity(),
 				clientId: "fake-client",
 				serverCapabilities: [],
 			});

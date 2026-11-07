@@ -47,6 +47,11 @@ async function runPublicCommand(args: string[]): Promise<PublicCommandResult> {
 	if (REMOVED_COMMAND_NAMES.has(command)) {
 		return rejectRemovedCommand(args);
 	}
+	// Private machine bridge for AIM. It intentionally has no command-registry
+	// entry and therefore never appears in Prime's public help or suggestions.
+	if (command === "__aim-handoff-credential") {
+		return runInternalAgentCommand("handoff-aim-credential", args.slice(1));
+	}
 
 	if (!PUBLIC_COMMAND_NAMES.has(command)) {
 		return continueWith(args);

@@ -202,6 +202,61 @@ describe("InteractiveMode.showStatus", () => {
 	});
 });
 
+describe("InteractiveMode /usage account scope", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+
+	function createUsageHarness(state: AgentConnectionState) {
+		const chatContainer = new Container();
+		return {
+			chatContainer,
+			harness: {
+				agentConnection: {
+					getSessionStats: vi.fn(async () => ({
+						tokens: { total: 0, input: 0, output: 0, cacheRead: 0 },
+						cost: 0,
+						contextUsage: undefined,
+					})),
+					getState: vi.fn(async () => state),
+				},
+				modelRegistry: { authStorage: { getAimExecutable: vi.fn(() => undefined) } },
+				chatContainer,
+				ui: { requestRender: vi.fn() },
+				showStatus: vi.fn(),
+				getConnectionContextUsage: vi.fn(() => undefined),
+			},
+		};
+	}
+
+	test.each([
+		[undefined, "Current session binding unavailable"],
+		[[], "Native or unmanaged"],
+	] as const)("does not replace session binding state with the AIM pool", async (credentialBindings, expected) => {
+		const state = createConnectionState(
+			credentialBindings === undefined ? {} : { credentialBindings: [...credentialBindings] },
+		);
+		const { harness, chatContainer } = createUsageHarness(state);
+		await (InteractiveMode as any).prototype.handleUsageCommand.call(harness);
+		const output = normalizeRenderedOutput(chatContainer);
+		expect(output).toContain(expected);
+		expect(output).not.toContain("AIM credential pool");
+	});
+
+	test("renders only the exact session binding when AIM status is unavailable", async () => {
+		const { harness, chatContainer } = createUsageHarness(
+			createConnectionState({
+				credentialBindings: [{ provider: "anthropic", source: "aimgr", binding: "office" }],
+			}),
+		);
+		await (InteractiveMode as any).prototype.handleUsageCommand.call(harness);
+		const output = normalizeRenderedOutput(chatContainer);
+		expect(output).toContain("Claude: AIM · office");
+		expect(output).toContain("Provider usage unavailable");
+		expect(output).not.toContain("AIM credential pool");
+	});
+});
+
 type RenderSessionContextHarness = {
 	pendingTools: Map<string, ToolExecutionComponent>;
 	ipythonToolComponents: Map<string, unknown>;
@@ -2806,6 +2861,11 @@ function createFakeConnectionSession(commandName: string): AgentSessionRuntime["
 
 class EventEmittingReplacementRuntime {
 	private rebindSession: Parameters<AgentSessionRuntime["setRebindSession"]>[0];
+	readonly services = {
+		authStorage: {
+			getAimCredentialBindings: () => [],
+		},
+	};
 
 	constructor(
 		public session: AgentSessionRuntime["session"],

@@ -1677,7 +1677,11 @@ export class SessionManager {
 	 * prefix is skipped; anything beyond it is user content.
 	 */
 	hasUserContent(): boolean {
-		const contentEntries = this.getEntries().filter((entry) => CONTENT_ENTRY_TYPES.has(entry.type));
+		const contentEntries = this.getEntries().filter(
+			(entry) =>
+				CONTENT_ENTRY_TYPES.has(entry.type) &&
+				!(entry.type === "custom" && entry.customType === "aimgr_credential_binding_v1"),
+		);
 		let start = 0;
 		if (contentEntries[start]?.type === "model_change") {
 			start++;

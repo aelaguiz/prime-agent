@@ -54,6 +54,10 @@ export function createAgentConnectionState(
 		})),
 		activeToolNames: session.getActiveToolNames(),
 		contextUsage: session.getContextUsage(),
+		credentialBindings: runtime.services.authStorage
+			.getAimCredentialBindings()
+			.map(({ provider, source, binding }) => ({ provider, source, binding }))
+			.sort((left, right) => `${left.provider}:${left.binding}`.localeCompare(`${right.provider}:${right.binding}`)),
 		// Baseline recap; the daemon overlays the live summary on attach.
 		recap: persistedRecap(sessionManager),
 	};
